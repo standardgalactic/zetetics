@@ -1,0 +1,2172 @@
+LANGUAGE MODELS ENABLE SIMPLE SYSTEMS FOR
+GENERATING STRUCTURED VIEWS OF HETEROGENEOUS DATA
+LAKES
+Simran Arora1, Brandon Yang1, Sabri Eyuboglu1, Avanika Narayan1, Andrew Hojel1, Immanuel Trummer2, and
+Christopher Ré1
+1Stanford University
+2Cornell University
+April 21, 2023
+ABSTRACT
+A long standing goal of the data management community is to develop general, automated systems
+that ingest semi-structured documents and output queryable tables without human effort or domain
+speciﬁc customization. Given the sheer variety of potential documents, state-of-the art systems make
+simplifying assumptions and use domain speciﬁc training. In this work, we ask whether we can
+maintain generality by using large language models (LLMs). LLMs, which are pretrained on broad
+data, can perform diverse downstream tasks simply conditioned on natural language task descriptions.
+We propose and evaluate EVAPORATE, a simple, prototype system powered by LLMs. We identify
+two fundamentally different strategies for implementing this system: prompt the LLM to directly
+extract values from documents or prompt the LLM to synthesize code that performs the extraction.
+Our evaluations show a cost-quality tradeoff between these two approaches. Code synthesis is cheap,
+but far less accurate than directly processing each document with the LLM. To improve quality while
+maintaining low cost, we propose an extended code synthesis implementation, EVAPORATE-CODE+,
+which achieves better quality than direct extraction. Our key insight is to generate many candidate
+functions and ensemble their extractions using weak supervision. EVAPORATE-CODE+ not only
+outperforms the state-of-the art systems, but does so using a sublinear pass over the documents with
+the LLM. This equates to a 110× reduction in the number of tokens the LLM needs to process,
+averaged across 16 real-world evaluation settings of 10k documents each.
+1
+Introduction
+Organizations often seek insights trapped in heterogeneous data lakes (e.g. the web, corporate data lakes, and electronic
+health records) [8, 25, 52]. In their raw form, these data sources cannot easily support analytical queries. A long
+standing goal of the data management community is to develop systems that automatically convert heterogeneous data
+lakes into queryable, structured tables [10, 13, 44, 47, inter alia.]. In this work, we investigate whether recent large
+language models can help address this problem.
+We study systems that take as input heterogeneous documents (e.g. HTML webpages, PDFs, text) and output a tabular,
+structured view of the documents. These systems must identify the schema and perform extraction to populate the table.
+EXAMPLE 1. Medical researchers frequently use data spanning electronic health records (EHR), clinical trials,
+knowledge sources (e.g. PubMed), and FDA reports to understand and monitor patients and treatments [6].
+As a motivating setting, we consider the large collection of FDA 510(k) reviews for premarket notiﬁcation
+submissions for medical devices, which have been the subject of multiple studies [61, 64]. Our objective is
+to output a table that automatically structures the attributes that are distributed in the ∼20-page PDFs (some
+example attributes are device classification, predicate device code, and indications for use).
+arXiv:2304.09433v2  [cs.CL]  20 Apr 2023
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Data lake: A collection of 
+semi-structured documents 
+(e.g. HTML, TXT, XML)
+Tables: A structured view of the data 
+in the input documents. 
+2
+3
+1
+def
+def
+def
+Filter: Compare function 
+and LLM outputs, filtering 
+out functions that disagree.
+Prompt LLM: List all 
+attributes about the 
+player mentioned in 
+this document.
+Function Aggregation
+Function Synthesis
+Schema Identification
+Output
+Input
+EVAPORATE-CODE+
+Prompt LLM: Write a 
+function to extract 
+draft year from the 
+document. 
+def draft_year(doc):
+  from bs4 import BeautifulSoup
+  soup = BeautifulSoup(doc)
+  ...
+draft year
+Point Guard
+Center
+Center
+Small Forward
+Point Guard
+Center
+Power Forward
+Small Forward
+2018
+2014
+2014
+2007
+2009
+2012
+2017
+2003
+Luka Doncic
+Nikola Jokic
+Joel Embiid
+Kevin Durant
+Steph Curry
+Anthony Davis
+Jayson Tatum
+LeBron James
+2017
+2017
+1999
+2017
+2017
+Estimate 
+Quality
+name
+position
+2017
+Prompt LLM: Extract 
+draft year directly 
+from the document. 
+position
+draft year
+name
+headline
+Filtered Attributes
+✔
+✔
+✔
+✘
+Function Candidates
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def draft_year(doc)
+Filtered Functions
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def extract_draft_year(doc)
+def draft_year(doc)
+2017
+Figure 1: The user provides a collection of raw documents (e.g. NBA player Wikipedia pages) and EVAPORATE outputs
+a table by identifying attributes and populating columns. EVAPORATE avoids running expensive LLM inference on all
+documents by (1) synthesizing the key attributes from a small sample of documents and (2) synthesizing (e.g. Pythonic)
+functions that then are reused at scale to process documents. Because function quality is variable, EVAPORATE applies
+an algorithm that generates many candidate functions and ensembles their extractions using weak supervision.
+Systems designed to tackle this problem must balance a three-way tradeoff between cost (data lakes may hold millions of
+documents), quality (output tables should be able to accurately support an analyst’s queries), and generality (different
+data lakes have different document types and structure). See Section 2 for a formal task deﬁnition and further discussion
+of this tradeoff.
+Given the sheer variety of formats, attributes, and domains across documents, prior systems rely on simplifying
+assumptions (e.g. focusing on one document format). A long line of work focuses on structuring HTML [10, 13, 23].
+The state-of-the-art systems assume attributes and values are at speciﬁc positions in the HTML-DOM [21, 42, 43, 63].
+For unstructured text, current approaches use linguistic tools (e.g., dependency parsers) to introduce structure [13, 23,
+29, 48]. The documents in Example 1 highlight the limitations of the prior approaches: they lack grounding HTML
+structure and, consistent with recent evaluation efforts [63], we ﬁnd the SoTA approaches for unstructured text perform
+poorly on long semi-structured PDFs (See Appendix C.1). To support new domains, one class of systems assumes
+access to a human-in-the-loop who can label data and write code [51, 55], while others assume access to annotated
+training documents from the domain [21, 42, 43]. Researchers manually annotated the reports in Example 1 [61].
+In this work, we explore whether we can avoid simplifying assumptions and maintain generality by leveraging large
+language models (LLMs). An LLM is a deep learning model that is pretrained on broad data and can be adapted to
+diverse tasks, from machine translation to data wrangling [12, 46]. At inference time, the models take as input a natural
+language task description termed a prompt [9, 12] and generate a natural language response. See Section 2.3 for more
+background on LLMs.
+EVAPORATE. (Section 3) We propose and evaluate EVAPORATE, a simple system that uses LLMs to produce structured
+views of semi-structured data lakes. Our evaluation spans 16 distinct settings representing a range of real-world data
+lakes: from movie and university websites (e.g. IMDB) to FDA 510(k) reviews for medical devices [21, 30, 32, 36, 42,
+61, 64].
+EVAPORATE exposes a general interface that can be used across these varied settings: the user inputs any collection of
+raw documents and EVAPORATE automatically identiﬁes the schema and extracts the attribute values to populate the
+table. Our implementation handles the diverse evaluation settings out-of-the-box, without any customization, training,
+or human effort.1 We propose two fundamental strategies for implementing this interface:
+1. EVAPORATE-DIRECT (Figure 2) The LLM directly extracts values from documents.
+2. EVAPORATE-CODE (Figure 4) The LLM synthesizes code that is applied to process documents at scale.
+We evaluate the strategies and identify a fundamental tradeoff between cost and quality. Code synthesis is cheap,
+but far less accurate than directly processing each document with the LLM. EVAPORATE-CODE underperforms
+EVAPORATE-DIRECT by 24.9% (13.8 F1 points) averaged across our evaluation settings.
+1Recent work applying prompting to data management requires customizing the prompt for each data setting [46, 57].
+2
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+We next propose a more involved code synthesis implementation, EVAPORATE-CODE+, which achieves better quality
+than direct extraction. Our key insight is to generate many candidate functions and ensemble their extractions using
+weak supervision.
+Direct Extraction (Section 3.1). Our ﬁrst implementation, EVAPORATE-DIRECT, applies a single prompt (included in
+Appendix E) to each document in the input. The prompt instructs the LLM to both identify the schema and extract
+values. Remarkably, we ﬁnd that in some settings, with a single prompt and no task speciﬁc modiﬁcations, performance
+is already competitive with state-of-the-art systems that rely on domain speciﬁc assumptions and training.
+However, this implementation is very expensive. LLMs are optimized for interactive, human-in-the-loop applications
+(e.g. ChatGPT) [62], not high-throughput data processing tasks [54]. The number of tokens processed by an LLM in
+EVAPORATE-DIRECT grows linearly with the size of the data lake. As of March 2023, applying OpenAI’s models to the
+55 million Wikipedia articles would cost over $110k (gpt-3.5, $0.002/1k tokens) and $1.1M (text-davinci-003,
+$0.02/1k tokens) dollars [1, 49]. There are billions of webpages on the broader Internet [33]. Moreover, in most
+organizations, data processing is a routine expense repeated by multiple data analysts, not a one-time cost [53]. Data
+lakes are dynamically changing; new NBA players are added to Wikipedia over time, players’ team attribute values
+change sporadically due to trades, and players’ points per game change after every game. EVAPORATE-DIRECT
+would need to be repeatedly applied.
+Code Synthesis (Section 3.2). Can we produce the structured table using a sublinear pass of the LLM over the
+documents? We propose EVAPORATE-CODE, which splits the task into two sub-tasks: (1) identify the table schema and
+(2) extract values. This view allows us to exploit the distinct redundancies of each sub-task that occur when running
+LLM inference on every document:
+1. Schema Generation. In order to identify a schema, we only process a small sample of documents with the
+LLM. This works because of redundancy in the attributes mentioned across documents. In Example 1, most
+reports mention a predicate device name.
+2. Function Synthesis. Instead of processing every document with the LLM and prompting it to directly extract
+values, we prompt it to synthesize (e.g. Pythonic) functions, that can then be applied at scale across the
+documents. This works because of redundancy in the formatting of attribute-value pairs. For instance, the
+predicate device name may consistently appear in the format “Predicate device name: k".
+The number of tokens processed by the LLM in EVAPORATE-CODE is ﬁxed and does not grow with the size of the data
+lake (as illustrated in Figure 3), addressing the cost issues of EVAPORATE-DIRECT. However, the LLM synthesizes
+variable quality functions, leading to tables that are up to 14 points in Pair F1 score worse than those produced using
+EVAPORATE-DIRECT.
+Code Synthesis + Aggregation. (Section 3.3) To improve quality while keeping costs low, we propose a third
+implementation, EVAPORATE-CODE+. Studying the synthesized functions, we observe some only work for a narrow
+slice of documents, while others exhibit syntactic and logical errors. To reduce variance, we synthesize many candidate
+functions and then estimate their quality and aggregate their extractions using weak supervision. This builds on recent
+work [3], which applies weak supervision to prompting.
+Weak supervision (WS) is a statistical framework for modeling and combining noisy sources with varied coverages
+without any labeled data [51, 59]. However, WS is typically applied over human-generated functions while our setting
+consists of machine-generated functions. This results in several issues when attempting to apply existing WS tools. (1)
+WS theoretically assumes all noisy sources are better than random performance (50% accuracy), while 40% of our
+generated functions are below 25% (Section 3.2). (2) WS attempts to deploy functions that achieve high quality on
+narrow slices of data (high precision), and allow the function to abstain on data external to the slice (low recall). While
+humans can express when functions should abstain, the machine-generated functions do not contain this logic. This
+makes it difﬁcult to identify and exploit the high precision, low recall functions. To handle the open WS setting, we
+present a novel algorithm for ensembling the functions.
+EVAPORATE-CODE+ achieves a pair F1 score of 67.5 on average across evaluation settings, a 12.1 point increase over
+EVAPORATE-DIRECT, using text-davinci-003. The prototype system demonstrates the possibility of LLM-based
+data management systems that achieve high quality at low cost, while maintaining generality. Our work makes the
+following contributions.
+1. We show that LLM-based systems can achieve high quality for structured view generation, while pro-
+viding a more general interface than prior systems. EVAPORATE-CODE+ outperforms the state-of-the-art
+systems (see Section 4) — which utilize in-domain training and document speciﬁc heuristics (e.g. DOM tags)
+3
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+— by 3.2 F1 points (6%) when generating tables from scratch, and 6.7 F1 points (10%) on the extraction step,
+given a predeﬁned schema.
+2. We explore two fundamentally different strategies for implementing EVAPORATE, direct extraction
+and code synthesis, showing that there is a cost-quality tradeoff between the approaches. EVAPORATE-
+CODE reduces the number of documents that need to be processed by the LLM by 110× at 10k documents per
+data lake. However, EVAPORATE-DIRECT achieves signiﬁcantly higher quality.
+3. We propose EVAPORATE-CODE+, a weak supervision based algorithm to help us reliably use the syn-
+thesized functions. EVAPORATE-CODE+ outperforms EVAPORATE-DIRECT, which directly processes every
+document, by 12.1 F1 points (22%) on average.
+4. We validate that the tradeoffs hold across multiple models. We evaluate EVAPORATE using four models
+from three unique LLM providers [4, 41, 49] and observe relative quality of EVAPORATE-DIRECT vs.
+EVAPORATE-CODE+ remains consistent as we vary the LLM.
+This paper is structured as follows. We deﬁne the problem in Section 2. We present EVAPORATE in Section 3,
+evaluations in Section 4, and discussion and related works in Sections 5 and 6. We release code at https://github.
+com/HazyResearch/evaporate.
+2
+Preliminaries
+We ﬁrst deﬁne the problem setting and system desiderata.
+2.1
+Problem Setting
+We study the problem of constructing a structured view (i.e. database table) of a set of semi-structured documents (e.g.
+HTML, PDF, TXT). Formally, we deﬁne the problem as follows:
+• Input: User provides a set of n semi-structured documents D = {d1, d2, ...dn} (e.g. A collection of FDA
+510(k) reviews for premarket notiﬁcation submission for medical devices).
+• Output:
+System outputs a table deﬁned by a set of attribute names A
+=
+{a1, a2, ...am} (e.g.
+a1 =indications for use, a2=classification) and a set of n extracted records for R = {r1, r2, ...rn},
+one per document, where ri is an m-tuple (e.g. r1 = (“fracture", “x-ray")).
+Unlike prior work which proposes systems that rely on manual labeling [55] or manual prompt tuning [46], we aim to
+develop fully automated solutions, which require no additional user interaction beyond specifying the input documents.
+How do we evaluate? We compare the generated table (A, R) to a manually curated “ground-truth" table ( ˆA, ˆR). The
+coverage of an attribute refers to the fraction of documents that include the attribute and its value. Following prior
+work, we prioritize attributes with high coverage, which tend to be useful for analysis [14, 17]. We measure agreement
+between the tables using Pair F1. For additional details on our evaluation setup, see Section 4.3.
+2.2
+System Desiderata
+Current systems for producing structured views are limited in their generality, cost/ﬂexibility, and quality/usability
+[14, 17, 48, 63]. Here we review the existing systems.
+Generality. The ideal system will generalize across document formats and domains, without manually engineered rules
+or task-speciﬁc training. This is important because the input documents D could focus on any imaginable topic or use
+any ﬁle format [63]. Existing systems featurize documents by tagging the named entities (NER), dependency parse tree,
+and part-of-speech (POS), and train a model to predict whether a span of text is a useful fact [38]. Unfortunately, the
+performance of the parse, NER, and POS tags drastically degrade on semi-structured data (e.g. HTML elements) and
+longer sequences of text (i.e. full documents) [63]. We provide detailed error analysis in Appendix C.1. A specialized
+class of systems focuses on processing semi-structured web HTML documents by leveraging the HTML DOM tree as
+features [11, 14, 21, 23, 43, inter alia.]. However, the systems thus do not support other document formats.
+Cost. The ideal system will enable users to manage a cost-coverage tradeoff, rather than requiring them to extract
+“all-or-nothing”.
+The existing systems are built to extract all possible facts in the documents, without prioritizing
+important attributes or allowing the user to inﬂuence what is extracted [20, 63]. Processing every line of every document
+can be expensive. To mitigate this, the user can deﬁne the attributes of interest then apply a closed IE system for
+4
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Sample text: 
+Patient birth date: 1990-01-01 
+Prescribed medication: aspirin, acetaminophen 
+Prescribed dosage: 1 tablet, 2 tablets, 3 tablets 
+Doctor's name: Dr. Burns 
+Date of discharge: 2020-01-01 
+Hospital address: 123 Main Street, New York, NY 
+ 
+Question: List all relevant attributes about that are 
+mentioned in this sample text if any. 
+Answer:  
+- Prescribed medication: aspirin, acetaminophen 
+- Prescribed dosage: 1 tablet, 2 tablets, 3 tablets 
+ ---- 
+ Sample text: 
+<document> 
+ 
+Question: List all relevant attributes that are mentioned in 
+this sample text if any.  
+Answer: 
+Integrated Prompt
+task demonstrations
+placeholder
+Figure 2: Prompt for EVAPORATE-DIRECT structured. The prompt template, which includes placeholders for in-context
+examples and and the inference example (i.e., data lake documents in the context of our problem), is applied to each
+document in the data lake.
+extraction, however this requires upfront human effort. Desiderata: The ideal system will enable users to manage a
+cost-coverage tradeoff, rather than requiring them extract “all-or-nothing”.
+Quality. The ideal system will output a table (A, R) with full columns (i.e. high-coverage attributes) and accurate,
+consistently formatted extractions. Existing OpenIE systems commonly extract tuples in unnormalized forms directly
+from documents [20]. This can make the resulting extractions difﬁcult to use for analysis, requiring advanced systems
+or user-deﬁned post-processing code for resolving subject, objects, and predicates to a canonical form [13].
+2.3
+Background on Large Language Models
+In this section, we provide background on large language models (LLMs), which are central to our work.
+DEFINITION 1 (LARGE LANGUAGE MODEL) A machine learning model, F, trained on a self-supervised task (e.g.
+next word prediction) over a massive corpus of text [27]. Language models can be used to generate new text based on
+provided context. For example:
+F(All that glitters ) →is not gold.
+Numerous studies have demonstrated LLMs capable of solving new tasks without updating any model parameters, a
+phenomenon termed in-context learning [2, 12, 46]. Speciﬁcally, these studies show that when passed an appropriate
+description of the task, the model often generates text completing the task.
+DEFINITION 2 (PROMPT) A natural language task-speciﬁcation used to elicit a particular generation from an LLM.
+Prompts often include demonstrations of the task. For example, the prompt below elicits the translation of the word
+cheese into French:
+F(Translate. Eng: hello, Fr: bonjour; Eng: cheese, Fr:
+|
+{z
+}
+Prompt
+) →fromage
+| {z }
+Generation
+Examples of prompts used in this work are provided in Figures 2 and 4. All prompts used in the system are provided in
+Appendix E.
+3
+EVAPORATE: A Prototype System Powered by Language Models
+In this section, we describe EVAPORATE, a prototype system that uses LLMs to materialize a structured view of a
+heterogeneous, semi-structured data lake.
+5
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Interface. Compared to prior systems, which rely on manual labeling [55] or tuning prompts to a domain [46], EVAPO-
+RATE exposes a remarkably general interface: the user inputs raw documents of any format and the system automatically
+outputs a structured view of those documents, without any domain speciﬁc training or prompt customization. We
+propose two implementations of this interface which tradeoff cost and quality.
+Implementation. There are two fundamentally different approaches to implementing this interface with LLMs. Either
+we feed every document to the LLM and prompt it to extract values directly (direct extraction), or we feed a small
+sample of documents to the LLM and prompt it to write code to do the extraction (code extraction). An example prompt
+for the former approach is shown in Figure 2 and for the latter in Figure 4.
+In Section 3.1 and Section 3.2, we describe baseline implementations of these two strategies, EVAPORATE-DIRECT
+and EVAPORATE-CODE. We ﬁnd that these two implementations tradeoff cost and quality. Then, in Section 3.3, we
+propose a code extraction implementation that uses weak supervision to improve quality.
+3.1
+EVAPORATE-DIRECT
+In this section, we describe a simple direct extraction implementation, EVAPORATE-DIRECT that applies a single
+prompt template to every document. This prompt template, which is included in Figure 2, instructs the LLM to both
+identify the schema and extract values (see Appendix E for the full prompt). It consists of a few in-context examples
+that are general, i.e. are not customized to a particular format, domain, or document.
+Below we discuss how we (1) manage long documents that cannot ﬁt in the LLM’s context window, (2) process the
+LLM’s textual outputs, (3) prioritize the most useful attributes according to principles described in prior work [14].
+Managing long documents. The input to EVAPORATE is a ﬁle path to raw documents, which can be several pages
+long. For instance the Medical FDA reports in Example 1 are ∼20 pages long. However, the underlying Transformer
+architecture of modern LLMs is limited to processing a ﬁxed number of tokens (e.g. a few thousand tokens), referred to
+as the context window, during each inference call. EVAPORATE therefore splits the raw documents such that each piece
+is within the context window. Each chunk is inserted into the prompt in turn as shown in Figure 2.
+Processing text outputs. Language models output open ended text so the last step is to convert this to a usable table.
+To facilitate this data transformation, we can specify formats in our prompt demonstrations to encourage the LLM
+to organize the output in a similar structure. For instance, the demonstration in Figure 2 speciﬁes a list format with
+<attribute>: <value(s)> per entry. EVAPORATE outputs in this format can be de-serialize into a table.
+Prioritizing common attributes. The list of extracted attributes and values can contain the niche attributes for speciﬁc
+documents, whereas a common database design principle is to capture the high frequency attributes [13]. Therefore
+EVAPORATE takes the union of attributes outputted across documents and ranks by frequency to enable prioritizing
+head attributes.
+Analysis. We analyze this direct extraction implementation, EVAPORATE-DIRECT, along the axes of our three
+desiderata. Results processing the documents with EVAPORATE-DIRECT are reported in Table 3 and are discussed in
+detail in Section 4.
+Overall, the quality matches or exceeds the baseline systems (described in Section 4), on 8 of the 16 settings. This is
+surprising given the simplicity — i.e. EVAPORATE-DIRECT uses one ﬁxed prompt to process all 16 settings. However,
+fundamental cost limitations impede the real-world deployment of this approach.
+However, the high cost of this implementation limits its applicability to large, recurring workloads. The number of
+tokens processed by the LLM scales linearly with the size of the data lake, O(n). Data lakes can contain billions of
+documents [33, 47]. Further, in most organizations, data processing is not a one time cost. Data lakes are dynamically
+changing, so EVAPORATE-DIRECT would need to be repeatedly applied.
+3.2
+EVAPORATE-CODE
+In this section, we present EVAPORATE-CODE, which signiﬁcantly reduces cost compared to EVAPORATE-DIRECT.
+Here, we perform schema identiﬁcation separately from value extraction, which allows us to exploit fundamental
+differences between the sub-tasks to reduce cost. In schema identiﬁcation, we ﬁnd that we only need to process a small
+sample of documents because attributes are consistent across documents. On the other hand, in order to extract values,
+we must process every document. However, the ways in which values appear across documents (i.e. their relative
+positions in the document) tend to be consistent, meaning the extraction logic is consistent across documents.
+The two steps of the decomposed implementation are:
+6
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+0
+2
+4
+6
+Log Documents
+4
+6
+8
+10
+Log Toks. Processed
+Direct
+Code
+1
+2
+3
+4
+Log Attributes
+6
+7
+8
+Log Toks. Processed
+Direct
+Code
+Figure 3: Tradeoffs between processing the documents via direct prompting in EVAPORATE-DIRECT (Direct) versus
+code synthesis in EVAPORATE-CODE and EVAPORATE-CODE+ (Code). For small data lakes and large numbers of
+attributes, Direct is sufﬁcient. As the number of documents grows, Code is orders-of-magnitude more efﬁcient. Left is
+evaluated at 10 attributes, Right at 10K documents, assuming 10K tokens per document.
+1. Schema synthesis.
+(Section 3.2.1) We observe that the attribute outputs contain relatively consistent
+<attributes>, even though the values differ from document to document. To exploit this redundancy,
+EVAPORATE-CODE prompts an LLM to analyze a small sample of documents to identify attributes for the
+output schema. For example, given a sample of the Medical Device FDA Reports, the LLM outputs a devices
+table with attributes like "510(k) number".
+2. Function synthesis (Section 3.2.2).
+We observe consistencies in how attributes are embedded across
+documents.
+E.g., the 510(k) code in the FDA documents always starts with the letter “k” and the
+player position attribute is always in the HTML “infobox” element in NBA player Wiki pages. A
+researcher would likely exploit such redundancies when manually scraping the documents for analysis. In
+EVAPORATE-CODE, we propose to use the LLM to automatically synthesize a data-lake-speciﬁc suite of
+functions, that can then be applied at scale to process many documents.
+3.2.1
+Schema Synthesis
+EVAPORATE-CODE begins by identifying attributes A = {a1, a2, ...am} for the output table’s schema.
+Generating candidate attributes Concretely, we sample a set ˜D of k << n documents from D. For each, we prompt
+the LLM to extract the most useful attributes from the document as in EVAPORATE-DIRECT. Recall this yields a set
+of attributes ranked by how frequently they were extracted across documents. We retain attributes that are explicitly
+mentioned in the document to ensure provenance in schema identiﬁcation.
+Re-ranking candidate attributes Because EVAPORATE-CODE now identiﬁes the attributes from a small set of documents,
+we observe that EVAPORATE-CODE’s ranking is noisier than when every document was processed in EVAPORATE-
+DIRECT, i.e. an important attribute may be selected by the LLM a few times amongst the k documents. To address
+this, we introduce a new prompting step in which we include the union of extracted attributes and instruct the LLM
+to identify the most useful attributes (see Appendix E for the prompt). High quality on this task reﬂects the powerful
+reasoning capabilities of recent LLMs. Finally, the frequency-based rank is upweighted by a constant multiplicative
+factor if the attribute is included in the LLM output.
+3.2.2
+Function Synthesis
+Given the attributes A = {a1, a2...am}, the objective of EVAPORATE-CODE’s second phase is to extract the values of
+the attributes for each document di ∈D. Our key insight, as discussed, is that attribute-values are expressed in similar
+ways from document to document. To exploit this, instead of processing every document with the LLM to extract values
+for attribute ai, we propose to use the LLM to generate code that can then be reused to process many documents.
+Figure 4 shows an EVAPORATE-CODE function synthesis prompt. The in-context examples show pairs of text snippets
+and functions to extract an attribute of interest. EVAPORATE-CODE searches the data lake via a simple keyword search
+for document portions that mention ai, and includes this in the prompt. EVAPORATE-CODE synthesizes functions
+for attributes following the rank-order of attributes derived during schema synthesis. This means that values of the
+most relevant (and frequent) attributes as determined by EVAPORATE-CODE are extracted ﬁrst. The user can stop the
+synthesis when desired.
+7
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Analysis. We brieﬂy analyze the EVAPORATE-CODE implementation along the axes of our three desiderata. Results
+processing the documents with EVAPORATE-CODE are reported in Table 3 and are discussed in detail in Section 4.
+Here is a file sample: 
+DESCRIPTION: This post answers the question, "How do I 
+sort a dictionary?" 
+DATES MODIFIED: The file was modified on the following 
+dates: 
+2009-03-05T00:49:05 
+2019-04-07T00:22:14 
+2011-11-20T04:21:49 
+USERS: The users who modified the file are: 
+Jeff Jacobs 
+… 
+ 
+Question: Write a python function called "get_dates_modi-
+fied_field" to extract the "DATES MODIFIED" field from the 
+text. Include any imports. 
+ 
+import re 
+def get_dates_modified_field(text: str):  
+          parts= text.split("USERS")[0].split("DATES 
+MODIFIED")[-1]
+          pattern = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}’ 
+          return re.findall(pattern, text) 
+---- 
+Here is a file sample: 
+<title>U.S. GDP Rose 2.9% in the Fourth Quarter </title> 
+<meta itemProp="datePublished" 
+content="2023-01-26T10:30:00Z"/> 
+… 
+Question: Write a python function called "get_date_pub-
+lished_field" to extract the "datePublished" field from the 
+text. Include any imports. 
+ 
+from bs4 import BeautifulSoup 
+def get_date_published_field(text: str):  
+          soup = BeautifulSoup(text, parser="html.parser") 
+          date_published_field = soup.find('meta', itemprop="-
+datePublished") 
+          date_published_field = date_published_field['content’] 
+          return date_published_field 
+ 
+---- 
+ 
+Here is a file sample: 
+<document> 
+Question: Write a python function called "get_<attribute>_-
+field" to extract the <attribute> from the text. Include any 
+imports. 
+Function Generation Prompt
+task demonstrations
+placeholder
+import re 
+def get_dates_modified_field(text: str):  
+  parts= text.split("USERS")[0].split(
+    "DATES MODIFIED"
+  )[-1]
+  pat = r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}’ 
+  return re.findall(pat, text) 
+from bs4 import BeautifulSoup 
+def get_date_published_field(text: str):  
+  soup = BeautifulSoup(
+    text, parser="html.parser"
+  ) 
+  date_published_field = soup.find(
+    'meta', itemprop="datePublished"
+  ) 
+  return date_published_field['content’] 
+draft year
+Figure 4: A representative prompt for function synthesis with
+two data lake agnostic in-context examples.
+Cost. The number of tokens processed by the LLM in
+EVAPORATE-CODE is ﬁxed with respect to the number
+of documents. Figure 3 demonstrates the asymptotic
+differences in cost between EVAPORATE-DIRECT and
+EVAPORATE-CODE. As shown in the left plot, Evapo-
+rate is asymptotically more efﬁcient as a function of the
+number of documents. This is because the number of
+LLM calls required with function generation is propor-
+tional to the number of attributes to be extracted, not the
+number of documents. The crossover point is at ∼40
+documents. In the right plot, we show EVAPORATE-
+DIRECT has the potential to extract multiple attributes
+from the in-context document per inference call, while
+EVAPORATE-CODE requires generating new functions
+for each attribute. As a result, the cost of EVAPORATE-
+CODE grows with the number of attributes, while the
+cost of EVAPORATE-DIRECT approach is constant. The
+crossover point is at ∼2,500 attributes.
+Quality. The tables generated by EVAPORATE-CODE
+are on average 13.8 pair F1 points worse than those pro-
+duced using EVAPORATE-DIRECT. This suggests that
+there is a cost-quality tradeoff between the two imple-
+mentations, since EVAPORATE-CODE is much cheaper.
+3.3
+EVAPORATE-CODE+
+In this section we discuss an extension of EVAPORATE-
+CODE, which enables signiﬁcant quality improvements
+while keeping costs low. This implementation, which we
+call EVAPORATE-CODE+, synthesizes many candidate
+functions and ensembles their extractions using weak
+supervision. We decompose the task into three parts:
+1. Schema identiﬁcation. (Section 3.2.1) Same
+as in EVAPORATE-CODE.
+2. Function synthesis. (Section 3.3.1) Same as
+in EVAPORATE-CODE, except instead of gen-
+erating a single function per attribute, we gen-
+erate many candidate functions. Below we de-
+scribe techniques to encourage diversity among
+candidates.
+3. Function aggregation. (Section 3.3.2) The
+synthesized candidate functions have varying
+qualities and coverages, making them unreli-
+able. We then introduce a weak supervision
+(WS) based algorithm to aggregate over their
+different predictions for the attribute values
+across documents.
+3.3.1
+Synthesizing Diverse Candidate Functions
+We ﬁnd that the quality of LLM-generated functions
+varies signiﬁcantly depending on the document chunk
+and in-context examples used in the prompts. To address the variability in function quality, we adopt the strategy we
+previously proposed in Arora et al. [3]. This strategy curates multiple diverse prompt templates for the same task (i.e.
+8
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+multiple function generation prompts in the style of Figure 4) and prompts the LLM with each in turn to produce a
+diverse set of function candidates F = {f1, f2, ...fk}.
+Concretely, we curate two function generation prompts PA and PB (both included in Appendix E) PA includes no
+in-context examples, only a task description that encourages the LLM to use regular expressions. PB includes two
+in-context examples along with the task description that encourages the LLM to import and use any Python library of
+choice. We ﬁnd that neither consistently outperforms the other. PA produces higher quality functions on 69%, 45%,
+60%, 91%, and 31% of attributes on the 8 SWDE Movie, 5 SWDE University, FDA reports, Enron, and Wikipedia
+player pages settings respectively. Writing a single “perfect” prompt that performs well across all documents can be
+challenging and prompting the LLM to complete the task in multiple ways helps.
+3.3.2
+Aggregating Candidate Functions
+Next, we discuss how to combine the aggregations of the candidate functions.
+Background: Methods for Unsupervised Aggregation Because we lack ground truth labels in our setting, it is not
+possible to directly evaluate the quality of the candidate functions. A popular unsupervised aggregation strategy is to
+take the Majority Vote (MV) across function outputs [60]. Formally, MV treats the functions as independent of one
+another and assigns equal weight to all function outputs. However, the functions are not of equal quality — over 40% of
+synthesized functions result in less than 25 Text F1 in extraction quality. Therefore, EVAPORATE uses weak supervision
+(WS), a popular standard statistical framework for modeling the accuracies and correlations between noisy sources of
+information without any labeled data [26, 51]. WS is widely used in industry [51].
+Unfortunately, the standard programmatic WS setup makes several assumptions that do not apply in our setting. The gap
+arises because the standard programmatic WS setup assumes human-designed functions that output standardized classes
+for classiﬁcation. In contrast, the functions in our setting are machine-generated functions that output non-standardized
+extracted text. Our setting violates the following assumptions of the existing WS setting:
+1. Assumption 1: Functions will abstain on examples where they do not apply [26, 51]. WS is able to
+exploit high-precision functions that may not have high recall. When humans construct the functions, they
+typically specify conditions under which the function is applicable (e.g. “If the email has a URL, “vote” that
+it contains spam, otherwise abstain” [56]). However, it can be challenging to generate functions with this
+advanced logic. As a result, the machine-generated functions from our prompts always provide some output.
+This is particularly important when the function is not able to extract a value from a document, which can
+either be because the attribute does not exist in the document (“No Attribute Value”, e.g. a Wikipedia page may
+be missing a college attribute since historically, not all basketball players have attended college) or because
+the attribute exists but the function does not apply to this speciﬁc instance (“Function Abstension”, e.g. the
+product code attribute value starts with a lowercase “k” in the minority of FDA reports and capital “K” in
+the majority. EVAPORATE-CODE generates functions for both cases, which output the product code on
+relevant documents, and empty strings otherwise.). If we cannot distinguish between cases, we will not be
+able to exploit high precision / low recall functions in our setting.
+2. Assumption 2: Functions are correlated with the ground truth label y at better than random perfor-
+mance [26, 51]. While this is reasonable when functions are human-designed, EVAPORATE uses machine-
+generated functions. We ﬁnd 51% of generated functions yield < 50 Text F1.
+3. Assumption 3: Weak supervision is typically applied to tasks with well deﬁned classes in a classiﬁcation
+setting [26, 51]. In our case, the output of the functions are extracted text, and thus there is a virtually
+unconstrained output space of possible extractions that vary from document to document (e.g. NBA players
+have varied date of birth values). The number of unique extractions collected by the functions can also
+differ across documents.
+We propose the following approach to be able to leverage WS. Let Deval be a small sample of documents from the data
+lake D. We have the set of generated functions F and LLM F.
+Identifying function abstentions. Our objective is to estimate the probability that an empty output from a function is an
+abstension. We propose to measure the fraction e of the Deval documents for which F extracts a value. Intuitively,
+when e is high, our prior should be that the attribute appears in a large fraction of documents, so we should assume
+functions are abstaining when they output empty values. When e is low, the attribute appears in few documents, so
+we should assume the functions are predicting empty values. We can use e to guide both our function evaluation and
+downstream aggregation. Note that it is possible for F to abstain or hallucinate values when they do not exist in the
+document, affecting the estimate of e.
+9
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Algorithm 1 Function Aggregation (from EVAPORATE-CODE+)
+1: Input: Documents D, candidate functions F, LLM F.
+Output: Predicted extractions ˆyi, ..., ˆyn for documents.
+2: Collect sample predictions Sample Deval ⊂D and apply the functions fj ∈F and LLM F to obtain ˆyij and ˆyiF
+for document di.
+3: Handle abstensions: For empty ˆyij, we need to determine if they represent function abstensions or predictions
+that di has no-value for the attribute. Use F to decide between cases: compute e as the fraction of di ∈Deval with
+non-empty ˆyiF
+4: Score functions: Compute a score sj for fj using metric function m(·) based on e.
+if e > τ then
+sj = Pi=n
+i=1 m(ˆyiF, ˆyij)|ˆyiF ̸= ∅
+else
+sj = Pi=n
+i=1 m(ˆyiF, ˆyij)
+5: Filter low quality functions Remove fj ∈F with sj ≤0.5 to create F ′.
+6: Collect votes Apply f ∈F ′ to all di ∈D to collect “votes” for the attribute-value in di. Post process empty votes
+as abstensions or no attribute predictions depending on e.
+7: Aggregation Use weak supervision to obtain the ﬁnal prediction ˆyi given the function votes {ˆyij|fj ∈F ′}.
+Filtering functions with worse than random performance. One key observation is that we can utilize the high quality
+LLM F on a small set of documents Deval (e.g. we use |Deval| ≤10). In Table 7, we validate that LLMs can generate
+high quality extractions for a wide range of attributes and document formats. We can leverage these as a high quality
+estimate of the ground truth extractions for those documents. We compute a score sj by comparing the outputs of
+function fj(·) against the outputs of F on document di ∈Deval. If we are in the low e regime, we should evaluate
+the outputs on all d ∈Deval. If we are in the high e regime, we should evaluate the outputs on only the d ∈Deval for
+which the function extracted a value. We ﬁnally ﬁlter any function fj with scores sj ≤0.5, where 0.5 derives from the
+typical WS assumptions [26, 51, 58].
+Handling extractions with unconstrained output spaces. The k generated functions can produce [0..k] unique prediction
+votes for a single unlabeled document di, and the number of unique votes can differ from document di to dj. Therefore,
+for each di ∈D, we bucket the unique votes and take the b buckets representing the most frequently occurring votes.
+The votes for functions that outputted values outside the top-b are marked as abstensions. If the number of unique votes
+is < b, placeholder values are inserted into the top-b. Finally, as the “classes” differ across documents, we introduce a
+constraint to the objective function encouraging the class-conditional accuracies to be equal.
+After addressing these assumptions, we can leverage prior approaches to aggregate the noisy extractions from the
+function candidates into higher-quality extractions as in [3, 51]. Under WS, the output of each function is viewed as a
+“vote” for the true label and the objective is to construct a latent graphical model to account for the varied accuracies
+and correlations amongst the functions, without access to any labeled data. Our aggregation method is summarized in
+Algorithm 1.
+Analysis. We brieﬂy analyze the EVAPORATE-CODE+ implementation along the axes of our three desiderata. Results
+processing the documents with EVAPORATE-CODE+ are reported in Table 3 and are discussed in detail in Section 4.
+Cost. As with EVAPORATE-CODE, the number of tokens processed by the LLM in EVAPORATE-CODE+ is ﬁxed with
+respect to the number of documents. Figure 3 demonstrates the asymptotic differences in cost between EVAPORATE-
+DIRECT and EVAPORATE-CODE. The number of tokens that must be processed by the LLM grows only by a constant
+factor: the number of function candidates generated. The user can set this number to balance cost and quality.
+Quality. Of the three implementations, EVAPORATE-CODE+ produces the highest quality tables. EVAPORATE-CODE+
+outperforms EVAPORATE-DIRECT by 12.1 F1 points (22%) on average, while using far fewer computational resources.
+Using function aggregation leads to an improvement of 25.1 F1 points over EVAPORATE-CODE.
+4
+Evaluations
+We evaluate the three EVAPORATE system implementations across 16 document formats spanning ﬁve domains
+representing a range of real-world settings. Our evaluation is designed to validate the following claims:
+• Function synthesis enables asymptotic cost reductions for processing data with LLMs. There has been
+signiﬁcant recent interest in developing various data management applications with LLMs [16, 35, 39, 46].
+10
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Prior work directly processes data with the LLM. By synthesizing functions that process the data, EVAPORATE-
+CODE+ reduces the number of tokens the LLM needs to process by 110x relative to EVAPORATE-DIRECT.
+• Function synthesis + aggregation results in higher quality than direct extraction. Despite the fact that
+EVAPORATE-DIRECT processes each document with the LLM directly, EVAPORATE-CODE+ performs 12.1
+F1 points (22%) better on average. Based on comparisons with EVAPORATE-CODE, which only synthesizes
+one function, we show that function aggregation is key in enabling the improvements.
+• EVAPORATE achieves higher quality than state-of-the-art baselines, while exposing a more general
+interface. EVAPORATE-CODE+ expresses tasks via merely six natural language prompts (all provided in
+Appendix E) and uses no training. Yet, it exceeds SoTA systems by 3.2 F1 (6%) points when generating
+tables from scratch and 6.7 points (10%) when extracting pre-deﬁned gold attributes. Meanwhile, it supports a
+broader range of settings than any of these baselines.
+• The identiﬁed tradeoffs hold across language models. We evaluate on four models from three unique
+providers [4, 41, 49]. We ﬁnd that the tradeoff space we identify between EVAPORATE-DIRECT and
+EVAPORATE-CODE+ holds across LLMs. The implementations remain competitive in quality across LLMs.
+4.1
+Experimental Setup
+We primarily evaluate EVAPORATE on the end-to-end task of structured view generation. For the purpose of comparison
+to prior work, we also evaluate on the sub-task of closed information extraction. We ﬁrst deﬁne these tasks, their
+metrics, and the baselines. We then provide implementation details for EVAPORATE.
+Structured view generation task. This captures the end-to-end task of identifying the schema and populating the
+output table. This task is often discussed as a vision system [14], and given the difﬁculty of this task, there are limited
+comparable works. We therefore compare to the closest line of work, OpenIE systems, where the task is to extract
+all facts from documents [5, 48]. We compare to two sets of baselines: (1) Deng et al. [21], Lockard et al. [42, 43]
+for HTML-speciﬁc OpenIE, and (2) Kolluru et al. [38] for generic unstructured text. The former models explicitly
+use the HTML-DOM tree structure to process the page, assuming attribute values are leaf nodes, and explicitly train
+on documents from the domain of interest. The latter class of systems ﬁrst label sentences using linguistic tools (i.e.
+dependency parsers, part of speech taggers, and named entity taggers), and ﬁne tune LLMs over these features to
+perform the task [63].
+Metrics. Following the baseline work [21], we report performance using Pair F1. This is an F1 score applied to the
+predicted vs. gold sets of tuples of the form (document ID di, attribute aj, value ri,j). All three elements in the
+tuple must exactly match a tuple in the ground truth to be marked correct. Since EVAPORATE ranks the attributes and
+generates functions in this order, for fair comparison, we report OpenIE scores for all tuples up to k attributes, where k
+is the number of gold attributes for the setting. We note that the prior systems extract all-or-no tuples, in contrast.
+Closed information extraction task. This captures the setting where the user provides a pre-deﬁned schema and
+EVAPORATE is used to populate the table. We compare to state-of-the-art approaches for ClosedIE including: (1) Deng
+et al. [21], Lockard et al. [42, 43] for HTML-speciﬁc ClosedIE and (2) Clark et al. [18], He et al. [31] for generic
+unstructured text. The former models explicitly use the HTML-DOM tree structure to process the page, assuming
+attribute values are leaf nodes, and explicitly train on documents from the test domain. The latter are pretrained LLMs
+that have been ﬁne tuned on massive amounts of labeled (attribute, value) pairs [50]. We report ClosedIE results
+using the Text F1 metric on a value-by-value basis across each document.
+EVAPORATE implementation details. In the following experiments, we instantiate EVAPORATE with currently
+popular, LLM APIs. Experiments in Sections 4.3 and 4.4.1 use text-davinci-003 from OpenAI. In Section 4.4.2,
+we evaluate additional LLMs from three model providers. For experiments, we use 10 sample documents per data
+lake for the schema synthesis, function synthesis, and function veriﬁcation. We apply Algorithm 1 over the top-10
+scoring functions that are synthesized for each attribute and data lake. The prompts remain constant across data lakes
+and models.
+When the measuring cost for alternate implementations of EVAPORATE, we compute total number of tokens processed
+by the LLM to perform the end-to-end task (i.e. the sum of the number of tokens in the prompt and the number of tokens
+the model generates). We use this metric because the wall-clock time and dollar cost of a model ﬂuctuate depending on
+the setup, but both should be proportional to the number of tokens processed.
+11
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Source (Format)
+CLOSEDIE
+OPENIE
+F1
+R
+P
+F1
+FDA (TXT)
+80.1
+58.9
+67.2
+62.8
+Enron Emails (TXT)
+93.3
+80.3
+94.6
+86.9
+Wiki NBA (HTML)
+84.7
+55.7
+88.2
+68.2
+SWDE Movie (HTML)
+79.5
+48.5
+71.0
+56.8
+SWDE University (HTML)
+73.7
+50.9
+71.4
+59.0
+Average
+82.3
+58.9
+78.5
+66.7
+Table 1: Quality of EVAPORATE-CODE+ evaluated on ClosedIE in Text F1 and OpenIE in Pair F1 across all documents
+using text-davinci-003.
+System
+SWDE MOVIE
+SWDE University
+Closed
+Open
+Closed
+Open
+ZeroShot Ceres [43]
+-
+50.0
+-
+50.0
+RoBERTa-Base
+49.3
+35.6
+36.6
+38.0
+RoBERTa-Structural
+47.7
+39.9
+46.5
+42.3
+DOM-LM [21]
+71.9
+54.1
+68.0
+55.2
+EVAPORATE-DIRECT
+84.4
+37.4
+72.6
+54.4
+EVAPORATE-CODE
+55.0
+33.0
+40.5
+22.2
+EVAPORATE-CODE+
+79.5
+56.8
+73.7
+59.0
+Table 2: Comparisons to state-of-the-art on ClosedIE in Text F1 and OpenIE in Pair F1. The baselines train on in-domain
+documents, while EVAPORATE uses no training. Baselines are as reported in [21] as code was not released.
+4.2
+Evaluation Settings
+We evaluate EVAPORATE on 16 settings representing a range of real-world data lakes. First, we use a benchmark
+suite of 13 Movie and University websites to compare EVAPORATE to state-of-the-art information extraction systems
+[21, 30, 42]. Next, to evaluate on more unstructured data (i.e. non-HTML) we turn to: Enron a corporate email corpus
+that has been analyzed in over three thousand academic papers [32, 36], FDA 510(k) reviews for premarket notiﬁcation
+submissions for medical devices, which have been the subject of multiple important research studies [61, 64], and NBA
+Wikipedia pages for NBA players, which include more complex HTML than the existing benchmarks [21]. We release
+the benchmarks and provide additional details in Appendix B. Here we brieﬂy describe the properties we aim to study
+with each setting:
+1. Benchmark Suite: SWDE Movies & Universities SWDE is the standard benchmark for document-level IE
+in prior work [21, 30, 42, 43, inter alia.]. There are 8 sets of webpages for Movies (e.g. IMDB, Rottentomatoes)
+and 5 sets of webpages for Universities (e.g. US News). For each website, the benchmark contains 1063-2000
+pages and annotations for 8-274 attributes. We use this benchmark to effectively compare to the state-of-the-art
+and test on a range of attribute types, e.g. simpler Movie runtime through complex Movie cast and popular
+Movie director through infrequent second assistant director.
+2. Complex HTML: NBA The SWDE webpages attribute values are isolated in separate leaf nodes in the
+HTML-DOM tree. We use NBA Player Wikipedia pages evaluate on more complex HTML. For instance, the
+NBA draft attribute contains the draft round, year, pick number, and team by which the player was selected.
+We evaluate on 100 randomly selected player pages (spanning the 1940s-present) and 19 attribute annotations.
+3. Unstructured Text: Enron and FDA We observe a lack of existing benchmarks for document-level IE over
+unstructured text — intuitively, this setting has been challenging with prior generations of models due to the
+lack of any grounding structure whatsoever (i.e. recall current systems rely on HTML-DOM elements or
+sentence-level NER, dependency, and POS tags). We turn to the Enron and FDA settings described above. The
+Enron setting contains 15 gold attributes and 500k documents. The FDA setting contains 16 gold attributes
+and 100 PDF documents, which are up to 20 pages long, randomly sampled from FDA 510(k).
+4.3
+Comparing EVAPORATE to State-of-the-Art Baselines
+First we validate that EVAPORATE-CODE+ outperforms the state-of-the-art, both in terms of quality metrics, and in
+terms of the number of unique document formats and domains handled by a single system without any data lake speciﬁc
+customization. These baselines are as deﬁned in Section 4.1.
+12
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Source
+EVAPORATE-DIRECT
+EVAPORATE-CODE+
+Relative Performance
+Quality
+Cost / 10K Documents
+Quality
+Cost / 10K Documents
+Quality
+Cost Reduction
+F1
+Tokens (M)
+Cost ($)
+F1
+Tokens (M)
+Cost ($)
+FDA
+48.6
+145.6
+2,900
+64.9
+1.9
+38
++16.3
+77x
+Enron Emails
+90.9
+21.2
+425
+87.1
+0.6
+12
+-3.8
+35x
+Wiki NBA
+45.9
+650.1
+13,000
+68.6
+3.0
+60
++22.7
+217x
+SWDE Movie
+37.4
+282.9
+5,660
+57.4
+2.3
+46
++38.0
+123x
+SWDE University
+54.4
+190.1
+3,800
+59.5
+1.9
+38
++5.1
+100x
+Average
+55.4
+258
+5,157
+67.5
+1.9
+39
++12.1
+110x
+Table 3: Quality (OpenIE Pair F1) and cost (number of tokens processed by the LLM) for producing the structured
+views. We compare the direct prompting and code synthesis implementations using text-davinci-003. We evaluate
+quality on 10 randomly sampled documents due to the cost of EVAPORATE-DIRECT and here, report on the same
+sample for EVAPORATE-CODE+.
+Overall, EVAPORATE performs the end-to-end task on documents spanning 16 formats and ﬁve domains. Averaged
+across settings, EVAPORATE-CODE+ provides 82.3 Text F1 on ClosedIE and 66.7 Pair F1 on OpenIE (Table 1). In
+Appendix F, we provide Figures showing samples of the documents that are input to EVAPORATE and the outputted
+tables.
+Systems for semi-structured text Shown in Table 2, EVAPORATE-CODE+ outperforms the state-of-the-art on the
+canonical SWDE benchmarks. In contrast to EVAPORATE, which uses no training whatsoever, the baselines are limited
+to HTML documents and explicitly perform supervised learning using labels from webpages within the Movie and
+University domains respectively [21, 43]
+Critically, the baseline systems restrict their scope to attributes that are speciﬁcally mentioned in the HTML <body>
+text, even though attributes are frequently mentioned in the HTML header (e.g. within <title> elements) as well
+as HTML tags within the body (e.g. <a href=’year/2012’>). Critically, EVAPORATE can identify and extract
+attributes mentioned anywhere in the document. To evaluate this, we extend the SWDE benchmark to include the
+attributes scattered throughout the full HTML and ﬁnd EVAPORATE-CODE+ achieves 52.2 and 49.0 on Movies and
+University respectively on the more challenging setting. We release the new annotations.
+Relatedly, the baseline systems assume attribute values are the leaf-nodes of the HTML-DOM tree and therefore are
+not applicable to the unstructured settings.
+Systems for unstructured text We consider the state-of-the-art OpenIE6 system for performing OpenIE over unstructured
+(non-HTML) text from Kolluru et al. [38]. While this system is not designed to extract structured views from
+heterogeneous data, we evaluate it qualitatively to understand how existing OpenIE systems perform in this setting. We
+ﬁnd the system only handles well formatted sentences and struggles to extend to heterogeneous data types. We ﬁnd that
+even when documents contain full sentences, the system extracts an extremely large set of relations or enforce consistent
+extractions across documents. For instance, on a sample FDA 510(k) document, OpenIE6 extracts 427 relations with
+184 relations having a conﬁdence level at 0.99. We include a detailed error analysis in Appendix C.1.
+4.4
+Comparing Implementations of EVAPORATE
+This work proposes a fundamental tradeoff space between directly processing data workloads with LLMs vs synthesizing
+code that does the processing. We ﬁrst discuss the tradeoffs for a ﬁxed LLM (text-davinci-003), which is the current
+best-in-class LLM [40] (Section 4.4.1), and next across a range of LLMs trained by three distinct model providers
+(Section 4.4.2).
+4.4.1
+Tradeoffs between EVAPORATE Implementations
+As detailed in Section 3.2, the base routine (“EVAPORATE-DIRECT”) in EVAPORATE entails directly processing
+documents with the LLM, while the optimized routine (“EVAPORATE-CODE”) synthesizes functions for processing.
+Next we evaluate these along our desiderata.
+Generality is maintained. LLMs take text as input and provide text as output — this uniﬁed natural language
+interface means EVAPORATE-DIRECT and EVAPORATE-CODE can ingest any document format without additional
+engineering. Critically, our results with EVAPORATE require no user effort, no training whatsoever, and no customization
+when applied to the 16 different settings.
+Asymptotic cost reduction. Figure 3 demonstrates the asymptotic differences in cost between directly processing
+the data lake with EVAPORATE-DIRECT vs. with EVAPORATE-CODE+. (Figure 3 Left) EVAPORATE-CODE+ is
+13
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+asymptotically more efﬁcient as a function of the number of documents in the data lake. The number of LLM calls
+required with function generation is proportional to the number of attributes to be extracted, not the number of
+documents. The crossover point is at ∼40 documents.
+(Figure 3 Right) EVAPORATE-DIRECT can extract multiple (i.e. every) attribute in the in-context documents in a
+single inference call, while EVAPORATE-CODE+ synthesizes new functions for each attribute. Thus, the cost of function
+synthesis grows with the number of attributes, while the cost of EVAPORATE-DIRECT is constant. The crossover point
+is at ∼2,500 attributes.
+Empirically across our settings, EVAPORATE-CODE+ realizes a 110x average reduction in the number of tokens the
+LLM needs to process (assuming 10k documents per setting and 378× given the true benchmark sizes) in the number of
+tokens the LLM must process compared to EVAPORATE-DIRECT (Table 3). Further, data lakes are constantly changing
+and functions can be reused while EVAPORATE-DIRECT would need to be re-run, multiplying the cost.
+In runtime, we observe that the generated functions are efﬁcient in processing the documents. For example, over the
+9,500 function runs (from 95 functions evaluated on 100 documents each) in the FDA 510(k) setting, we ﬁnd that the
+average time to run one function over one document is 0.00025s on a 2 CPU machine.
+Improved quality and reliability. Even though EVAPORATE-DIRECT directly processes each document with the
+LLM, EVAPORATE-CODE+ surprisingly performs 12.1 F1 (22%) better (Table 3).
+What are the failure modes of EVAPORATE-DIRECT? We proﬁle the errors of EVAPORATE-DIRECT and ﬁnd the
+main issue is inconsistency or a lack of reliability. On the Medical FDA report setting:(1) The LLM misses an average
+of 4.4 attributes that are present in the gold schema (27.5% of gold attributes) per document. Among the gold attributes
+that are missed, all are extracted in at least one document. (2) Further, the LLM outputs an average of 9.7 attributes or
+values that are not explicitly mentioned in the documents. (3) Finally, attributes are reworded in diverse ways across
+documents — the attribute classification is extracted in 4 different ways across the sample of 10 documents (i.e.
+“classiﬁcation”, “device classiﬁcation”, “regulatory information”, missing). As the error modes are quite varied, it is
+unclear how to improve quality. 2
+Why does EVAPORATE-CODE+ improve quality?
+We validate that our Algorithm 1 for selecting and aggregating
+functions leads to the quality improvements over EVAPORATE-DIRECT.
+Synthesizing diverse functions We ﬁnd that using diverse prompts helps address the lack of reliability in function
+synthesis. EVAPORATE-CODE+ applies a boilerplate prompt template to synthesize functions that contains no data
+lake speciﬁc examples or customization. Recall the prompt template includes one-to-two in-context demonstrations
+and a placeholder for the inference example, i.e. document text (Figure 4). Holding the inference example constant, it
+is trivial to instantiate multiple prompts in our provided template by simply swapping the in-context examples. We
+explore the effects of increasing diversity through each, and ﬁnd both beneﬁt downstream quality:
+• In-context demonstrations Our implementation (Table 1) instantiates two prompts by swapping in-context
+demonstrations , PA and PB. Quality using PA or PB alone is 8.5 and 8.0 F1 points worse than using both to
+synthesize functions on SWDE Movie and SWDE University respectively.
+• Inference documents Using ﬁve instead of three sample documents in the prompts for EVAPORATE-CODE+,
+the ClosedIE and OpenIE quality improve by 6.8 F1 points (9%) and 6.5 F1 points (14%) respectively, averaged
+across the 16 settings.
+Estimating function quality using the LLM. In Table 4, we ﬁrst evaluate the two unsupervised aggregation
+baselines in prior work off-the-shelf: Majority Vote (MV) and Weak Supervision (WS) [3, 51, 60]. Next we measure
+the effect of ﬁltering functions and handling abstentions as proposed in Algorithm 1.
+In Table 4, we observe WS with ﬁltering provides a consistent boost across settings compared to WS — 7.1
+F1 point higher average quality and up to 13.8 F1 points on the SWDE University setting. Additionally handling
+abstensions leads to a 1.9 F1 point increase in average quality over WS with ﬁltering, with up to 7.8 F1 points on
+the FDA setting. Qualitatively, accounting for abstensions is helpful when attributes are expressed in diverse ways
+across documents, which is not applicable to all settings such as Enron. These results highlight the importance of
+EVAPORATE-CODE+’s aggregation approach for the system’s overall reliability. Without Algorithm 1, quality does not
+improve over EVAPORATE-DIRECT.
+2When we replace text-davinci-003 with text-curie-001, a smaller, but cheaper LLM, an average of 5.1 gold attributes are missing
+per document and an average of 30.3 attributes are identiﬁed, but not explicitly mentioned in the documents.
+14
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Source
+MV
+WS
+WS
+WS
+Filter
+Abstain + Filter
+FDA
+52.9
+51.1
+55.0
+62.8
+Enron Emails
+81.4
+82.7
+86.9
+86.9
+Wiki NBA
+59.5
+64.9
+68.4
+68.2
+SWDE Movie
+44.3
+46.3
+56.6
+56.8
+SWDE University
+42.7
+43.5
+57.3
+59.0
+Average
+56.2
+57.7
+64.8
+66.7
+Table 4: Quality under alternate approaches of aggregating the synthesized functions. The two key baselines in prior
+work are (left columns): Majority Vote (MV) and Weak Supervision (WS). We evaluate the components of Algorithm 1
+(right columns): “Abstain” indicates we account for abstensions and “Filter” indicates we ﬁlter low quality functions.
+Model
+EVAPORATE-DIRECT
+EVAPORATE-CODE+
+SCHEMA ID
+FDA
+Wiki
+Movie
+University
+Enron
+FDA
+Wiki
+Movie
+University
+Enron
+F1@k
+OpenAI GPT-4 [49]
+59.2
+40.5
+35.1
+56.1
+92.7
+57.5
+61.4
+54.9
+57.2
+85.5
+67.3
+Anthropic Claude-V1 [4]
+45.1
+20.6
+27.5
+44.3
+88.1
+44.4
+33.5
+38.7
+30.4
+84.7
+69.0
+Jurassic Jumbo-2-Instruct [41]
+25.9
+0.0
+13.3
+29.2
+90.3
+1.2
+0.0
+20.6
+18.6
+85.7
+62.3
+Table 5: OpenIE (Pair F1) results evaluating EVAPORATE using alternate LMs from three model providers. For cost
+reasons, we apply EVAPORATE-DIRECT to samples of 10 documents each. For fair comparison, we report the score of
+EVAPORATE-CODE+ on the same sample instead of the full set of documents. k is the number of gold attributes for the
+setting.
+4.4.2
+Understanding the Tradeoff Space across Varied Language Models
+The are an increasing number of LLMs being made available. These models are trained by various providers each
+using distinct protocols [40]. To understand whether the tradeoffs we identiﬁed hold for different LLMs, we evaluate
+EVAPORATE using three additional LLMs from three different providers: (1) GPT-4 [49], (2) Anthropic Claude-V1
+[4], and (3) Jurassic Jumbo-2-Instruct [41]. Results are summarized in Table 5.
+Overall results.
+The quality with gpt-4 is comparable to that obtained using text-davinci-003. Both the
+EVAPORATE-DIRECT and EVAPORATE-CODE+ quality decrease with claude and jumbo, consistent with the results
+of large-scale benchmarking efforts [40], however the relative quality of the two implementations are similar to Table 3.
+Both appear to remain competitive in quality and the quality of the approaches appear to increase together.
+We ﬁnd the precision of EVAPORATE-CODE+ remains high across models. Algorithm 1 helps EVAPORATE ﬁlter the
+low quality functions and if this eliminates all the candidate functions, the attribute is excluded from the output table.
+We ﬁnd that when an attribute is included in the output, it has high precision, consistent with Table 1 where the precision
+with text-davinci-003 is almost 20 points higher than the recall. The average precision scores corresponding
+to EVAPORATE-CODE+ in Table 5 are 70.9 (gpt-4), 67.6 (claude), and 50.9 (jumbo) using EVAPORATE-CODE+
+and in contrast are 61.9 ( gpt-4), 55.1 (claude), and 49.9 (jumbo) using EVAPORATE-DIRECT, emphasizing a
+precision-recall tradeoff between approaches.
+Understanding the errors.
+Overall, EVAPORATE relies on versatile reasoning capabilities (i.e. to identify the schema
+and extract attribute values directly from noisy provided context, and the ability to synthesize code) and excitingly, the
+results validate that these capabilities co-exist within multiple model families. We investigate which of the required
+reasoning capabilities contributes to lower quality in comparison to text-davinci-003. We ﬁnd that the schema
+synthesis step plays a small role. Considering the top ranked schema attributes according to EVAPORATE, we measure
+the average F1@k between the predicted and gold sets of attributes, where k is the number of gold attributes per setting.
+The average F1@k for text-davinci-003 is 71.9, and the right-hand column of Table 5 shows the alternate models
+perform comparably.
+We ﬁnd the two main sources of errors are (1) the inability to generate a function for particular attributes, and (2)
+occasionally, low quality direct extractions (e.g., claude may generate “I’m not sure, please give me more information.”
+in a ChatBot style, when prompted to extract an attribute value). The models we evaluate are optimized for language
+and personal assistant (ChatBot) applications [37]. Our proof of concept with gpt-4 suggests these objectives are not
+orthogonal to code synthesis and the quality gaps could close in future model versions.
+15
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+5
+Discussion
+The goal of this study was to evaluate a simple, prototype system that uses LLMs to generate structured views from
+unstructured documents. We explored two fundamentally different implementation strategies and next, highlight
+opportunities for future work in the space.
+Extending to additional tasks. Our ﬁndings demonstrate the promise of function synthesis as a way to mitigate
+cost when using LLMs. We study the problem of materializing a structured view of an unstructured dataset, but this
+insight may be applicable in a broader suite of data wrangling tasks. Many data wrangling tasks are high throughput
+applications, for which LLMs are not optimized. Future work should explore whether code synthesis may enable
+general low cost solutions.
+Characterizing function cost. We dichotomized the direct extraction and code synthesis implementations. However,
+the lines between these approach may blur going forward. After all, the LLM could generate functions that invoke other
+models — for instance, the LLM may generate functions that call the NLTK, HUGGINGFACE, or even the OPENAI
+APIs. This naturally raises the question of how to characterize the cost of the generated functions, rather than assuming
+they are inexpensive.
+Improving function quality. Finally, future work should consider iterative approaches to function generation.
+Concretely, when a generated function fails to compile or achieves low scores compared to the high quality LLM, we
+may be able to provide the compilation errors and/or high quality LLM responses in a prompt that encourages the
+LLM to generate an improved function. For instance, we may use Algorithm 1 to score the quality of small LLMs for
+performing the extractions.
+Potential downstream uses. A structured representation compiled over heterogeneous documents is useful in
+fulﬁlling downstream queries over the data. In the absence of a structured representation, querying an un/semi-
+structured data lake can be costly. For instance, recent works [16, 35] utilize LLMs to produce answers to natural
+language queries over heterogeneous documents with a retrieve-and-process pipeline: they (1) retrieve relevant data
+sources and (2) apply the query (or sub-queries) to each of the sources respectively. Since steps (1) and (2) are done
+at run-time for each query, the method is costly in terms of the required inference calls. Instead, an eagerly prepared
+structured representation enables support for direct SQL workloads over the attributes outputted by EVAPORATE.
+Further, in cases where all the information required for a user’s question is not included in the output table,
+EVAPORATE’s output may still help improve the cost and quality of the traditional retrieve-and-process pipeline used
+in those prior works [15, 16, 35]. For instance, consider the question “How many times did the Enron and Disney
+CEOs meet in 1999?”. Even though Enron-Disney CEO meeting may not be an attribute in the EVAPORATE output,
+we could still ﬁlter the 500k emails in the document-set to those timestamped with “1999”, as the date attribute is
+included in the output table. The ability to ﬁlter based on EVAPORATE’s output may lead to downstream improvements
+in retrieval cost and quality.
+6
+Related Work
+Structured querying of heterogeneous data.
+Converting heterogeneous data to structured databases is a long
+standing data management problem [10, 14, 29, inter alia.]. In contrast to systems for knowledge base construction
+(KBC) or closed information extraction (IE) [44, 55], which assume there is a predeﬁned schema and focus on populating
+the database according to the schema, the setup we focus on relies on OpenIE. OpenIE is the task of extracting useful
+facts without access to a predeﬁned ontology (i.e. the types or categories of facts to be extracted) [5, 19]. Given the
+breadth of input documents, the ability to construct a schema and populate the corresponding database on-the-ﬂy is
+useful.
+Existing systems for this problem introduce assumptions about the data-domain [21, 22, 34], ﬁle-format (e.g., XML
+ﬁles) [28], or the syntactic patterns of useful facts [10, 13, 23, 29, 38, 45, 48, 63]. For instance, in early systems,
+Cafarella et al. [13] focuses on facts expressed as triples (two entities with a descriptive string of their relationship
+in between) with hypernym “is-a” relationships between the entities. In recent years, deep learning based systems
+have begun to outperform the rule based systems in various settings [63]. However, the existing neural systems (1)
+require domain- and document-format speciﬁc training, (2) focus on reasoning over sentences, in contrast to long
+documents, and (3) rely on high quality linguistic tools (e.g. dependency parse, POS, NER) to help introduce structure
+over unstructured text [38, 63].
+For the narrower problem of generating structured views from web data [13, 23, 24], the current state-of-the-art
+approaches use (1) distant supervision to train site-speciﬁc extraction models [42] (domain speciﬁc), and (2) rely
+16
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+on assumptions about where in the HTML-DOM attributes and values are located (format speciﬁc) Deng et al.
+[21], Lockard et al. [43]. We investigate the feasibility of a domain and document-format agnostic approach.
+Language models for data management.
+Given the recency of in-context learning, there are few works exploring
+the beneﬁts for data processing. Most closely related, Chen et al. [16] presents a system for querying heterogeneous
+data lakes with in-context learning. The proposed approach involves processing every document with the LLM to
+extract values of interest. We propose an alternate approach and tradeoff space for processing data with LLMs.
+In-context learning has also recently been applied to data wrangling [46] and processing SQL queries [57]. These
+works require a manual prompt design step, which is a bottleneck for data management systems, since documents
+contain a wide variety of formats, attribute-types, and topics. In contrast, in EVAPORATE a handful of prompts are used
+across all document settings and included in Appendix E —the prompts are not modiﬁed in any way from setting to
+setting.
+Data programming.
+We build on work in data programming and weak supervision [51], a broad set of techniques
+for aggregating cheaply available sources of information (for instance functions based on heuristics and knowledge
+bases) in a principled statistical framework. WS is widely used for data management in industry. In this work, we
+automatically generate the functions rather than using human-designed functions. We design a system for open ended
+tasks in contrast to the classiﬁcation tasks considered in the prior work on automated WS [7, 58], and we propose a
+strategy that uses the LLM to handle abstensions and ﬁlter low quality functions.
+Recent work considers combining weak supervision and LLM in-context learning [3]. Our approach applies to a
+complementary set of problems for which processing every data point (document) with the LLM would be expensive,
+and requires addressing the challenges described in Section 3.3 to apply WS.
+7
+Conclusion
+We propose and evaluate EVAPORATE, a system that uses LLMs to generate structured views of semi-structured
+data lakes. Our evaluation focuses on the tradeoff between cost, quality, and generality. We ﬁnd that LLM-based
+systems work across document formats and domains, and therefore expose a more general interface than state-of-the-art
+approaches. We identify and explore a cost-quality tradeoff between processing data directly with an LLM versus
+synthesizing code for data processing. Finally, we propose an extension of the code synthesis implementation based off
+weak supervision. Our study highlights the promise of LLM-based data management systems.
+17
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Acknowledgments
+We thank Sarah Hooper, Benjamin Spector, Mayee Chen, Saehan Jo, Laurel Orr, Karan Goel, Ce Zhang, and Sen
+Wu for their helpful feedback. We gratefully acknowledge the support of NIH under No. U54EB020405 (Mobilize),
+NSF under Nos. CCF1763315 (Beyond Sparsity), CCF1563078 (Volume to Velocity), and 1937301 (RTML); US
+DEVCOM ARL under No. W911NF-21-2-0251 (Interactive Human-AI Teaming); ONR under No. N000141712266
+(Unifying Weak Supervision); ONR N00014-20-1-2480: Understanding and Applying Non-Euclidean Geometry in
+Machine Learning; N000142012275 (NEPTUNE); NXP, Xilinx, LETI-CEA, Intel, IBM, Microsoft, NEC, Toshiba,
+TSMC, ARM, Hitachi, BASF, Accenture, Ericsson, Qualcomm, Analog Devices, Google Cloud, Salesforce, Total,
+the HAI-GCP Cloud Credits for Research program, the Stanford Data Science Initiative (SDSI), and members of the
+Stanford DAWN project: Facebook, Google, and VMWare. The U.S. Government is authorized to reproduce and
+distribute reprints for Governmental purposes notwithstanding any copyright notation thereon. Any opinions, ﬁndings,
+and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reﬂect
+the views, policies, or endorsements, either expressed or implied, of NIH, ONR, or the U.S. Government.
+References
+[1] Wikipedia statistics, 2023. URL https://en.wikipedia.org/wiki/Special:Statistics.
+[2] Monica Agrawal, Stefan Hegselmann, Hunter Lang, Yoon Kim, and David Sontag. Large language models
+are few-shot clinical information extractors. The 2022 Conference on Empirical Methods in Natural Language
+Processing (EMNLP), 2022.
+[3] Simran Arora, Avanika Narayan, Mayee F. Chen, Laurel Orr, Neel Guha, Kush Bhatia, Ines Chami, Frederic
+Sala, and Christopher Ré. Ask me anything: A simple strategy for prompting language models. International
+Conference on Learning Representations (ICLR), 2023.
+[4] Amanda Askell, Yushi Bai, Anna Chen, Dawn Drain, Deep Ganguli, T. J. Henighan, Andy Jones, and
+Nicholas Joseph et al. A general language assistant as a laboratory for alignment. arXiv:2112.00861v3, 2021.
+[5] Michele Banko, Michael J. Cafarella, Stephen Soderland, Matthew G Broadhead, and Oren Etzioni. Open
+information extraction from the web. IJCAI, 2007.
+[6] David W Bates, David M Levine, Hojjat Salmasian, Ania Syrowatka, David M Shahian, Stuart Lipsitz, Jonathan P
+Zebrowski, Laura C Myers, Merranda S Logan, Christopher G Roy, et al. The safety of inpatient health care. New
+England Journal of Medicine, 388(2):142–153, 2023.
+[7] Benedikt Boecking, Willie Neiswanger, Eric Xing, and Artur Dubrawski. Interactive weak supervision: Learning
+useful heuristics for data labeling, 2021.
+[8] E. Bolyen, J. R. Rideout, M. R. Dillon, N. A. Bokulich, C. C. Abnet, G. A. Al-Ghalith, H. Alexander, E. J. Alm,
+and M. Arumugam et al. Reproducible, interactive, scalable and extensible microbiome data science using qiime
+2. In Nature biotechnology, 2019.
+[9] Rishi Bommasani, Drew A. Hudson, E. Adeli, Russ Altman, Simran Arora, S. von Arx, Michael S. Bernstein,
+Jeanette Bohg, A. Bosselut, Emma Brunskill, and et al. On the opportunities and risks of foundation models.
+arXiv:2108.07258, 2021.
+[10] S. Brin. Extracting patterns and relations from the worldwide web. In WebDB, 1998.
+[11] Mirko Bronzi, Valter Crescenzi, Paolo Merialdo, and Paolo Papotti. Extraction and integration of partially
+overlapping web sources. PVLDB, 2013.
+[12] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind Nee-
+lakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are few-shot learners. Advances
+in neural information processing systems, 33:1877–1901, 2020.
+[13] Michael J. Cafarella, Christopher Re, Dan Suciu, Oren Etzioni, and Michele Banko. Structured querying of web
+text. In Conference on Innovative Data Systems Research (CIDR), 2007.
+[14] Michael J Cafarella, Dan Suciu, and Oren Etzioni. Navigating extracted data with schema discovery. In WebDB,
+pages 1–6, 2007.
+[15] Danqi Chen, Adam Fisch, Jason Weston, and Antoine Bordes. Reading wikipedia to answer open-domain
+questions. In Association for Computational Linguistics (ACL), 2017.
+[16] Zui Chen, Zihui Gu, Lei Cao, Ju Fan, Sam Madden, and Nan Tang. Symphony: Towards natural language query
+answering over multi-modal data lakes. CIDR, 2023.
+18
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+[17] Eric Chu, Akanksha Baid, Ting Chen, AnHai Doan, and Jeffrey Naughton. A relational approach to incrementally
+extracting and querying structure in unstructured data. In VLDB, 2007.
+[18] Kevin Clark, Minh-Thang Luong, Quoc V. Le, and Christopher D. Manning. Electra: pre-training text encoders as
+discriminators rather than generators. In International Conference on Learning Representations (ICLR), 2020.
+[19] W. Cohen. Information extraction and integration: An overview. IJCAI, 2004.
+[20] Lei Cui, Furu Wei, and Ming Zhou. Neural open information extraction. 2022.
+[21] Xiang Deng, Prashant Shiralkar, Colin Lockard, Binxuan Huang, and Huan Sun. Dom-lm: Learning generalizable
+representations for html documents. 2022.
+[22] P. DeRose, W. Shen, F. Chen, A. Doan, and R. Ramakrishnan. Building structured web community portals: A
+top-down, compositional, and incremental approach. VLDB, 2007.
+[23] Oren Etzioni, Michael Cafarella, Doug Downey, Ana-Maria Popescu, Tal Shaked, Stephen Soderland, Daniel S.
+Weld, and Alexander Yates. Unsupervised named-entity extraction from the web: An experimental study. In AAAI,
+2004.
+[24] Oren Etzioni, Michele Banko, Stephen Soderland, and Daniel S Weld. Open information extraction from the web.
+Communications of the ACM, 51(12):68–74, 2008.
+[25] J. H. Faghmous and V Kumar. A big data guide to understanding climate change: The case for theory-guided data
+science. In Big data, 2014.
+[26] Daniel Fu, Mayee Chen, Frederic Sala, Sarah Hooper, Kayvon Fatahalian, and Christopher Re. Fast and three-
+rious: Speeding up weak supervision with triplet methods. In Proceedings of the 37th International Conference on
+Machine Learning, volume 119 of Proceedings of Machine Learning Research, pages 3280–3291. PMLR, 13–18
+Jul 2020.
+[27] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace He,
+Anish Thite, Noa Nabeshima, Shawn Presser, and Connor Leahy. The pile: An 800gb dataset of diverse text for
+language modeling, 2021.
+[28] Minos Garofalakis, Aristides Gionis, Rajeev Rastogi, Sridhar Seshadri, and Kyuseok Shim. Xtract: A system
+for extracting document type descriptors from xml documents. In Proceedings of the 2000 ACM SIGMOD
+international conference on Management of data, pages 165–176, 2000.
+[29] Eugene Agichtein Luis Gravano. Snowball: Extracting relations from large plain-text collections. In DL ’00:
+Proceedings of the ﬁfth ACM conference on Digital libraries, 2000.
+[30] Qiang Hao, Rui Cai, Yanwei Pang, and Lei Zhang. From one tree to a forest: a uniﬁed solution for structured web
+data extraction. SIGIR, 2011.
+[31] Pengcheng He, Xiaodong Liu, Jianfeng Gao, and Weizhu Chen. Deberta: Decoding-enhanced bert with disentan-
+gled attention. In International Conference on Learning Representations, 2021.
+[32] Nathan Heller. What the enron e-mails say about us, 2017. URL https://www.newyorker.com/magazine/
+2017/07/24/what-the-enron-e-mails-say-about-us.
+[33] Nick Huss. How many websites are there in the world?, 2023.
+[34] T.S. Jayram, R. Krishnamurthy, S. Raghavan, S. Vaithyanathan, and H. Zhu. Avatar information extraction system.
+IEEE Data Eng. Bull, 2006.
+[35] Omar Khattab, Keshav Santhanam, Xiang Lisa Li, David Hall, Percy Liang, Christopher Potts, and Matei Zaharia.
+Demonstrate-search-predict: Composing retrieval and language models for knowledge-intensive NLP. arXiv
+preprint arXiv:2212.14024, 2022.
+[36] B. Klimt and Y. Yang. Introducing the enron corpus. In Proceedings of the 1st Conference on Email and Anti-Spam
+(CEAS), 2004.
+[37] Jan Koco´n, Igor Cichecki, Oliwier Kaszyca, Mateusz Kochanek, Dominika Szydło, Joanna Baran, Julita
+Bielaniewicz, Marcin Gruza, Arkadiusz Janz, Kamil Kanclerz, et al. Chatgpt: Jack of all trades, master of
+none. arXiv preprint arXiv:2302.10724, 2023.
+[38] Keshav Kolluru, Vaibhav Adlakha, Samarth Aggarwal, Mausam, and Soumen Chakrabarti. Openie6: Iterative
+grid labeling and coordination analysis for open information extraction. In Proceedings of the 2020 Conference
+on Empirical Methods in Natural Language Processing (EMNLP), 2020.
+[39] Yuhang Lai, Chengxi Li, Yiming Wang, Tianyi Zhang, Ruiqi Zhong, Luke Zettlemoyer, Scott Wen tau Yih, Daniel
+Fried, Sida Wang, and Tao Yu. Ds-1000: A natural and reliable benchmark for data science code generation.
+ArXiv, abs/2211.11501, 2022.
+19
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+[40] Percy Liang, Rishi Bommasani, Tony Lee, Dimitris Tsipras, Dilara Soylu, and more. Holistic evaluation of
+language models. ArXiv, abs/2211.09110, 2022.
+[41] Opher Lieber, Or Sharir, Barak Lenz, and Yoav Shoham. Jurassic-1: Technical details and evaluation. 2021.
+[42] Colin Lockard, Prashant Shiralkar, and Xin Luna Dong. Openceres: When open information extraction meets the
+semi-structured web. Proceedings of NAACL-HLT, 2019.
+[43] Colin Lockard, Prashant Shiralkar, Xin Luna Dong, and Hannaneh Hajishirzi. Zeroshotceres: Zero-shot relation
+extraction from semi-structured webpages. ACL, 2020.
+[44] A. Madaan, A. Mittal, G. R. Mausam, G. Ramakrishnan, and S. Sarawagi. Numerical relation extraction with
+minimal supervision. In AAAI, 2016.
+[45] Mausam, Michael Schmitz, Stephen Soderland, Robert Bart, and Oren Etzioni. Open language learning for
+information extraction. 2012.
+[46] Avanika Narayan, Ines Chami, Laurel Orr, Simran Arora, and Christopher Ré. Can foundation models wrangle
+your data? arXiv preprint arXiv:2205.09911, 2022.
+[47] Fatemeh Nargesian, Erkang Zhu, Reneé J. Miller, Ken Q. Pu, and Patricia C. Arocena. Data lake management:
+Challenges and opportunities. Proceedings of the VLDB Endowment, 2019.
+[48] Christina Niklaus, Matthias Cetto, André Freitas, and Siegfried Handschuh. A survey on open information
+extraction. In Proceedings of the 27th International Conference on Computational Linguistics, 2018.
+[49] OpenAI. Openai api, 2023. URL https://openai.com/api/.
+[50] Pranav Rajpurkar, Jian Zhang, Konstantin Lopyrev, and Percy Liang. Squad: 100,000+ questions for machine
+comprehension of text. arXiv:1606.05250, 2016.
+[51] Alexander Ratner, Stephen H. Bach, Henry Ehrenberg, Jason Fries, Sen Wu, and Christopher Ré . Snorkel: Rapid
+training data creation with weak supervision. Proceedings of the VLDB Endowment (VLDB), 2017.
+[52] C. Romero and S. Ventura. Data mining in education. In Wiley Interdisciplinary Reviews: Data Mining and
+Knowledge Discovery, 2013.
+[53] Shreya Shankar, Rolando Garcia, Joseph M. Hellerstein, and Aditya G. Parameswaran. Operationalizing machine
+learning: An interview study. arXiv:2209.09125, 2022.
+[54] Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y Fu, Zhiqiang Xie, Beidi Chen,
+Clark Barrett, Joseph E Gonzalez, et al. High-throughput generative inference of large language models with a
+single gpu. arXiv preprint arXiv:2303.06865, 2023.
+[55] Jaeho Shin, Sen Wu, Feiran Wang, Christopher De Sa, Ce Zhang, and Christopher Ré. Incremental knowledge
+base construction using deepdive. In Proceedings of the VLDB Endowment International Conference on Very
+Large Data Bases (VLDB), 2015.
+[56] Ryan Smith, Jason A. Fries, Braden Hancock, and Stephen H. Bach. Language models in the loop: Incorporating
+prompting into weak supervision. arXiv:2205.02318v1, 2022.
+[57] Immanuel Trummer. CodexDB: Synthesizing code for query processing from natural language instructions using
+GPT-3 Codex. PVLDB, 15(11):2921 – 2928, 2022.
+[58] Paroma Varma and Christopher Ré. Snuba: Automating weak supervision to label training data, 2018.
+[59] Paroma Varma, Frederic Sala, Ann He, Alexander Ratner, and Christopher Re. Learning dependency structures
+for weak supervision models. 2019.
+[60] Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc Le Le, Ed H. Cho, Sharan Narang, Aakanksha Chowdhery, and
+Denny Zhou. Self-consistency improves chain of thought reasoning in language models. 2022.
+[61] Eric Wu, Kevin Wu, Roxana Daneshjou, David Ouyang, Daniel Ho, and James Zou. How medical ai devices are
+evaluated: limitations and recommendations from an analysis of fda approvals. Nature Medicine, 27:1–3, 04 2021.
+[62] Tongshuang Wu, Michael Terry, and Carrie Jun Cai. Ai chains: Transparent and controllable human-ai interaction
+by chaining large language model prompts. In CHI Conference on Human Factors in Computing Systems, pages
+1–22, 2022.
+[63] Shaowen Zhou, Bowen Yu, Aixin Sun, Cheng Long, Jingyang Li, Haiyang Yu, Jian Sun, and Yongbin Li. A
+survey on neural open information extraction: Current status and future directions. IJCAI22, 2022.
+[64] Diana M. Zuckerman, Paul Brown, and Steven E. Nissen. Medical Device Recalls and the FDA Approval Process.
+Archives of Internal Medicine, 171(11):1006–1011, 06 2011. ISSN 0003-9926.
+20
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+A
+Experimental Details
+We describe the metrics we use to evaluate OpenIE and ClosedIE performance of our system.
+Pair F1 For OpenIE, we report Pair F1 scores. Pair F1 is the standard metric for OpenIE systems [42]. The metric
+constructs (subject, value, predicate). The subject is the document-ﬁlename in our setting. The predicate
+is the attribute and the value is the attribute value. The F1 score computes the F1 score between the sets of gold and
+predicted tuples. This assigns credit for exact-matches between the attribute names and values extracted by the system
+and the ground truth — it assigns no partial credit.
+Note that because EVAPORATE ﬁrst identiﬁes a list of attributes then sequentially generates functions and extracts the
+values, the user can “stop” execution at any number of attributes. The stopping point determines the number of tuples
+included in the prediction set. This is not a property of prior systems that extract “all or no” tuples [21, 38, 42, 43, 63,
+inter alia.]. For fair comparison we report performance at the number of gold attributes contained in the benchmark —
+note that this is generally not the number of attributes that maximizes the EVAPORATE’s Pair F1 score.
+Text F1 For ClosedIE, we report Text F1 scores. Text F1 is the standard metric for extractive tasks and we use
+the exact implementation released by Rajpurkar et al. [50]. The metric tokenizes the prediction and gold strings and
+computes a token-wise F1 score.
+Recall we select the F1 at the number of gold attributes, rather than at the number that gives the highest score).
+B
+Dataset Construction
+Below we describe how each of the evaluation benchmarks is obtained. We also release the suite of benchmarks along
+with the system code.
+B.1
+FDA
+For the FDA setting, we randomly sampled a dataset of 100 FDA 510(k) premarket notiﬁcation submission PDFs
+for medical devices with substantially equivalent predicate devices since 1996 from the FDA website: https://www.
+accessdata.fda.gov/scripts/cdrh/cfdocs/cfpmn/pmn.cfm. We used the lightweight ﬁtz library to convert
+this to text ﬁles. We asked 5 database graduate students to identify important attributes, deﬁned as attributes useful for
+analysis that’s present in at least a majority of documents. We collected the ﬁnal set of 16 attributes as attributes agreed
+on by all graduate students. For these 16 attributes, we manually wrote functions to extract their value, then corrected
+errors by manual review. We deﬁned the attribute value as the full content of information pertaining to that attribute,
+typically a value, sentence, or section.
+B.2
+Wiki NBA
+For the Wiki NBA setting, we used the following SPARQL query over Wikidata to retrieve NBA articles. We then
+manually supplemented missing pages and ﬁltered the results to only include pages about NBA players.
+# Q13393265
+is for
+Basketball
+Teams
+# Q155223
+is for NBA
+# P118 is
+league (https :// www.wikidata.org/wiki/Property:P118)
+SELECT ?item ?itemLabel ?linkcount
+WHERE {
+?item
+wdt:P118 wd:Q155223 .
+?item
+wikibase:sitelinks ?linkcount .
+FILTER
+(? linkcount
+>= 1) .
+SERVICE
+wikibase:label { bd: serviceParam
+wikibase:language
+"[ AUTO_LANGUAGE ],en" . }
+}
+GROUP BY ?item ?itemLabel ?linkcount
+ORDER BY DESC (? linkcount)
+We asked 5 database graduate students to identify important attributes, deﬁned as attributes useful for analysis that’s
+present in at least a majority of documents. We collected the ﬁnal set of 19 attributes as the attributes agreed on by all
+graduate students. For these 19 attributes, we manually wrote functions to extract their value, then corrected errors by
+manual review. We deﬁned the attribute value as the full content of information pertaining to that attribute, typically a
+value, sentence, or section. We use these as ground truth extractions in the main paper.
+We noted that the resulting attributes were complex for multiple documents, so we included another set of ground
+truth. We asked a graduate student to write functions to parse compound attributes whose values mention multiple
+21
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+values (e.g. birth date and location under attribute "Born") into atomic attributes and values. We this ground truth to
+demonstrate an additional step of schema cleaning in Section C.3.
+B.3
+Enron
+We download the Enron corpus from http://www.cs.cmu.edu/~enron/ and apply no further processing. We
+generate a benchmark using all metadata in the email headers by manually writing functions.
+B.4
+SWDE
+We download the SWDE benchmark from https://www.colinlockard.com/expanded_swde.html. The bench-
+mark includes the raw HTML from several websites with no further processing and ground-truth labels for selected
+attributes [42]. Because all the attributes are located within the root-elements of the HTML body, excluding the
+information such as the HTML header, attributes described within tags (e.g. <a href=’/year/2012/>’, <title>),
+and so on, we extend the original benchmark to include a more diverse set of attributes. We refer to the extended
+benchmark as SWDE Plus.
+C
+Additional Experiments and Analysis
+Here we study the effectiveness of relevant baselines, which ultimately performed poorly on our settings. We also
+report evaluations on additional foundation models. We focus on the Wikipedia and FDA settings for these analyses.
+C.1
+Additional Baselines from Prior Work
+Here we study two additional baselines from prior work for OpenIE and ClosedIE respectively.
+OpenIE
+We apply the OpenIE6 system from Kolluru et al. [38], which is a state-of-the art approach for OpenIE over
+unstructured (non-HTML) text. While this system is not designed for extracting structured views over heterogeneous
+data, we evaluate it qualitatively to understand how existing OpenIE systems perform in this setting.
+1. First, the system only handles well formatted sentences and struggles to extend to heterogeneous data types. It
+does not handle HTML documents and is difﬁcult to apply to documents with complex formatting (like PDFs)
+where full sentences can be difﬁcult to extract. Using SWDE College Prowler as an example, given the HTML
+input line <td>Student Body Size:</td> <td class="stat"> <span id="..."> 6,504 </span>
+</td>, OpenIE6 misses the student body size attribute and corresponding value.
+2. Second, even when documents contain full sentences, OpenIE6 extracts an extremely large set of relations for
+each document and does not prioritize attributes by relevance or enforce consistent attributes across documents.
+This makes it difﬁcult to use the resulting relations to understand the contents of the documents or to do
+analysis. Using a sample FDA 510(k) document from our corpus as an example, OpenIE6 extracts 427 relations
+with 184 relations with conﬁdence larger than 0.5. While some can be informative, a signiﬁcant fraction of
+these relations are not useful for indexing and analysis across documents. For example, "(sample carryover;
+occurs; the results of the acceptor assay show interference)" is an extracted relation with conﬁdence 0.99.
+ClosedIE
+We study the effectiveness of span-extractor models, which are commonly used in QA systems to extract
+the information that is relevant to a user-query from a provided document context [18]. Given the ground truth attributes,
+we evaluate the ability of these models to extract their values from the relevant paragraphs. We evaluate the DebertaV3
+Large model ﬁne-tuned on the Squad 2.0 dataset, which achieves 90.8 F1 on the Squad 2.0 dev set in Table 6. We
+ﬁnd our EVAPORATE function generation approach (Table 1) signiﬁcantly outperforms this pre-trained QA model on
+ClosedIE in all settings, over text and HTML documents.
+C.2
+Validating the Quality of LLM F
+Because our approach for scoring the generated functions relies on comparing to the extractions produced by directly
+processing the document with the LLM F (Section 3.2.2), in Table 7, we evaluate the quality of F. In this ClosedIE
+task, the LLM is provided with the speciﬁc attributes to extract in the prompt. This prompt is shown in Appendix E.
+22
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Source (Format)
+# Attributes
+Closed IE F1
+Enron Emails (TXT)
+15
+53.7
+FDA (TXT)
+17
+56.5
+Wiki NBA (HTML)
+19
+50.2
+SWDE Movies (HTML)
+30
+43.5
+SWDE University (HTML)
+25
+45.3
+Table 6: ClosedIE results using the DebertaV3 large model ﬁne-tuned on the Squad2.0 dataset from HuggingFace.
+Source (Format)
+QUALITY
+COST / 10K
+DOCUMENTS
+# Attributes
+F1
+Tokens (M)
+Dollars ($)
+Enron Emails (TXT)
+15
+85.3
+140
+2,790
+FDA (TXT)
+16
+78.0
+241
+4,816
+Wiki NBA (HTML)
+19
+84.6
+328
+6,559
+SWDE Movies (HTML)
+25
+84.4
+359
+7,174
+SWDE University (HTML)
+33
+72.6
+379
+7,586
+Average
+21.6
+79.9
+289
+5,785
+Table 7: Quality and cost achieved through prompting OpenAI’s text-davinci-003 model to extract speciﬁc,
+pre-deﬁned attributes.
+C.3
+Atomic Schema Cleaning Extensions
+One further extension of schema generation is atomic schema cleaning. EVAPORATE generates a set of candidate
+attributes which, in some cases, are complex and can be decomposed into cleaned, atomic attributes. For example, an
+extracted attribute of born from the Wiki NBA setting, has the following form: <birth date> (age) <location>.
+Decomposing the born attribute into three separate attributes (e.g., birth date, age and birth location) would enable users
+to ask queries such as — How many players in the NBA were born in Ohio? — that would otherwise be unanswerable
+with the existing schema. As such, decomposing the complex attributes into cleaned, atomic attributes increases
+the utility of the resulting schema and extractions for analysis and indexing. Prior work [46] has demonstrated that
+LLMs can be useful for data transformation task. Schema decomposition can be viewed as an instantiation of data
+transformation, suggesting that such an operation could be completed using an LLM.
+We manually clean the ground truth complex attributes and values in the Wiki NBA setting and construct the ground
+truth atomic attribute and values. We ﬁnd that after cleaning there are 35 atomic attributes for Wiki NBA, decomposed
+from the 19 complex attributes.
+For our method, we prompt the expensive LLM (in this case text-davinci-003 from OpenAI) to decompose the
+complex attribute and values into a list of atomic attributes and values, for a single example of each complex attribute
+and value. To save computation cost, we then use the large LLM schema cleaning result from one example to prompt a
+smaller, less expensive LLM (in this case the text-curie-001 model from OpenAI) to extract the cleaned values for the
+remainder of documents. We provide the smaller, less expensive LM with the complex attribute, the cleaned attribute to
+extract, and a one-shot example from the expensive LLM.
+To measure the performance of schema cleaning, we construct pairs of (file, value) for all ﬁles and values and
+compute the precision, recall, and F1 as in the OpenIE setting against the ground truth atomic attributes and values. We
+do not include the attribute in the relations to score, because the extracted values are generally unique and we want
+to avoid penalizing generated atomic attribute names that differ from the ground truth but are still correct. As a baseline
+before our atomic schema cleaning step, we score the ground truth complex values against the ground truth atomic
+values and ﬁnd it achieves an F1 of 21.0, since many values are not atomic. Applying our atomic schema cleaning
+methodology to the ground truth complex values decomposes them into atomic attributes, qualitatively improving the
+usability of the attributes. The resulting predicted atomic attributes achieve an F1 of 57.5 when scored against the
+ground truth atomic values.
+23
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+D
+Weak Supervision Details
+Objective
+We detail the weak supervision (WS) algorithm used for aggregating the votes across generated functions.
+Let D be our unlabeled dataset of documents from which we are extracting a particular attribute of interest. Let y
+be a random variable representing the true attribute value. Let λ represent the outputs of our m generated extraction
+functions f ∈E on a particular document. Each λi ∈λ is a function λi : X →Y. Our goal is to use the vectors λ,
+produced across documents x ∈D to infer the true label y. Concretely, we seek, φ(x), a function that inputs λ and
+outputs a ﬁnal prediction ˆy for a document x.
+With labeled data, i.e. where we had documents and their attribute values {(x1, a1), ..., (xn, an)}, we could perform
+traditional supervised learn φ(x) that maps λ to y. However, in our unlabeled setting, the insight is to use the noisy
+estimates of y produced by each of the functions to construct φ(x).
+Standard WS Setup [51]
+WS models learn the latent variable graphical model on the distribution
+Pr(y, {λ1, ..., λm} = Pr(y, λ). In this model, y is latent, we cannot observe it. To produce ˆy, we concretely
+perform two steps:
+• Learn the label model We have access to λ and can use this to learn the label model P(λ|y).
+• Inference We can then produce the estimate ˆy by setting φ(x) = argmaxyPr(y|λ(x))
+To learn the label model, we can parameterize P(λ|y) as follows:
+P(λ|y) = 1
+Zθ
+exp(
+m
+X
+i=1
+θd(λi, y))
+Intuitively, when modeling our sources, we want to model how accurate a particular λi is, when it makes a prediction.
+We are then going to want to weigh the predictions of the different sources proportional to their accuracies.
+The Z is a constant to normalize the probability distribution. The feature-vector d can be broken down into:
+• dlab, representing how frequently λi provides a prediction vs. abstains across documents. This is directly
+observable.
+• dcorr, which represents how frequently λi and λj yield the same prediction for the attribute value. This is
+directly observable.
+• dacc, representing the accuracy of λi, or how frequently λi agrees with y. Note that the accuracy is measured
+across documents for which the function provides a prediction and does not abstain. This is not directly
+observable.
+θ are the parameters we aim to learn to combine the inputs in the feature vector. To learn this without access to y,
+we can minimize the negative log marginal likelihood given the observed λi outputs and solve with SGD, or use a
+closed-form solution [26].
+E
+Prompts
+Here we include all prompts used in the paper.
+E.1
+End-to-end prompt
+The prompt that instructs the model to produce all useful attribute-value pairs mentioned in a “chunk” of document text
+is as follows. This prompt is used both as the end-to-end prompt that is used to process all documents in EVAPORATE-
+DIRECT (Section 3.1) and in EVAPORATE-CODE for performing Schema Identiﬁcation (Section 3.2). The same
+prompt is applied to multiple chunks across multiple documents across our 16 evaluation settings, and contains generic
+in-context examples.
+24
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Sample
+text:
+<tr class =" mergedrow"><th scope ="row" class =" infobox -label"><div
+style ="text -indent : -0.9em;margin
+-left :1.2 em;font -weight:normal ;"><a href ="/ wiki/ Monarchy_of_Canada " title =" Monarchy
+of Canada
+">Monarch </a> </div ></th ><td class =" infobox -data"><a href ="/ wiki/ Charles_III " title =" Charles
+III">Charles III </a></td ></tr >
+<tr class =" mergedrow"><th scope ="row" class =" infobox -label"><div
+style ="text -indent : -0.9em;margin
+-left :1.2 em;font -weight:normal ;"><span
+class =" nowrap"><a href ="/ wiki/
+Governor_General_of_Canada " title =" Governor
+General
+of Canada">Governor
+General </a></span > </
+div ></th ><td class =" infobox -data"><a href ="/ wiki/Mary_Simon" title =" Mary
+Simon">Mary Simon </a
+></td ></tr >
+<b>Provinces
+and
+Territories </b class=’ navlinking
+countries ’>
+<ul >
+<li >Saskatchewan </li >
+<li >Manitoba </li >
+<li >Ontario </li >
+<li >Quebec </li >
+<li >New
+Brunswick </li >
+<li >Prince
+Edward
+Island </li >
+<li >Nova
+Scotia </li >
+<li > Newfoundland
+and
+Labrador </li >
+<li >Yukon </li >
+<li >Nunavut </li >
+<li >Northwest
+Territories </li >
+</ul >
+Question: List
+all
+relevant
+attributes
+about ’Canada ’ that
+are
+exactly
+mentioned
+in this
+sample
+text if any.
+Answer:
+- Monarch: Charles
+III
+- Governor
+General: Mary
+Simon
+- Provinces
+and
+Territories: Saskatchewan , Manitoba , Ontario , Quebec , New
+Brunswick , Prince
+Edward
+Island , Nova
+Scotia , Newfoundland
+and
+Labrador , Yukon , Nunavut , Northwest
+Territories
+----
+Sample
+text:
+Patient
+birth
+date: 1990 -01 -01
+Prescribed
+medication: aspirin , ibuprofen , acetaminophen
+Prescribed
+dosage: 1 tablet , 2 tablets , 3 tablets
+Doctor ’s name: Dr. Burns
+Date of
+discharge: 2020 -01 -01
+Hospital
+address: 123
+Main
+Street , New York , NY 10001
+Question: List
+all
+relevant
+attributes
+about ’medications ’ that
+are
+exactly
+mentioned
+in this
+sample
+text if any.
+Answer:
+- Prescribed
+medication: aspirin , ibuprofen , acetaminophen
+- Prescribed
+dosage: 1 tablet , 2 tablets , 3 tablets
+----
+Sample
+text:
+{{ chunk :}}
+Question: List
+all
+relevant
+attributes
+about
+’{{ topic :}}’ that
+are
+exactly
+mentioned
+in this
+sample
+text if any.
+Answer:
+E.2
+Attribute Extraction Prompt
+The following prompt is used to directly extract a provided “attribute” value from the provided “chunk” of document
+text. This prompt is used as EVAPORATE’s prompt for collecting the high-quality LLM F’s “labels” on Deval, against
+which the generated functions f ∈E are scored (Section 3.2). The same prompt is applied to multiple chunks across
+multiple documents across our 16 evaluation settings, and contains generic data-lake agnostic in-context examples.
+25
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Here is a file
+sample:
+<th >Location </th >
+<td ><a href ="/ wiki/Cupertino">Cupertino </a>, <a href ="/ wiki/ California">California </a>Since
+1987 </td >
+Question: Return
+the
+full "location" span of this
+sample
+if it exists , otherwise
+output
+nothing.
+Answer:
+- Location: Cupertino , California
+Since
+1987
+----
+Here is a file
+sample:
+{{ chunk :}}
+Question: Return
+the
+full
+"{{ attribute :}}"
+span of this
+sample if it exists , otherwise
+output
+nothing.
+Answer:
+E.3
+Function Generation Prompts
+We use two generic prompts for function-generation as follows. These prompts correspond to PA and PB described
+in the Section 3.2.2 micro-experiments. The prompts accept “chunks” of document text that need to be parsed, the
+“attribute” of interest, and the cleaned attribute name “function ﬁeld” (i.e. because attributes with “/”, “-”, etc. will not
+compile).
+Here is a sample of text:
+{{ chunk :}}
+Question: Write a python
+function
+to
+extract
+the
+entire
+"{{ attribute :}}"
+field
+from text , but not
+any
+other
+metadata. Return
+the
+result as a list.
+import
+re
+def
+get_ {{ function_field :}} _field(text: str):
+\"""
+Function
+to
+extract
+the "{{ attribute :}}
+field ".
+\"""
+The second prompt is:
+26
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Here is a file
+sample:
+DESCRIPTION : This
+file
+answers
+the
+question , "How do I sort a dictionary
+by value ?"
+DATES
+MODIFIED: The
+file
+was
+modified
+on the
+following
+dates:
+2009 -03 -05 T00 :49:05
+2019 -04 -07 T00 :22:14
+2011 -11 -20 T04 :21:49
+USERS: The
+users
+who
+modified
+the
+file
+are:
+Jeff
+Jacobs
+Richard
+Smith
+Julia D’Angelo
+Rebecca
+Matthews
+FILE
+TYPE: This is a text
+file.
+Question: Write a python
+function
+called " get_dates_modified_field " to
+extract
+the "DATES
+MODIFIED" field
+from
+the
+text. Include
+any
+imports.
+import
+re
+def
+get_dates_modified_field (text: str):
+\"""
+Function
+to
+extract
+the
+dates
+modified.
+\"""
+parts= text.split (" USERS ") [0]. split (" DATES
+MODIFIED ")[-1]
+pattern = r’\d{4} -\d{2} -\d{2}T\d{2}:\d{2}:\d{2}’
+return
+re.findall(pattern , text)
+----
+Here is a file
+sample:
+<title >U.S. GDP
+Rose
+2.9% in the
+Fourth
+Quarter
+After a Year of High
+Inflation
+- WSJ </title >
+<meta
+property ="og:url" content =" https :// www.wsj.com/articles/us -gdp -economic -growth -fourth -
+quarter -2022 -11674683034"/ >
+<meta
+name =" article.published" content ="2023 -01 -26 T10 :30:00Z"/><meta
+itemProp =" datePublished "
+content ="2023 -01 -26 T10 :30:00Z"/>
+<meta
+name =" article.created" content ="2023 -01 -26 T10 :30:00Z"/><meta
+itemProp =" dateCreated " content
+="2023 -01 -26 T10 :30:00Z"/>
+<meta
+name =" dateLastPubbed " content ="2023 -01 -31 T19 :17:00Z"/><meta
+name =" author" content =" Sarah
+Chaney
+Cambon "/>
+Question: Write a python
+function
+called " get_date_published_field " to
+extract
+the " datePublished
+" field
+from
+the
+text. Include
+any
+imports.
+from
+bs4
+import
+BeautifulSoup
+def
+get_date_published_field (text: str):
+\"""
+Function
+to
+extract
+the
+date
+published.
+\"""
+soup = BeautifulSoup (text , parser =" html.parser ")
+date_published_field = soup.find(’meta ’, itemprop =" datePublished ")
+date_published_field = date_published_field [’content ’]
+return
+date_published_field
+----
+Here is a sample
+of text:
+{{ chunk :}}
+Question: Write a python
+function
+called "get_ {{ function_field :}} _field" to
+extract
+the "{{
+attribute :}}"
+field
+from
+the
+text. Include
+any
+imports.
+E.4
+Unsupervised Schema Validation Prompts
+The following prompt is used to determine the validity of an attribute identiﬁed and extracted during EVAPORATE’s
+OpenIE execution. We apply the prompt to a small sample of (e.g. 5) values extracted from the documents, in turn, for
+27
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+a particular “attribute”. If the LLM outputs “No” for all values in the sample, the entire attribute is discarded from
+EVAPORATE s outputted structured view.
+Question: Could
+"2014" be a "year" value in a "students" database?
+Answer: Yes
+----
+Question: Could "cupcake" be a "occupation " value in a "employee" database?
+Answer: No
+----
+Question: Could "’’" be a "animal" value in a "zoo" database?
+Answer: No
+----
+Question: Could "police
+officer" be a " occupation " value in a "employee" database?
+Answer: Yes
+----
+Question: Could
+"{{ value :}}" be a "{{ attr_str :}}"
+value in a {{ topic :}}
+database?
+Answer:
+E.5
+Atomic Schema Cleaning Prompts
+The following prompts are used for atomic schema cleaning in Section C.3. This prompt is used for the expensive LLM
+to decompose complex attributes and values into atomic attributes and values.
+Extract
+one or more
+atomic
+schemas
+and
+values
+from
+the
+given
+schemas
+and
+values
+as a JSON
+list of
+pairs.
+Schema: Spouse
+Value: Michelle
+Robinson (m. 1992)
+Atomic
+schemas
+and
+values: [[" Spouse
+Name", "Michelle
+Robinson "], [" Married
+Year", 1992]]
+---
+Schema: In office
+Value: January 8, 1997 - November 4, 2004
+Atomic
+schemas
+and
+values: [[" In Office
+Start
+Year", "January 8, 1997"] , ["In Office
+End
+Year", "
+November 4, 20024"]]
+---
+Schema: Gini
+(2020)
+Value: 46.9
+Atomic
+schemas
+and
+values: [[" Gini
+2020" ,
+"46.9"]]
+---
+Schema: Countries
+Value: United
+States
+(29
+teams)\n Canada (1 team)
+Atomic
+schemas
+and
+values: [[" Countries", [" United
+States
+(29
+teams)", "Canada
+(1 team)"]]]
+---
+Schema: {{ complex_attribute :}}
+Value: {{ complex_value :}}
+Atomic
+schemas
+and
+values:
+28
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+The following prompt is used to prompt the smaller, inexpensive LM to extract the cleaned value from the complex
+value given the cleaned attribute and a one-shot demonstration from the expensive LLM for atomic schema cleaning in
+Section C.3.
+Extract
+the
+attribute
+from
+the
+context.
+Context: {{ complex_attribute_example :}}: {{ complex_extraction_example :}}
+Attribute: {{ cleaned_attribute_example :}}
+Value: {{ cleaned_value_example :}}
+---
+Context: {{ complex_attribute :}}: {{ complex_extraction :}}
+Attribute: {{ cleaned_attribute :}}
+Value:
+F
+System Input and Output Diagrams
+In Figures 5, 6, and 7, we include sample inputs and outputs for EVAPORATE.
+Figure 5: Diagram depicting EVAPORATE input and sample output on the Wikipedia NBA Players (HTML) setting.
+29
+
+Language Models Enable Simple Systems for Generating Structured Views of Heterogeneous Data Lakes
+Figure 6: Diagram depicting EVAPORATE input and sample output on the Medical AI Device FDA Reports (TXT)
+setting.
+Figure 7: Diagram depicting EVAPORATE input and sample output on the SWDE Movies IMDB (HTML) setting.
+30
+

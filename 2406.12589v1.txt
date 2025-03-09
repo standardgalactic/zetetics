@@ -1,0 +1,2084 @@
+Discovering Minimal Reinforcement Learning
+Environments
+Jarek Liesen ∗
+BCCN Berlin
+Chris Lu
+University of Oxford
+FLAIR
+Andrei Lupu
+University of Oxford
+FLAIR
+Jakob N. Foerster
+University of Oxford
+FLAIR
+Henning Sprekeler
+Technical University Berlin
+Science of Intelligence
+Robert T. Lange
+Technical University Berlin
+Science of Intelligence
+Abstract
+Reinforcement learning (RL) agents are commonly trained and evaluated in the
+same environment. In contrast, humans often train in a specialized environment
+before being evaluated, such as studying a book before taking an exam. The
+potential of such specialized training environments is still vastly underexplored,
+despite their capacity to dramatically speed up training.
+The framework of synthetic environments takes a first step in this direction by meta-
+learning neural network-based Markov decision processes (MDPs). The initial
+approach was limited to toy problems and produced environments that did not
+transfer to unseen RL algorithms. We extend this approach in three ways: Firstly,
+we modify the meta-learning algorithm to discover environments invariant towards
+hyperparameter configurations and learning algorithms. Secondly, by leveraging
+hardware parallelism and introducing a curriculum on an agent’s evaluation episode
+horizon, we can achieve competitive results on several challenging continuous
+control problems. Thirdly, we surprisingly find that contextual bandits enable
+training RL agents that transfer well to their evaluation environment, even if it is
+a complex MDP. Hence, we set up our experiments to train synthetic contextual
+bandits, which perform on par with synthetic MDPs, yield additional insights into
+the evaluation environment, and can speed up downstream applications.
+1
+Introduction
+Reinforcement learning (RL) agents are commonly trained and evaluated in precisely the same
+environment. It is well known that this approach has several significant disadvantages: RL agents are
+brittle to minor changes in the environment dynamics, hyperparameter choices, or even the concrete
+implementation of an algorithm [Henderson et al., 2018, Engstrom et al., 2019, Cobbe et al., 2020,
+Agarwal et al., 2021]. Most recent research in RL has focused on improving RL algorithms to
+alleviate these challenges. But what about the RL environment or the underlying Markov decision
+process (MDP) itself? Unlike RL agents, professional athletes train under vastly different conditions
+than their final competition settings. For example, long-distance runners do not repeatedly run the
+target distance, but train shorter interval runs, progressively increase their pace, and occasionally
+mix in long runs. Such specialized training environments have the potential to significantly speed up
+RL pipelines: They can be optimized to train agents rapidly, requiring several orders of magnitude
+fewer environment steps. Additionally, when such environment proxies are parameterized by neural
+networks, modern hardware accelerators enable rapid simulation of the environment. Thus, they can
+∗Correspondence at jarek@bccn-berlin.de
+Preprint. Under review.
+arXiv:2406.12589v1  [cs.LG]  18 Jun 2024
+
+Figure 1: (1) Training process for synthetic contextual bandits. Firstly, an agent is trained in an SCB
+(blue), observing only an initial state and reward in each episode. After training, the agent is frozen
+and transferred to an evaluation environment. The achieved episodic return is the training signal to
+update the SCB (red). (2) Aggregated training results for challenging Brax environments. Training in
+the SCB yields policies that are competitive with EE experts, sometimes even outperforming them.
+The x-axis shows expert normalized performance as (R−Rrandom)/(Rexpert −Rrandom), where Rrandom
+and Rexpert are the episodic returns achieved in the EE by an expert and a random policy, respectively.
+For full training results, see appendix 2. (3) Training curves for EE versus SCBs, saving orders of
+magnitude of environment steps. A complete visualization is given in figure 5. (4) Visualization of
+observation feature importances for Pendulum-v1. For details refer to section 5.
+be used in a myriad of applications including pretraining, neural architecture search, and downstream
+meta-learning.
+Here, we scale the framework of synthetic environments [SEs, Ferreira et al., 2022] to explore the
+usefulness of synthetic training data for RL agent training. SEs are RL environments parameterized
+by neural networks and optimized for transfer performance: After training an agent in an SE, the
+agent achieves a high episodic return in a fixed evaluation environment (EE). A visualization of the
+optimization algorithm is shown in figure 1 (1). The initial approach parameterizes the SE using
+a single network to represent the transition, reward, and termination functions. Combined with
+the initial state distribution of the EE, the SE becomes a full MDP. During our experiments, we
+found that extending the initial approach by additionally parameterizing the initial state distribution
+leads to synthetic MDPs that terminate most episodes after a single time step. We propose that
+this is not an artifact of meta-learning, but a discovered property that is beneficial when training
+agents. Therefore, we purposefully constrain our environment parameterization towards synthetic
+contextual bandits (SCBs). SCBs perform competitively with synthetic MDPs, but have several
+practical benefits including much smaller models and a high degree of interpretability. We make the
+following contributions:
+• We give analytical and empirical evidence that it is possible to transform MDPs into CBs. In
+other words, we show that we can obtain a policy that performs well in an MDP by training
+it in a CB. We demonstrate that SCBs arise naturally when parameterizing fully synthetic
+MDPs (section 4.1).
+• We show that our meta-learning algorithm discovers CBs invariant towards learning algo-
+rithms and hyperparameters, and even generalize towards out-of-distribution agents and
+training algorithms. Furthermore, we are the first to show that it is possible to discover syn-
+thetic proxies for challenging control environments ((2) and (3) in figure 1, and section 4.2).
+• We demonstrate how the synthetic CBs can be analyzed to gain insights into their evaluation
+environment, including a measure of feature importance ((4) in figure 1, and section 5).
+• We show how SCBs can be integrated into downstream meta-learning applications, such as
+Learned Policy Optimization [Lu et al., 2022], speeding them up significantly (section 6).
+2
+
+• We implement several common RL algorithms in a way that supports GPU parallelism, which
+allows us to run experiments in a fraction of wall clock time compared to a multiprocessing-
+based approach. Additionally, we release the synthetic environments using the gymnax
+interface [Lange, 2022b], allowing for a drop-in replacement of the evaluation environment.
+The respositories are available at https://github.com/keraJLi/rejax [Liesen et al.,
+2024] and https://github.com/keraJLi/synthetic-gymnax.
+2
+Background
+2.1
+Contextual Bandits are a Special Case of Markov Decision Processes
+The most widely used formalism for RL environments is the Markov decision process (MDP), defined
+as a tuple ⟨S, A, P, R, η0, d⟩. At the beginning of each episode, a state s0 ∈S is sampled from the
+initial state distribution s0 ∼η0. At each succeeding time step t, the agent samples an action at ∈A
+from its policy a ∼π(.|st). The environment then generates the next state as st+1 ∼P(.|st, at) and
+issues a reward rt ∼R(.|st, at). As soon as the Boolean value of the termination function d(st)
+indicates it, the episode is terminated.
+The basic reinforcement learning problem is to find a policy π∗that maximizes the expected return
+Eπ[P∞
+t=0 γtrt], where 0 < γ < 1 is called discount factor. Alternatively, this can be stated in terms
+of the Q-function as
+π∗= argmax
+π
+E
+s0∼η0
+a0∼π(.|s0)
+[Qπ(s0, a0)],
+where
+Qπ(s, a) = Eπ
+" ∞
+X
+t=0
+γtrt
+s0 = s, a0 = a
+#
+. (1)
+Note that any optimal policy chooses actions greedily with respect to its Q-function, meaning
+π∗(a|s) = 1 iff a = argmax˜a Qπ∗(s, ˜a).
+This work focuses on meta-learning a special case of MDPs, namely a contextual bandit (CB). In a
+CB, the transition function P is deterministic, and always points towards a state sd with d(sd) = true.
+From this constraint, it follows immediately that the Q-function of any policy is equal to the expected
+immediate reward:
+Qπ(s, a) = Eπ
+" ∞
+X
+t=0
+γtrt
+s0 = s, a0 = a
+#
+= Eπ[γ0r0|s0 = s, a0 = a] = E[R(.|s, a)].
+(2)
+Therefore in any contextual bandit, the optimal policy as defined in equation (1) greedily maximizes
+the immediate reward, i.e.
+π∗(a|s) = 1 iff a = argmax
+˜a
+E[R(.|s, ˜a)].
+2.2
+Meta-training Synthetic Environment and Parameterization
+Algorithm 1 Bi-level optimization algorithm for meta-learning SEs
+Require: number of generations G, population size N
+Initialize population of SCBs via random neural network initialization
+for g = 1, . . . , G do
+▷Outer loop
+for i = 1, . . . , N do
+▷Inner loop
+Train RL agent Ai in SCBi
+Evaluate fitness of Ai as episodic return in evaluation environment
+Update population using meta-optimizer and performances of the agents Ai
+Ferreira et al. [2022] introduce synthetic environments as RL environments parameterized by a
+neural network. They parameterize parts of an MDP, namely the transition, reward, and termination
+function, computed as st+1, rt, dt = fθ(st, at), where fθ refers to the forward pass of a neural
+network with parameters θ. The resulting networks are then optimized using a bi-level optimization
+scheme consisting of two nested loops (see alg. 1). In the inner loop, an RL agent is trained in a
+synthetic environment. After training it is frozen, and its fitness, the episodic return in an evaluation
+3
+
+environment, is calculated. At each generation (iteration) of the outer loop, the inner loop is executed
+on a population (batch) of SEs. Afterward, the calculated fitness scores are used to generate the next
+population, such that the expected return is increased. We use separable natural evolution strategies
+[SNES, Wierstra et al., 2014, see appendix B] for outer loop optimization.
+3
+Methods: Improving the Discovery of Synthetic Environments by Sampling
+Inner Loop Algorithms & Introducing an Outer Loop Curriculum
+Meta-learning for generalization by sampling algorithms. The meta-learned CBs should not be
+specific to certain RL algorithms. Instead, it should be possible for any RL algorithm to train a good
+policy in the SCB, using a wide range of hyperparameters (HPs). To avoid overfitting to specific
+algorithms while meta-training, we extend the original optimization algorithm by sampling inner
+loop tasks, each of which is represented by a random algorithm/HP combination. We use PPO, SAC,
+DQN and DDQN [Schulman et al., 2017, Christodoulou, 2019, Mnih et al., 2015, van Hasselt et al.,
+2015] for discrete, and PPO, SAC, DDPG and TD3 [Schulman et al., 2017, Haarnoja et al., 2018,
+Lillicrap et al., 2015, Fujimoto et al., 2018] for continuous action spaces. HPs are sampled uniformly
+from a broad range of sensible values (see appendix F.2).
+Scaling to locomotion environments using an outer loop curriculum. Many continuous control
+problems in Brax [Freeman et al., 2021], like hopper or walker2d, require learning balance and
+locomotion, and are truncated after 1000 steps. When evaluating SCB-trained agents for the full
+1000 steps, SCBs quickly converge to balancing without forward movement. To address this, we
+employ a curriculum on fitness evaluation rollout length: We start meta-training with short episodes
+and gradually increase their length, shifting focus towards locomotion early in meta-training.
+Leveraging automatic vectorization. To efficiently parallelize the training of agent populations,
+we implement vectorizable versions of these algorithms in JAX [Bradbury et al., 2018]. This allows
+for hardware-parallel training using different values of hyperparameters that don’t alter the memory
+layout or sequence of executed operations. While this does not include model architecture or the
+number of training steps, we find that the diversity in training algorithms allows for sufficient
+generalization (section 4.2). Additionally, we will publish the implementations as an open-source
+library, available at https://github.com/keraJLi/rejax [Liesen et al., 2024].
+4
+Results: Synthetic CBs are General & Scalable MDP Proxies
+We first demonstrate that contextual bandits arise naturally from parameterizing fully synthetic MDPs
+(section 4.1). Subsequently, we show that meta-learned synthetic contextual bandits generalize
+out-of-distribution and scale towards challenging control environments (section 4.2).
+4.1
+Contextual Bandits as a Discovered Property of Synthetic Environments
+We begin our experiments by extending the setup of Ferreira et al. [2022] with a parameterized initial
+state distribution of the form s0 = fϕ(z), where z ∈RN is a latent variable sampled from a diagonal
+Gaussian distribution. After training these fully synthetic MDPs, we found that they often terminate
+episodes after a single time step (see Figure 2, left). We interpret this as a discovered property of SEs,
+and constrain our SEs to a single step, making them contextual bandits. Surprisingly, we find that this
+has next to no negative impact on the performance of the synthetic environments, sometimes even
+being beneficial (see Figure 2, right). The usage of CBs has several practical advantages:
+1. The number of parameters is significantly lower. The transition function takes O(dim(S)2)
+parameters, while the reward function only takes O(dim(S)) when parameterizing with
+fully connected networks, where S is the state space.
+2. It avoids instabilities related to the recurrent application of the transition function. When
+allowing for long episodes, we consistently encountered overflowing state values (NaNs) in
+the early stages of meta-training (for example, in the ablations in appendix D.2).
+3. It significantly simplifies the meta-learning problem for sparse reward environments. Param-
+eterizing the initial state distribution is necessary to obtain a well-performing SCB for the
+MountainCar-v0 environment (appendix D.2). We hypothesize that this is because critical
+4
+
+0.00
+0.25
+0.50
+0.75
+1.00
+Fraction of episodes
+Acrobot-v1
+CartPole-v1
+MountainCar-v0
+MountainCar
+Continuous-v0
+Pendulum-v1
+1
+2
+3
+4
+1
+1
+2
+1
+1
+2
+1
+2
+3
+4
+Number of steps
+1
+(SCB)
+2
+5
+10
+50
+100
+max
+(EE)
+Max. #steps in synthetic MDP
+0.4
+0.6
+0.8
+1.0
+1.2
+Normalized perf.
+Acrobot-v1
+CartPole-v1
+MountainCar-v0
+MountainCar
+Continuous-v0
+Pendulum-v1
+Figure 2: CBs are a discovered property of synthetic environments. Left: Fraction of episode
+lengths in a synthetic MDP. In most environments, more than 80% of episodes are terminated after a
+single time step. Episodes were generated using 50 episodes of agents trained with each algorithm.
+Right: Normalized performance of synthetic MDPs with decreasing maximum episode length. “max”
+refers to the maximum episode of the evaluation environment. Shown are the IQM scores and 95%
+confidence intervals of 20 training runs, aggregated over all algorithms (see section 3). Performance
+is normalized as (R−RSCB)/(R−Rrandom) for each algorithm individually, where RSCB is the return
+in the EE after training in the SCB, and Rrandom is the return of a random policy.
+PPO
+SAC
+DDPG
+TD3
+Aggregated
+algorithms
+Networks with
+512 units
+Swish
+activation
+Neuro-
+evolution
+CB-optimal
+policy
+25
+0
+25
+50
+75
+100
+Episodic return in EE
+Used in inner loop
+Out of distribution
+Training agents for ContinuousMountainCar-v0
+Training in
+SCB
+SCB (fixed HP)
+EE
+Figure 3: Meta-learned SCBs generalize across hyperparameters and towards out-of-distribution RL
+algorithms. Each column shows the return of a policy after training in either the SCB (blue) or the
+EE directly (red), using sampled hyperparameters and 10,000 environment steps. Additionally, we
+ablate the meta-training algorithm by using fixed hyperparameters in the inner loop. When sampling
+hyperparameters during the evaluation, the ablated SCBs (green) perform worse. Additionally, the
+SCBs generalize towards agents not used in the inner loop (right of dashed line). For more details,
+refer to appenix C.
+states can be shown to the agent immediately, instead of having to be reached via multiple
+(meta-learned) transitions.
+4. The synthetic reward function is well-interpretable since the episodic return is equal to
+the immediate reward (eq. (2)). Neural parameterization allows differentiation and the
+application of interpretability methods. We present two ways to interpret the CBs in
+section 5.
+Intuition suggests that being more general, MDPs have a richer class of solutions (i.e. optimal
+policies) compared to CBs. Perhaps surprisingly, this is not the case:
+Theorem 1. Given any Markov decision process M, there exists a contextual bandit B, such that
+every policy π∗that is optimal in B is also optimal in M. For a proof see appendix A.
+Theorem 1 makes no statement about the training efficiency in practice. Thus, we dedicate the rest of
+our experiments to empirically demonstrate that training in CBs is not only possible but beneficial.
+4.2
+Meta-Learning Synthetic Contextual Bandits
+SCB generalization.
+Figure 3 demonstrates the generality of a meta-learned SCB for
+ContinuousMountainCar-v0. It shows the performance of inner loop agents with random HPs,
+5
+
+0
+1000
+2000
+Generation
+250
+500
+750
+1000
+Evaluation length
+Curriculum
+0
+1000
+2000
+Generation
+0
+1000
+2000
+3000
+Episodic return
+Fitness of SCB for hopper
+Curriculum
+linear
+fast
+polynomial
+none
+Figure 4: Curriculum and training speed for Brax environments. Left: Visualization of different
+curricula. Right: Influence of curricula on the meta-training progress for the hopper environment.
+For no curriculum, we show the IQM and 95% CIs over 9 seeds. One seed is shown per curriculum.
+as well as the performance of several agents that were out-of-distribution, after training in the SCB
+and evaluation environment directly. SCBs are universally much more robust to hyperparameter
+changes than their respective evaluation environment. This is even the case when being meta-learned
+using fixed hyperparameters in the inner loop, but the robustness can be increased further by sam-
+pling them. Notably, SCBs enable consistently training PPO agents for MountainCar-v0, which
+is not the case in the evaluation environment directly, even when using tuned HPs2. Due to the
+technical constraints imposed by using JAX’s vectorization, SCBs were trained using both a fixed
+set of gradient-based algorithms and a common fixed network architecture for each RL agent. Still,
+the meta-learned SCBs generalize out-of-distribution. Replacing an RL agent’s activation function
+or network architecture with one that was not used during meta-training does not hurt its perfor-
+mance. Additionally, optimizing a policy network using SNES [Wierstra et al., 2014], an evolution
+strategy instead of a gradient-based algorithm, works well across SCBs. Finally, we show that the
+SCB-optimal policy performs well in the evaluation environment, meaning that SCBs should enable
+training capable agents using any RL algorithm that finds this policy.
+Baselines and Ablations. Since CBs lack the temporal dynamics of an MDP, training in a CB can
+be thought of as an (online) supervised learning problem. Instead of solving the temporal credit
+assignment problem, the agent simply has to predict which action maximizes the immediate reward.
+We, therefore, investigate how the discovered reward function compares with several baselines. First,
+we compare to online supervised learning of an expert policy, implemented by interacting with the
+evaluation environment and taking steps to minimize KL[π||πexpert] on batches of states. We refer to
+this setup as online behavioral cloning and interpret it as a replacement for the reward function of the
+SCB. Alternatively, we can replace the reward function with one that was constructed using an expert
+Q-function. We can construct it such that theorem 1 holds, thereby theoretically obtaining expert
+policies from training in the SCB. Finally, we can replace the synthetic initial state distribution with
+an expert state distribution, simulating the interaction of the evaluation environment and expert agent
+in the background. We find that the synthetic initial state distribution is strictly required for successful
+RL training, while the training speed of SCB training and online behavioral cloning is comparable
+(appendix D.1). In appendix D.2 we additionally perform several ablations to the most important
+design choices of our meta-training algorithm: A parameterized initial state distribution is needed for
+sparse-reward environments, our method performs best with a continuous latent distribution for the
+initial state, and meta-evolution is robust to the choice of meta-curriculum.
+Scaling to complex control environments. To scale to control environments requiring locomotion,
+we apply a curriculum to the meta-learning algorithm. It gradually increases the number of time steps
+for which we evaluate a trained inner loop agent in the evaluation environment. Different curricula
+and corresponding meta-learning curves are shown in figure 4. While our experiments suggest that
+meta-learning is robust towards the choice of curriculum, training without a curriculum leads to
+quick convergence to a local optimum. Overall, this method allows us to successfully meta-learn
+SCBs for several complex control environments, as shown in figure 1 (2). Notably, agents only take
+10,000 steps to learn these tasks in the SCB, whereas training in the evaluation environments typically
+takes millions of time steps. Training in the EE directly is roughly two orders of magnitude slower,
+as shown in figure 5. Additionally, achieving good returns on Brax environments typically needs
+2MountainCar-v0 has a sparse reward that is unlikely to be reached by random exploration. Thus, even
+standard reference implementations of PPO struggle to reach the goal. For example, this is the case for CleanRL
+[Huang et al., 2022], see https://docs.cleanrl.dev/rl-algorithms/ppo/#experiment-results and
+appendix C
+6
+
+104
+106
+#env steps
+0
+2000
+Episodic return in EE
+hopper
+104
+106
+#env steps
+0
+5000
+10000
+halfcheetah
+104
+106
+#env steps
+0
+200
+swimmer
+104
+106
+#env steps
+0
+2000
+4000
+6000
+walker2d
+Training in EE and SCB
+Algorithm
+PPO
+SAC
+DDPG
+TD3
+Training environment
+SCB
+EE
+Figure 5: Training curves for different algorithms on Brax environments. Training in an SCB is
+roughly two orders of magnitude faster. We show the IQM performance with 95% bootstrapped
+confidence intervals. Refer to appendix E for complete training curves.
+4
+0
+4
+1
+4
+0
+4
+Optimal action 
+2
+Acrobot-v1
+-0.75 0 0.75
+x
+-0.75
+0
+0.75
+CartPole-v1
+-1.2 -0.3 0.6
+x
+-0.07
+0
+0.07
+x
+MountainCar-v0
+-1.2 -0.3 0.6
+x
+-0.07
+0
+0.07
+x
+MountainCar
+Continuous-v0
+-1
+0
+1
+sin
+-8
+0
+8
+Pendulum-v1
+cos
+1
+sin
+1
+cos
+2
+sin
+2
+1
+2
+0.0
+0.5
+1.0
+Normalized
+ var(r)
+x
+x
+x
+x
+x
+x
+cos
+sin
+1
+0
+1
+left
+right
+left
+nop
+right
+left
+nop
+right
+2
+0
+2
+Figure 6: SCBs provide interpretable insights into their evaluation environment. Top. Optimal actions
+given the differentiable synthetic reward function for different states and 5 environments. Black box:
+observation space of the evaluation environment. Black line: representative trajectory in the real
+environment. Black x-marker: episode end. Bottom. Normalized reward variance when varying
+observation parts. Mean value over all observations in the space visualized in the top row.
+extensive hyperparameter tuning and additional hacks such as observation normalization, which is
+unnecessary when training on the SCB.
+5
+Interpretability of Synthetic Contextual Bandits
+In contextual bandits, the reward received is equal to the return, the state-, and the state-action value
+function (see eq. (2)). This enables new ways to analyze the environment, such as easily finding the
+optimal action in each state via gradient descent or a simple grid search. We visualize the optimal
+actions in the top row of figure 6. The resulting visualizations yield insights into the way that the
+synthetic environment trains an agent to perform a task: For example, the SCB for MountainCar-v0
+never induces nops, since the return is highest if terminating early, while the optimal action in the
+MountainCarContinuous-v0 SCB is often close to nop since it includes a control cost instead of
+a constant negative reward. Additionally, we can directly investigate the relationship between the
+observation and the return. We do so by fixing observation and action, and observing the variance in
+the reward when varying a single entry of the observation. The results are visualized in the bottom
+row of figure 6. We find that the reward is almost invariant to some parts of the observations. For
+example, varying the values of the angle in Acrobot-v1 has very little impact on the reward compared
+to the angular velocities. Similar findings hold for the position and angle in CartPole-v1. Thereby we
+rediscover the results of Vischer et al. [2021] and Lu et al. [2023a]. They found the same invariances
+7
+
+0
+20
+Generation
+1000
+750
+500
+250
+Episodic return in EE
+Meta-Training (Pendulum-v1)
+107
+109
+#env steps (log scale)
+1000
+750
+500
+250
+Meta-Training (Pendulum-v1)
+0.0
+0.5
+1.0
+#env steps 1e6
+1250
+1000
+750
+500
+250
+Test-time (Pendulum-v1)
+0
+2
+4
+#env steps 1e7
+0
+500
+1000
+1500
+2000
+Test-Time (brax/hopper)
+LPO-Zero (EE)
+LPO-Zero (SCB)
+PPO
+Figure 7: Meta-learning an objective function using an SCB. From left to right: 1. Meta-training
+using SCB and EE achieves similar performance on Pendulum-v1. 2. Meta-training on an SCB takes
+fewer environment steps since every episode has only one step. 3. Training with the meta-learned
+objective is faster than using the original PPO objective. 4. The meta-learned objectives generalize to
+an unseen, much more complex, environment (Hopper).
+in the context of the lottery ticket hypothesis and adversarial attacks respectively, where these input
+channels were pruned or used to manipulate learning dynamics.
+6
+Downstream Application: Learned Policy Optimization
+SCBs offer a significant training speedup both in terms of environment steps and simulation time.
+This offers several possibilities for downstream applications, such as in evolutionary meta-learning.
+As an example, we demonstrate their effectiveness in Learned Policy Optimization [LPO, Lu et al.,
+2022]. In LPO, the surrogate objective of PPO is replaced by a neural network3. This neural network
+is meta-trained to maximize the final return when using it as an objective.
+We meta-learn an objective function both on the Pendulum-v1 environment, as well as an SCB that has
+Pendulum-v1 as its corresponding EE. In both cases, we obtain well-performing objective functions
+(figure 7, 1.). However, meta-training on the SCB takes two orders of magnitude fewer environment
+steps (figure 7, 2.). This is because to obtain fitness scores for the SCB, only a single environment
+step has to be simulated, while for Pendulum-v1 a whole episode of 200 steps is necessary. We
+then use the meta-learned surrogate objectives for training an agent on Pendulum-v1 and compare
+them to PPO (figure 7, 3.). We find that both objectives outperform the original objective of PPO in
+terms of training speed and final performance. To probe the generalization to new environments, we
+additionally evaluate the meta-learned objectives on hopper (figure 7, 4.). The results show that the
+meta-learned objectives are fully comparable to PPO.
+In this application, replacing the evaluation environment with its corresponding SCB had no negative
+effect on the final performance, but allowed for a significant speedup in meta-training time. The
+ability to not only train an RL agent but to successfully apply a meta-learning algorithm on the SCB
+further underscores its generality.
+7
+Related Work
+Training Reinforcement Learning Agents with Synthetic Data. Various methods for training
+machine learning models from synthetically generated data have been proposed. For example, this
+includes dataset distillation for supervised training [Wang et al., 2018] or synthetic experience replay
+and behavior distillation for RL [Lu et al., 2023b, Lupu et al., 2024]. Applications for training with
+synthetic data include data augmentation and cheap data generation, which is especially important
+when requiring large amounts of data, such as in RL. Most closely related to our work is the approach
+outlined by Ferreira et al. [2022] which learns the reward- and state transition function while using
+the initial state distribution of the original environment. They report limited transfer to agents not
+used in the inner loop and do not scale their approach to continuous control environments.
+3The neural network is parameterized to fulfill the conditions of a drift functional to uphold theoretical
+convergence guarantees, for more details see [Lu et al., 2022, Kuba et al., 2022].
+8
+
+Extensions to Ferreira et al. [2022] We overcome the limited scalability and transfer reported by
+Ferreira et al. [2022] by extending their work in the following ways:
+• We limit the episode length in the synthetic MDP to one, turning it into a simple CB.
+• We meta-learn the initial state distribution instead of sampling from the EE.
+• We sample inner-loop algorithms during meta-training. This allows for broad generalization,
+even out-of-distribution, as shown in figure 3.
+• We introduce a curriculum on the evaluation episode length for control environments. This
+enables training SCBs for complex control environments of the Brax suite, as shown in
+figure 4.
+• We leverage hardware acceleration by developing an efficient RL algorithm implementation.
+This allows us to run much larger experiments, using larger population sizes (256 vs. 16),
+more evaluation seeds (64 vs. 10), and more generations (2000 vs. 200).
+Discovering Algorithm Components via Evolutionary Meta-Learning. Recently, the general
+combination of evolutionary optimization and neural network-based algorithm families has been used
+to discover various powerful algorithms. This includes the meta-discovery of gradient-based [Metz
+et al., 2022] and gradient-free [Lange et al., 2022, 2023] optimization algorithms, policy optimization
+objective functions [Lu et al., 2022, Jackson et al., 2024], or reward functions [Faust et al., 2019].
+Furthermore, these synthetic artifacts can often be reverse-engineered to generate human-interpretable
+components. Here, we use the same paradigm to transform real environment simulators into SCBs.
+Hardware Accelerated Reinforcement Learning Environments. Commonly, RL environments
+have been bound to CPUs and constrained by limited parallelism. Recently, there has been a paradigm
+change with RL simulators being accelerated by accelerator parallelism. These efforts include Brax
+[Freeman et al., 2021], Gymnax [Lange, 2022b], Jumanji [Bonnet et al., 2023], Pgx [Koyamada
+et al., 2023], or NVIDIA Isaac Gym [Makoviychuk et al., 2021]. Still, most of them require the
+translation of the original step transition logic into hardware-specific coding frameworks (e.g. JAX
+[Bradbury et al., 2018]). Here, we provide a means to automatically yield hardware-accelerated
+neural-network-based environment proxies for training RL agents that generalize to potentially
+non-accelerated environments.
+8
+Discussion
+Summary. We have demonstrated that it is possible to transform Markov decision processes into
+contextual bandits, a much simpler class of reinforcement learning environments. The meta-learned
+SCBs are capable of training RL agents that perform competitively in evaluation environments. As
+shown by our extensive studies, they exhibit a high degree of generality and even generalize to RL
+agents out-of-distribution. To enable successful meta-learning, we introduced improvements over the
+previous discovery process by Ferreira et al. [2022], including the sampling of inner loop algorithms,
+a curriculum on the evaluation episode length, and an efficient implementation. The SCBs yield
+insights into the relevance of individual observation entries, are easy to interpret, and can be used to
+speed up downstream applications.
+Limitations. Our goal for this project was to demonstrate the possibility of transforming Markov
+decision processes into contextual bandits, enabling fast training. Still, optimizing an SCB using
+black-box meta-learning is far more computationally expensive than training agents in the evaluation
+environment directly. Current limitations of black-box meta-learning also extend to this work, limiting
+the number of trainable parameters in practice. To recoup the high initial cost, the SCB has to be used
+in downstream applications, like Learned Policy Optimization [Lu et al., 2022]. While a curriculum
+was necessary to discover SCBs for Brax environments, other hacks might be necessary for different
+classes of more complex tasks, all of which must be engineered.
+Future Work. Going forward we are interested in the discovery of synthetic simulators capable of
+promoting a truly open-ended learning process. Furthermore, we have focused on control environ-
+ments with proprioceptive symbolic observation dimensions so far. A natural extension of our work
+is to pixel- and vision-based environments leveraging transposed convolutional architectures for the
+initial state distribution.
+9
+
+Societal impact. We find that neural networks are capable of representing various RL simulators
+in a compressed fashion. In principle, large models can therefore be capable of distilling data
+distributions and world models useful for self-training. Given that these systems are ultimately
+black-box, practitioners need to be careful when deploying them in real-world applications.
+Acknowledgments and Disclosure of Funding
+Andrei Lupu was partially funded by a Fonds de recherche du Québec doctoral training scholarship.
+Henning Sprekeler and Robert T. Lange are funded by the Deutsche Forschungsgemeinschaft (DFG,
+German Research Foundation) under Germany’s Excellence Strategy - EXC 2002/1 “Science of
+Intelligence” - project number 390523135.
+References
+Rishabh Agarwal, Max Schwarzer, Pablo Samuel Castro, Aaron C Courville, and Marc Bellemare.
+Deep reinforcement learning at the edge of the statistical precipice. Advances in neural information
+processing systems, 34:29304–29320, 2021.
+Clément Bonnet, Daniel Luo, Donal Byrne, Shikha Surana, Vincent Coyette, Paul Duckworth, Lau-
+rence I Midgley, Tristan Kalloniatis, Sasha Abramowitz, Cemlyn N Waters, et al. Jumanji: a diverse
+suite of scalable reinforcement learning environments in jax. arXiv preprint arXiv:2306.09884,
+2023.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and
+Qiao Zhang.
+JAX: composable transformations of Python+NumPy programs, 2018.
+URL
+http://github.com/google/jax.
+Petros Christodoulou. Soft actor-critic for discrete action settings, 2019.
+Karl Cobbe, Chris Hesse, Jacob Hilton, and John Schulman. Leveraging procedural generation
+to benchmark reinforcement learning. In International conference on machine learning, pages
+2048–2056. PMLR, 2020.
+Logan Engstrom, Andrew Ilyas, Shibani Santurkar, Dimitris Tsipras, Firdaus Janoos, Larry Rudolph,
+and Aleksander Madry. Implementation matters in deep rl: A case study on ppo and trpo. In
+International conference on learning representations, 2019.
+Aleksandra Faust, Anthony Francis, and Dar Mehta. Evolving rewards to automate reinforcement
+learning. arXiv preprint arXiv:1905.07628, 2019.
+Fabio Ferreira, Thomas Nierhoff, Andreas Sälinger, and Frank Hutter. Learning synthetic environ-
+ments and reward networks for reinforcement learning. In International Conference on Learning
+Representations, 2022. URL https://openreview.net/forum?id=C1_esHN6AVn.
+C Daniel Freeman, Erik Frey, Anton Raichuk, Sertan Girgin, Igor Mordatch, and Olivier Bachem.
+Brax–a differentiable physics engine for large scale rigid body simulation.
+arXiv preprint
+arXiv:2106.13281, 2021.
+Scott Fujimoto, Herke Hoof, and David Meger. Addressing function approximation error in actor-
+critic methods. In International conference on machine learning, pages 1587–1596. PMLR,
+2018.
+Tuomas Haarnoja, Aurick Zhou, Kristian Hartikainen, George Tucker, Sehoon Ha, Jie Tan, Vikash
+Kumar, Henry Zhu, Abhishek Gupta, Pieter Abbeel, et al.
+Soft actor-critic algorithms and
+applications. arXiv preprint arXiv:1812.05905, 2018.
+Peter Henderson, Riashat Islam, Philip Bachman, Joelle Pineau, Doina Precup, and David Meger.
+Deep reinforcement learning that matters. In Proceedings of the AAAI conference on artificial
+intelligence, volume 32, 2018.
+10
+
+Shengyi Huang, Rousslan Fernand Julien Dossa, Chang Ye, Jeff Braga, Dipam Chakraborty, Kinal
+Mehta, and João G.M. Araújo. Cleanrl: High-quality single-file implementations of deep rein-
+forcement learning algorithms. Journal of Machine Learning Research, 23(274):1–18, 2022. URL
+http://jmlr.org/papers/v23/21-1342.html.
+Matthew Thomas Jackson, Chris Lu, Louis Kirsch, Robert Tjarko Lange, Shimon Whiteson, and
+Jakob Nicolaus Foerster. Discovering temporally-aware reinforcement learning algorithms. arXiv
+preprint arXiv:2402.05828, 2024.
+Sotetsu Koyamada, Shinri Okano, Soichiro Nishimori, Yu Murata, Keigo Habara, Haruka Kita, and
+Shin Ishii. Pgx: Hardware-accelerated parallel game simulators for reinforcement learning. arXiv
+preprint arXiv:2303.17503, 2023.
+Jakub Grudzien Kuba, Christian Schroeder de Witt, and Jakob Foerster. Mirror learning: A unifying
+framework of policy optimisation, 2022.
+Robert Lange, Tom Schaul, Yutian Chen, Chris Lu, Tom Zahavy, Valentin Dalibard, and Sebastian
+Flennerhag. Discovering attention-based genetic algorithms via meta-black-box optimization. In
+Proceedings of the Genetic and Evolutionary Computation Conference, pages 929–937, 2023.
+Robert Tjarko Lange. evosax: JAX-based evolution strategies, 2022a. URL http://github.com/
+RobertTLange/evosax.
+Robert Tjarko Lange. gymnax: A JAX-based reinforcement learning environment library, 2022b.
+URL http://github.com/RobertTLange/gymnax.
+Robert Tjarko Lange, Tom Schaul, Yutian Chen, Tom Zahavy, Valentin Dallibard, Chris Lu, Satinder
+Singh, and Sebastian Flennerhag. Meta-learning black-box optimization via black-box optimization.
+2022.
+Jarek Liesen, Chris Lu, and Robert Lange. rejax, 2024. URL https://github.com/keraJLi/
+rejax.
+Timothy P Lillicrap, Jonathan J Hunt, Alexander Pritzel, Nicolas Heess, Tom Erez, Yuval Tassa,
+David Silver, and Daan Wierstra. Continuous control with deep reinforcement learning. arXiv
+preprint arXiv:1509.02971, 2015.
+Chris Lu, Jakub Grudzien Kuba, Alistair Letcher, Luke Metz, Christian Schroeder de Witt, and
+Jakob Nicolaus Foerster. Discovered policy optimisation. In Decision Awareness in Reinforcement
+Learning Workshop at ICML 2022, 2022.
+Chris Lu, Timon Willi, Alistair Letcher, and Jakob Nicolaus Foerster. Adversarial cheap talk. In
+International Conference on Machine Learning, pages 22917–22941. PMLR, 2023a.
+Cong Lu, Philip J Ball, and Jack Parker-Holder. Synthetic experience replay. arXiv preprint
+arXiv:2303.06614, 2023b.
+Andrei Lupu, Chris Lu, Jarek Luca Liesen, Robert Tjarko Lange, and Jakob Nicolaus Foerster.
+Behaviour distillation. In The Twelfth International Conference on Learning Representations,
+2024. URL https://openreview.net/forum?id=qup9xD8mW4.
+Viktor Makoviychuk, Lukasz Wawrzyniak, Yunrong Guo, Michelle Lu, Kier Storey, Miles Macklin,
+David Hoeller, Nikita Rudin, Arthur Allshire, Ankur Handa, et al. Isaac gym: High performance
+gpu-based physics simulation for robot learning. arXiv preprint arXiv:2108.10470, 2021.
+Luke Metz, James Harrison, C Daniel Freeman, Amil Merchant, Lucas Beyer, James Bradbury,
+Naman Agrawal, Ben Poole, Igor Mordatch, Adam Roberts, et al. Velo: Training versatile learned
+optimizers by scaling up. arXiv preprint arXiv:2211.09760, 2022.
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A. Rusu, Joel Veness, Marc G. Belle-
+mare, Alex Graves, Martin Riedmiller, Andreas K. Fidjeland, Georg Ostrovski, Stig Petersen,
+Charles Beattie, Amir Sadik, Ioannis Antonoglou, Helen King, Dharshan Kumaran, Daan Wierstra,
+Shane Legg, and Demis Hassabis. Human-level control through deep reinforcement learning.
+Nature, 518(7540):529–533, Feb 2015. ISSN 1476-4687. doi: 10.1038/nature14236. URL
+https://doi.org/10.1038/nature14236.
+11
+
+John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal policy
+optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+Hado van Hasselt, Arthur Guez, and David Silver. Deep reinforcement learning with double q-
+learning, 2015.
+Marc Aurel Vischer, Robert Tjarko Lange, and Henning Sprekeler. On lottery tickets and minimal
+task representations in deep reinforcement learning. arXiv preprint arXiv:2105.01648, 2021.
+Tongzhou Wang, Jun-Yan Zhu, Antonio Torralba, and Alexei A Efros. Dataset distillation. arXiv
+preprint arXiv:1811.10959, 2018.
+Daan Wierstra, Tom Schaul, Tobias Glasmachers, Yi Sun, Jan Peters, and Jürgen Schmidhuber.
+Natural evolution strategies. The Journal of Machine Learning Research, 15(1):949–980, 2014.
+12
+
+A
+Solving Markov Decision Processes by Training in Contextual Bandits
+Theorem 1. Given any Markov decision process M, there exists a contextual bandit B, such that
+every policy π∗that is optimal in B is also optimal in M. For a proof see appendix A.
+Proof. Let π∗
+M be an optimal policy in M with value function Q∗
+M(s, a). We construct B by setting
+SB = SM and AB = AM, where S and A are state and action spaces. Furthermore, we set
+RB(s, a) = Q∗
+M(s, a) and ρ0,B = ρM(π∗
+M), where ρM(π∗
+M) is the state distribution of policy π∗
+M
+interacting with environment M.
+We now show that any policy π∗
+B that is optimal in B is also optimal in M, by noting that
+1. π∗(a|s) = argmaxa Q∗(s, a) for any policy,
+2. π∗
+B(a|s) = argmaxa RB(s, a) because Q∗
+B(s, a) = RB(s, a) (see equation (2)), and
+3. RB(s, a) = Q∗
+M(s, a) by construction.
+Therefore, for all states s that π∗
+B visits while interacting with M,
+π∗
+B(a|s)
+2.= argmax
+a
+RB(s, a)
+3.= argmax
+a
+Q∗
+M(s, a)
+1.= π∗
+M(a|s).
+There are several different constructions that can be used in the proof, as RB only has to be
+equal to Q∗
+M under argmax (see equality 3.). For example, one can use RB(s, a) = −||a −
+argmax˜a Q∗
+M(s, ˜a)|| for continuous, and RB = 1[a = argmax˜a Q∗
+M(s, ˜a)] for discrete environ-
+ments. Additionally, one can use any initial state distribution that has non-zero probability for all
+states visited by π∗
+M. We compare to these baselines in appendix D.1.
+B
+Meta-Optimization via SNES
+In our experiments, we use a variant of evolution strategies [ES, Wierstra et al., 2014] for meta-
+optimization. ES are algorithms for black-box optimization inspired by the process of biological
+evolution. They aim to maximize a fitness score by sampling a population of parameters and mutating
+those with high fitness to create a population for the next iteration. Formally, every ES consists of a
+parameterized search distribution π(z|θ) and a fitness evaluation function f(z). Here z is a vector of
+parameters whose fitness to maximize, and θ are the parameters of the search distribution. The goal
+is to maximize the expected fitness under the search distribution
+J(θ) = Eθ[f(z)] =
+Z
+f(z)π(z|θ)dz.
+The key design choices of ES are the parameterization of the search distribution and the update
+of its parameters. We use Separable Natural ES [SNES, Wierstra et al., 2014], which updates the
+search distribution by approximating the natural gradient of J(θ) with respect to θ. The search
+distribution of SNES is a diagonal Gaussian π(z|θ) = N(z|µ, σ) where σ = diag(σ1, . . . , σM) and
+M is the number of parameters. A generic version of SNES is shown in algorithm 2. Commonly,
+SNES additionally applies fitness shaping to become invariant to monotonic transformations of the
+fitness vector. We use the implementation provided by Evosax [Lange, 2022a]. For more details, see
+Wierstra et al. [2014].
+13
+
+Algorithm 2 Separable NES
+Require: Population size N
+Require: Fitness function f(z)
+Initialize search distribution mean µ and diagonal covariance matrix σ
+while not converged do
+1. Sample population zi ∼N(−|µ, σ) for i = 1, . . . , N
+2. Calculate fitness f(zi) and log-gradients log ∇θπ(z|θ)
+3. Estimate ∇µJ(θ) ≈PN
+i=1 f(zi)si and ∇σJ(θ) ≈PN
+i=1 f(zi)(s2
+i −1), where si = zi−µ
+σ
+Update µ ←µ + ηµσ∇µJ and σ ←σ exp( ησ
+2 ∇σJ)
+C
+Generality of Synthetic Contextual Bandits
+Here, we present results on the generality of SCBs for other classic control environments, analogous
+to ContinuousMountainCar-v0 figure 3. We train each agent on the x-axis for 20 independent runs
+and show the IQM and 95% confidence intervals of the episodic return achieved in the EE. Each
+agent’s performance is evaluated using the mean return of 50 episode rollouts. For the inner loop
+algorithms, we sample hyperparameters from the distribution used in the inner loop. We compare
+training using our standard SCB (blue), an SCB that was meta-learned using fixed hyperparameters
+in the inner loop (green), and the EE (red). “Aggregated algorithms” refers to the episodic return in
+the EE aggregated over all inner loop algorithms (PPO, SAC, DDPG, TD3 for continuous, and PPO,
+SAC, DQN for discrete action spaces). To test for generalization out of distribution, we train several
+different agents that were not included in the inner loop. These are:
+Networks with 512 units Agent networks with a different architecture (one hidden layer with 512
+units instead of two hidden layers with 64 units). Aggregated across all inner loop algorithms.
+Swish activation Agent networks with a different activation function (swish instead of tanh). Aggre-
+gated across all inner loop algorithms.
+Neuroevolution Training a policy network using a gradient-free evolution strategy instead of a
+gradient-based RL algorithm. Since neuroevolution was not used in the inner loop, we have
+not defined a hyperparameter distribution to sample from, using default hyperparameters
+instead.
+CB-optimal policy We evaluate the optimal policy in the CB, which we find by gradient-based
+maximization of argmaxa RB(s, a) for each state s for continuous action spaces, and by
+explicitly calculating argmaxa RB(s, a), trying out all actions, for discrete action spaces.
+Since this policy is not trained, there are no training hyperparameters that can be sampled.
+PPO
+SAC
+DQN
+Aggregated
+algorithms
+Networks with
+512 units
+Swish
+activation
+Neuro-
+evolution
+CB-optimal
+policy
+500
+400
+300
+200
+100
+Episodic return in EE
+Used in inner loop
+Out of distribution
+Training agents for Acrobot-v1
+Training in
+SCB
+SCB (fixed HP)
+EE
+Figure 8: Generality of an SCB for Acrobot-v1.
+14
+
+PPO
+SAC
+DQN
+Aggregated
+algorithms
+Networks with
+512 units
+Swish
+activation
+Neuro-
+evolution
+CB-optimal
+policy
+100
+200
+300
+400
+500
+Episodic return in EE
+Used in inner loop
+Out of distribution
+Training agents for CartPole-v1
+Training in
+SCB
+SCB (fixed HP)
+EE
+Figure 9: Generality of an SCB for CartPole-v1. The environment is considered solved if the return
+equals 500.
+PPO
+SAC
+DQN
+Aggregated
+algorithms
+Networks with
+512 units
+Swish
+activation
+Neuro-
+evolution
+CB-optimal
+policy
+200
+180
+160
+140
+120
+Episodic return in EE
+Used in inner loop
+Out of distribution
+Training agents for MountainCar-v0
+Training in
+SCB
+SCB (fixed HP)
+EE
+Figure 10: Generality of an SCB for MountainCar-v0. The return being > 200 indicates that the goal
+was reached.
+PPO
+SAC
+DDPG
+TD3
+Aggregated
+algorithms
+Networks with
+512 units
+Swish
+activation
+Neuro-
+evolution
+CB-optimal
+policy
+1400
+1200
+1000
+800
+600
+400
+200
+0
+Episodic return in EE
+Used in inner loop
+Out of distribution
+Training agents for Pendulum-v1
+Training in
+SCB
+SCB (fixed HP)
+EE
+Figure 11: Generalty of an SCB for Pendulum-v1.
+15
+
+D
+Ablations
+D.1
+Replacing Components of an SCB
+If Q∗
+B(s, a) = RB(s, a) holds for any CB, can we not construct an optimal CB by setting RB(s, a) =
+Q∗
+expert(s, a)? Theoretically, training in such a CB should yield a policy with Q∗
+B(s, a) = Q∗
+expert(s, a)
+(see appendix A). Motivated by this insight, we investigate ablations in which we replace the synthetic
+reward function and initial state distribution. While most classic control environments are not strongly
+affected by such ablations, this is not the case for Pendulum-v1, as shown in figure 12.
+Firstly, we notice that the synthetic state distribution is needed to train well-performing agents within
+10,000 time steps, which is the default for SCBs (bottom row). We hypothesize that this is because the
+synthetic initial state distribution samples a large part of the state space, such that agents generalize
+quickly. In contrast, the expert state distributions are much less diverse, closely following a small set
+of trajectories. Corresponding visualizations are shown in figure 13. Replacing the synthetic reward
+by the value function of an expert agent does not work well (column 4). A possible explanation
+for this could be that in Pendulum-v1, the difference in Q-values for close actions is small when
+compared to its absolute magnitude. Finally, using online behavioral cloning (column 2) or an
+“action-supervised” reward (column 3) in combination with the meta-learned synthetic initial state
+distribution leads to performance similar to RL training.
+       
+Expert states
+Synth. reward
+0
+5000
+10000
+0.0
+0.5
+1.0
+Norm. perf
+Online BC
+RB(s, a) = ( * )
+RB(s, a) = Qexpert(s, a)
+0
+5000
+10000
+#Env steps
+0.0
+0.5
+1.0
+Synth. states
+Norm. perf.
+0
+5000
+10000
+#Env steps
+0
+5000
+10000
+#Env steps
+0
+5000
+10000
+#Env steps
+Replacing the synthetic initial state distribution and reward function (Pendulum-v1)
+Algorithm
+PPO
+SAC
+DDPG
+TD3
+Online BC
+Figure 12: Training performance of agents when replacing the synthetic reward function and initial
+state distribution of an SCB for Pendulum-v1. The performance is normalized as (R −Rexpert)/(R −
+Rrandom), where R, Rrandom and Rexpert are the episodic return of the current, a random policy, and
+an expert policy, respectively. Experts were chosen to be SAC agents trained on the evaluation
+environment directly. Their final returns are shown in table 1. We report the IQM of episodic return
+with 95% confidence intervals using 20 independent training runs with 50 evaluation rollouts each.
+Online BC: RL training in online behavioral cloning setup, where we take steps towards minimizing
+KL[π||πexpert] on batches of observations. RB(s, a) = (∗): Training to minimize the error towards
+the expert action. The reward is computed as −||a −a∗|| for continuous, and 1[a = a∗] for discrete
+environments, where 1 is the indicator function and a∗is the action chosen by the expert agent.
+RB(s, a) = Qexpert(s, a): Training in an environment where the reward has been replaced by an
+expert Q-function, similar to the construction in the proof of lemma 1.
+Environment
+IQM Score
+Lower CI
+Upper CI
+Pendulum-v1
+-137.4
+-151.5
+-127.5
+Acrobot-v1
+-76.7
+-78.9
+-74.7
+CartPole-v1
+500.0
+500.0
+500.0
+ContinuousMountainCar-v0
+94.9
+94.8
+95.0
+MountainCar-v0
+-117.7
+-119.2
+-115.3
+Table 1: IQM and 95% confidence intervals of the episodic returns achieved by an SAC expert
+on classic control environments. Aggregated over 200 independent evaluation runs. The agent is
+near-optimal in all cases.
+16
+
+4
+0
+4
+EE
+2
+Acrobot-v1
+-0.75
+0
+0.75
+CartPole-v1
+-0.07
+0
+0.07
+x
+MountainCar-v0
+-0.07
+0
+0.07
+x
+MountainCar
+Continuous-v0
+-8
+0
+8
+Pendulum-v1
+4
+0
+4
+1
+4
+0
+4
+SCB
+2
+-0.75 0 0.75
+x
+-0.75
+0
+0.75
+-1.2 -0.3 0.6
+x
+-0.07
+0
+0.07
+x
+-1.2 -0.3 0.6
+x
+-0.07
+0
+0.07
+x
+-1
+0
+1
+sin
+-8
+0
+8
+1
+0
+1
+1
+0
+1
+left
+right
+left
+right
+left
+nop
+right
+left
+nop
+right
+left
+nop
+right
+left
+nop
+right
+2
+0
+2
+2
+0
+2
+Figure 13: State distributions on the EE and SCB. 2000 samples are shown each. The state distribu-
+tions on the EE are generated by an expert SAC policy, for more details see table 1. The background
+indicates argmaxa Qexpert(s, a) for the EE (top row), and argmaxa RSCB(s, a) for the SCB (bottom
+row). We observe that the synthetic initial state distribution samples a significantly larger part of
+the state space than what is visited by the expert. Additionally, the synthetic reward functions are
+smoother for several of the environments. We hypothesize that this is because it has to be consistent
+across all sampled synthetic states, while the Q-function of an expert policy only has to be accurate
+on its own state distribution.
+D.2
+Ablations of the Meta-Evolution Algorithm
+1500
+1000
+500
+Return in eval. env.
+Pendulum-v1, DDPG
+200
+150
+MountainCar-v0, PPO
+0
+2000
+brax/hopper, SAC
+Setup
+IC
+I
+TI
+T
+0
+500
+1000
+# Generation
+1500
+1000
+500
+Return in eval. env.
+200
+150
+0
+2000
+Latent dist.
+gaussian
+uniform
+categorical
+softmax
+0
+500
+1000
+# Generation
+200
+150
+Return in eval. env.
+0
+1000
+2000
+# Generation
+0
+2000
+Curriculum
+linear
+linear_fast
+polynomial
+no curriculum
+Figure 14: Ablation study evaluating meta-evolution ingredients. Top. We compare the impact of
+parameterizing the initial state distribution (I), transition function (T), and the evaluation episode
+length curriculum (C). All three contributions lead to robust and scalable meta-discovery. Middle.
+Continuous latent distributions for the initial state distribution perform better than categorical ones.
+Bottom. The meta-training setup is robust to the exact choice of evaluation episode length curriculum.
+Inner quantile means for meta-training runs have been averaged over 5 seeds for Pendulum-v1 and 20
+seeds for MountainCar-v0, with indicated 95% confidence intervals.
+17
+
+Figure 14 shows several ablations of our method. In the first row, we visualize four different
+meta-training settings, ingredients indicated by the presence of the letter
+T for a parameterized transition function
+I for a parameterized initial state distribution
+C for the application of an evaluation episode length curriculum
+In the plain T setup, we only parameterize the transition function, which is equivalent to the pa-
+rameterization of Ferreira et al. [2022]. We use our meta-learning software implementation and
+hyperparameters to optimize SEs with the T parameterization. The hyperparameters differ from
+Ferreira et al. [2022] only in the population size (increased from 16 to 64-256, depending on the EE)
+and the number of evaluation seeds (increased from 10 to 64). Both changes are generally favorable
+to the performance. The plain T setup is consistently beaten by our extensions. On MountainCar-v0,
+it is not able to discover an environment in which the agent reaches the goal, achieving a mean return
+of -200 on all evaluation seeds of all meta-training runs. It is well known that even state-of-the-art RL
+algorithms such as PPO struggle with solving MountainCar, due to the sparse reward of reaching the
+flag, which is very improbable to achieve through random exploration. Having to learn the transition
+function before training an agent adds another layer of complexity, which makes solving MountainCar
+in the T setup infeasible.
+Introducing a parameterized initial state distribution in TI circumvents this problem, as the envi-
+ronment can learn a distribution of relevant observations directly, without having to reach them via
+repeated application of the transition function. This increases the performance on almost all classic
+control environments, including Pendulum-v1. We noticed that in T and TI, nearly every generation
+had members with fitness values of nan. This leads to missing data points in figure 14, where even
+the population mean was affected in Pendulum-v1. This is because, for long episodes, the recurrent
+forward pass of synthetic states through the transition neural network can lead to exploding values,
+which eventually overflow.
+This problem can be addressed by limiting the maximum episode length. Since most episodes are
+already extremely short in the T and TI setup (typically under 10 time steps) we set the maximum
+episode length to 1, effectively reducing the synthetic MDP to an SCB task without transition
+dynamics, leading to the plain I setup. We find that this does not reduce the performance in any
+environment, except for Pendulum-v1, where some meta-training runs converge to a lower value.
+Still, the best runs of TI and I have comparable performance.
+A curriculum like in IC is needed to achieve competitive results in the Brax environments. Similar
+curricula can be introduced to classic control environments. For example, decreasing the evaluation
+length from 1000 to 200 while meta-training an environment for MountainCar improves meta-
+training stability and performance. The applicability of curricula is specific to each environment. For
+Pendulum-v1, it is unclear what kind of curriculum to apply, so we omit it, leaving the bottom left
+part of figure 14 empty.
+Our setup includes two main hyperparameters: the latent distribution from which the initial states
+are generated and the curriculum. The second row of figure 14 shows meta-training curves for
+different latent distributions. We test four different latent distributions: a standard Gaussian, a
+uniform distribution in the interval [0, 1), a categorical distribution with equal probabilities, and a
+categorical distribution with probabilities generated by applying the softmax function to [1, 2, . . . , n],
+where n is the dimensionality of the latent vector. When using categorical latent distributions, the
+initial state distribution becomes a categorical one as well and can be thought of as sampling from a
+set of meta-learned observations. Overall, the Gaussian and uniform distributions achieve a similar
+performance, outperforming the categorical distributions. This is likely because they can densely
+sample a manifold of the state space. The third row of figure 14 shows meta-training curves for
+different curricula, showing that meta-training is robust to the choice of curriculum.
+18
+
+E
+Full Training Results on Brax
+0
+2000
+Return in
+hopper
+PPO
+SAC
+DDPG
+TD3
+0
+2000
+4000
+6000
+Return in
+walker2d
+0
+200
+Return in
+swimmer
+0
+5000
+10000
+Return in
+halfcheetah
+103
+104
+105
+106
+#env steps
+10000
+20000
+30000
+Return in
+humanoidstandup
+103
+104
+105
+106
+#env steps
+103
+104
+105
+106
+#env steps
+103
+104
+105
+106
+#env steps
+Learning Curves in SCBs and Brax Environments
+Figure 15: Training curves for SCBs and their corresponding Brax environments. Lines show IQMs
+over 20 runs for the SCB and 5 runs for the EE. Shaded areas are 95% confidence intervals. Each
+of the trained agents is evaluated on 50 episode rollouts. EE expert hyperparameters are shown in
+appendix F.3. Dashed lines are used to indicate the number of steps needed in the EE to match the
+final performance in the SCB.
+104
+105
+106
+#env steps to match
+SCB performance
+hopper
+walker2d
+swimmer
+halfcheetah
+humanoidstandup
+5
+5
+5
+5
+5
+5
+3
+5
+0
+0
+3
+0
+5
+4
+0
+5
+5
+5
+5
+5
+#times SCB
+perf. matched
+#steps in SCB
+PPO
+SAC
+DDPG
+TD3
+Figure 16: Training in the SCB is two orders of magnitude faster than training in the EE. For
+three algorithms, we train 20 independent agents in an SCB (10k steps) and record the IQM final
+performance as a baseline. Afterward, we train 5 independent agents on the evaluation environments
+(5000k steps) using tuned hyperparameters (see appendix F.3). For each agent, we record the number
+of environment steps until it reaches the baseline. We denote the number of times the EE agents
+match the SCB performance next to each row.
+19
+
+PPO
+SAC
+DDPG
+TD3
+Environment
+EE
+SCB
+EE
+SCB
+EE
+SCB
+EE
+SCB
+hopper
+2521.9
+853.5
+3119.4
+2738.8
+1536.0
+3012.4
+3325.8
+2985.3
+walker2d
+2039.6
+858.3
+4140.1
+1323.1
+698.3
+1304.3
+4605.8
+1321.8
+swimmer
+83.6
+348.5
+124.8
+361.6
+348.5
+365.1
+232.2
+365.4
+halfcheetah
+3487.1
+1657.4
+7735.5
+5810.4
+3263.3
+6162.4
+13213.5
+6555.8
+humanoidstandup
+17243.5
+13356.1
+23808.1
+21105.2
+24944.8
+21039.0
+28376.2
+20372.0
+Table 2: Final training performance of agents trained in the SCB and EE. We indicate the IQM of
+the episodic return for 20 independent training runs for the SCB and 5 runs for the EE. The final
+evaluation is done using 50 episodes.
+F
+Hyperparameters
+We manually set the outer loop hyperparameters informed by exploratory experiments, since the
+experiments are very computationally expensive. The hyperparameters of the inner loop algorithms
+were set arbitrarily to a large range of reasonable values.
+We ran all our experiments on four Nvidia A100 80GB GPUs and one Intel Xeon 4215R CPU. The
+time to complete one meta-training run depends on the environment, ranging from less than an hour
+(most classic control environments) to 24 hours (Brax environments, Pendulum-v1).
+F.1
+Outer loop hyperparameters
+Classic Control
+Pendulum
+Brax
+Init. SNES σ
+0.05
+0.05
+0.05
+Population size
+128
+64
+256
+num. rollouts
+1
+8
+1
+num. eval. seeds
+50
+50
+16
+num. eval. seeds
+for population mean
+64
+64
+64
+multi algo. mode
+all
+all
+sequential
+Table 3: Hyperparameters for meta-training. multi algo. mode refers to the way the RL algorithms
+are chosen in the inner loop. “All” means executing all available ones sequentially, and taking the
+mean of their returns as the fitness. “Sequential” means using algorithm i where i = gen mod |A|.
+num. generations
+Acrobot
+300
+CartPole
+300
+MountainCar
+1000
+ContinuousMountainCar
+300
+Pendulum
+1000
+Inverted Pendulum
+300
+Inverted Double Pendulum
+300
+Reacher
+30
+Pusher
+100
+Hopper
+2000
+Walker2D
+2000
+Swimmer
+2000
+Halfcheetah
+2000
+Ant
+2000
+Table 4: Number of generations for each environment
+MountainCar
+Brax
+type
+linear
+linear
+init. eval. length
+1000
+100
+final eval. length
+200
+1000
+begin transition
+200
+200
+num. transitions steps
+600
+1600
+Table 5: Hyperparameters for evaluation length curricula.
+20
+
+all environments
+network arch.
+(32, ) MLP
+activation
+tanh
+latent dist.
+N(0, In)
+latent size
+(dim. of eval. envs. obs. space)
+Table 6: Hyperparameters for the synthetic environment
+F.2
+Inner loop hyperparameters
+Classic Control
+brax
+network arch.
+(64, 64) MLP
+(64, 64) MLP
+activation
+tanh (ReLU for Pendulum)
+tanh
+num. envs
+5
+5
+num. steps
+100
+100
+num. epochs
+10
+10
+num. minibatches
+10
+10
+time steps
+104
+104
+max. grad. norm
+10
+10
+learning rate
+{0.01, 0.005, 0.001, 0.0005, 0.0001}
+(without 0.01 for continuous environments)
+0.005
+discount
+{1.0, 0.99, 0.95, 0.9, 0.8}
+0.99
+λ for GAE
+{1.0, 0.95, 0.9, 0.8, 0.5}
+0.95
+clipping ϵ
+{0.1, 0.2, 0.3, 0.4, 0.5}
+0.2
+entropy coef.
+{0.0, 0.01, 0.05, 0.1, 0.5}
+0.01
+value function coef.
+{0.0, 0.5, 1.0, 1.5, 2.0}
+0.5
+Table 7: Hyperparameters for PPO in the inner loop. Underlined values are used in runs with a fixed
+configuration.
+Classic Control
+brax
+network arch.
+(64, 64) MLP
+(64, 64) MLP
+activation
+tanh (ReLU for Pendulum)
+tanh
+num. envs
+5
+1
+buffer size
+2000
+5000
+prefill buffer
+1000
+1000
+batch size
+256
+250
+grad. steps
+2
+1
+time steps
+104
+104
+learning rate
+{0.01, 0.005, 0.001, 0.0005, 0.0001}
+0.005
+discount
+{1.0, 0.99, 0.95, 0.9, 0.8}
+0.99
+Polyak τ
+{0.99, 0.95, 0.9, 0.7, 0.8}
+0.95
+target entropy ratio
+{0.1, 0.3, 0.5, 0.7, 0.9}
+n.a.
+Table 8: Hyperparameters for SAC in the inner loop. Underlined values are used in runs with a fixed
+configuration.
+Classic Control (discrete)
+network arch.
+(64, 64) MLP
+activation
+tanh
+num. envs
+10
+buffer size
+2000
+prefill buffer
+1000
+batch size
+100
+grad. steps
+1
+time steps
+104
+target update freq.
+50
+max. grad. norm
+10
+ϵ start
+1
+ϵ decay fraction
+0.5
+ϵ end
+{0.01, 0.05, 0.1, 0.2}
+learning rate
+{0.01, 0.005, 0.001, 0.0005, 0.0001}
+discount
+{1.0, 0.99, 0.95, 0.9, 0.8}
+Double DQN
+{yes, no}
+Table 9: Hyperparameters for DQN in the inner loop. Underlined values are used in runs with a fixed
+configuration.
+21
+
+Classic Control (continuous)
+brax
+network arch.
+(64, 64) MLP
+(64, 64) MLP
+activation
+tanh (ReLU for Pendulum)
+tanh
+num. envs
+1
+1
+buffer size
+2000
+5000
+prefill buffer
+1000
+1000
+batch size
+100
+100
+grad. steps
+1
+1
+time steps
+104
+104
+max. grad. norm
+10
+10
+learning rate
+{0.01, 0.005, 0.001, 0.0005, 0.0001}
+0.005
+discount
+{1.0, 0.99, 0.95, 0.9, 0.8}
+0.99
+Polyak τ
+{0.99, 0.95, 0.9, 0.7, 0.8}
+0.95
+expl. noise
+{0.1, 0.2, 0.3, 0.5, 0.7, 0.9}
+0.2
+Table 10: Hyperparameters for DDPG in the inner loop. Underlined values are used in runs with a
+fixed configuration.
+Classic Control (continuous)
+brax
+network arch.
+(64, 64) MLP
+(64, 64) MLP
+activation
+tanh (ReLU for Pendulum)
+tanh
+num. envs
+1
+1
+buffer size
+2000
+5000
+prefill buffer
+1000
+1000
+batch size
+100
+100
+grad. steps
+1
+1
+time steps
+104
+104
+max. grad. norm
+10
+10
+learning rate
+{0.01, 0.005, 0.001, 0.0005, 0.0001}
+0.005
+discount
+{1.0, 0.99, 0.95, 0.9, 0.8}
+0.99
+Polyak τ
+{0.99, 0.95, 0.9, 0.7, 0.8}
+0.95
+expl. noise
+{0.1, 0.2, 0.3, 0.5, 0.7, 0.9}
+0.2
+target noise
+{0.1, 0.2, 0.3, 0.5, 0.7, 0.9}
+0.2
+target noise clip
+{0.1, 0.4, 0.5, 0.7, 1.0, 1.3}
+0.5
+Table 11: Hyperparameters for TD3 in the inner loop. Underlined values are used in runs with a fixed
+configuration.
+F.3
+Brax Expert Hyperparameters
+We train several expert agents in Brax environments. Our goal for the expert agents is not to match
+the state-of-the-art results, but instead, to get a baseline that represents good performance. We
+therefore fit hyperparameters using a budget of 20 runs using random search, using a fixed number of
+environment steps, buffer size, the number of vectorized environments, and others.
+Parameter
+Hopper
+Walker2d
+Swimmer
+Halfcheetah
+Humanoidstandup
+learning rate
+2.5 · 10−4
+1.7 · 10−3
+2.8 · 10−3
+1.7 · 10−3
+1.7 · 10−3
+num. envs.
+32
+32
+128
+32
+32
+num. steps
+32
+32
+64
+32
+32
+num. epochs
+9
+2
+7
+2
+2
+num. minibatches
+2
+2
+8
+2
+2
+discount
+0.995
+0.99
+0.98
+0.99
+0.99
+λ for GAE
+0.95
+0.8
+0.99
+0.8
+0.8
+max. grad. norm
+1
+5
+0.5
+5
+5
+network arch.
+(64, 64) MLP
+activation
+tanh
+time steps
+5 · 220
+clip_eps
+0.2
+entropy coef.
+0.01
+value function coef.
+0.5
+norm. obs.
+true
+Table 12: PPO expert hyperparamters. Tuned over 20 runs of random search.
+22
+
+Parameter
+Hopper
+Walker2d
+Swimmer
+Halfcheetah
+Humanoidstandup
+learning rate
+5.7 · 10−4
+2 · 10−4
+5.7 · 10−4
+2 · 10−4
+2 · 10−4
+batch size
+128
+256
+128
+512
+256
+discount
+0.995
+0.99
+0.995
+0.98
+0.99
+Polyak τ
+0.95
+0.99
+0.95
+0.995
+0.99
+network arch.
+(64, 64) MLP
+activation
+tanh
+num. envs.
+128
+buffer size
+220
+prefill buffer
+213
+grad. steps
+128
+time steps
+5 · 220
+norm. obs.
+true
+Table 13: SAC expert hyperparameters. Tuned over 20 runs of random search.
+Parameter
+Hopper
+Walker2d
+Swimmer
+Halfcheetah
+Humanoidstandup
+learning rate
+1.4 · 10−4
+1.4 · 10−4
+4.6 · 10−4
+2 · 10−4
+2 · 10−4
+discount
+0.995
+0.995
+0.995
+0.95
+0.95
+Polyak τ
+0.98
+0.98
+0.995
+0.99
+0.99
+batch size
+512
+512
+128
+512
+512
+max. grad. norm
+1
+1
+0.1
+0.1
+0.1
+expl. noise
+0.2
+0.9
+1
+0.5
+0.5
+norm. obs.
+true
+true
+false
+true
+true
+network arch.
+(64, 64) MLP
+activation
+tanh
+num. envs.
+128
+buffer size
+220
+prefill buffer
+213
+gradient steps
+128
+time steps
+5 · 220
+Table 14: DDPG expert hyperparamters. Tuned over 20 runs of random search.
+Parameter
+Hopper
+Walker2d
+Swimmer
+Halfcheetah
+Humanoidstandup
+learning rate
+1.8 · 10−4
+1.8 · 10−4
+2.1 · 10−4
+1.2 · 10−4
+1.5 · 10−4
+discount
+0.995
+0.995
+0.995
+0.99
+0.99
+Polyak τ
+0.95
+0.95
+0.98
+0.99
+0.95
+batch size
+256
+256
+512
+512
+256
+max. grad. norm
+2
+2
+0.1
+5
+0.2
+expl. noise
+0.5
+0.5
+0.9
+0.3
+0.8
+target noise
+0.8
+0.8
+0.9
+0.8
+1.0
+target noise clip
+0.5
+0.5
+0.9
+0.6
+0.9
+policy delay
+3
+3
+1
+1
+10
+network arch.
+(64, 64) MLP
+activation
+tanh
+num. envs.
+128
+buffer size
+220
+prefill buffer
+213
+gradient steps
+128
+time steps
+5 · 220
+norm. obs.
+true
+Table 15: TD3 expert hyperparamters. Tuned over 20 runs of random search.
+23
+

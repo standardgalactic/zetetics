@@ -1,0 +1,4662 @@
+Can Transformers Learn to Solve Problems Recursively?
+Shizhuo Dylan Zhang1
+Curt Tigges2
+Stella Biderman2,3
+Maxim Raginsky1
+Talia Ringer1
+1University of Illinois Urbana-Champaign
+2EleutherAI
+3Booz Allen Hamilton
+{shizhuo2,maxim,tringer}@illinois.edu
+{curt,stella}@eleuther.ai
+Abstract
+Neural networks have in recent years shown promise for helping software engineers
+write programs and even formally verify them. While semantic information plays
+a crucial part in these processes, it remains unclear to what degree popular neural
+architectures like transformers are capable of modeling that information.
+This paper examines the behavior of neural networks learning algorithms relevant to
+programs and formal verification proofs through the lens of mechanistic interpretability,
+focusing in particular on structural recursion. Structural recursion is at the heart of tasks
+on which symbolic tools currently outperform neural models, like inferring semantic
+relations between datatypes and emulating program behavior.
+We evaluate the ability of transformer models to learn to emulate the behavior of
+structurally recursive functions from input-output examples. Our evaluation includes
+empirical and conceptual analyses of the limitations and capabilities of transformer
+models in approximating these functions, as well as reconstructions of the “shortcut”
+algorithms the model learns. By reconstructing these algorithms, we are able to
+correctly predict 91% of failure cases for one of the approximated functions. Our work
+provides a new foundation for understanding the behavior of neural networks that fail
+to solve the very tasks they are trained for.
+1
+Introduction
+A revolution in neural methods for programming languages tasks is underway. Once confined to the realm
+of symbolic methods, some of the most performant tools for synthesizing [3, 4, 21, 5], repairing [16, 35,
+41], and even formally verifying [1, 42, 12, 37, 36, 13] programs now rest in part or in whole upon neural
+foundations.
+But how sturdy are these foundations? At the core of many of these tools are transformer-based large
+language models [4, 5, 13]. It is an open question to what degree these models are simply repeating
+program syntax, and to what degree they have some model of program semantics—how programs
+behave and what they mean. State-of-the-art language models still rely on tricks like chain of thought
+prompting [40] and scratchpadding [28] to approximate program semantics. Even models trained on code
+often need to be finetuned to solve specific tasks instead of used in a multitask fashion [4, 2, 20].
+In this paper, we investigate the degree to which small transformer [38] models can learn to model the
+semantics of an important class of programs: structural recursion. A program is an example of structural
+recursion if it is defined over some data structure (say, binary trees) by recursively calling itself over smaller
+substructures (say, left and right subtrees). Structural recursion is at the heart of important programming
+and theorem proving tasks for which neural methods still lag behind symbolic methods, like inferring
+semantic relations between datatypes [34, 33].
+Drawing on previous work on reverse engineering neural networks [39, 27, 6], we train small transformer
+models to solve structural recursion problems and explore the extent to which the models are able to solve
+Preprint. Under review.
+arXiv:2305.14699v1  [cs.LG]  24 May 2023
+
+the problems. Our emphasis in particular is on understanding the ways in which the algorithms learned
+by transformers fail to correctly solve the tasks for which they were trained.
+We make the following contributions: (1) We conduct a comprehensive empirical study on two
+representative types of recursive tasks for transformers (Section 3): the binary successor function, which
+has a single recursive subcase, and a tree traversal, which has two recursive subcases. Our study investigates
+different aspects and granularities of the models’ behaviors on these tasks. For example, we train a
+model on an atomic subtask of a tree traversal and find that it performs well on that subtask, even though
+a model trained with the same setup on the end-to-end traversal fails. (2) We describe a conceptual
+framework based on abstract-state machines (ASMs) that allows us to analyze programs, examining
+transformer behavior within a formal model of its practical computation (Section 4). (3) We reconstruct
+the mechanisms of transformers in learning the recursive tasks and identify their flaws (Section 5). By
+reconstructing these mechanisms, we are able to correctly predict specific classes of inputs on which the
+models fail—correctly predicting up to 91% of failures! Our analysis also reveals evidence of differences
+in the learned algorithms and under different hyperparameter set-ups.
+2
+Representing Structural Recursion
+For this work, we are interested in how transformer models learn to approximate structural recursion:
+a restricted but powerful class of recursive functions that are defined in a structurally decreasing manner,
+and so must terminate. This is a popular representation of recursion in the program and proof literature
+because it is very expressive, but easy to reason about.
+Consider, for example, defining a recursive function that adds two positive natural numbers. We start
+by defining the datatype representing those numbers—a unary encoding of Peano natural numbers—as
+in Figure 1a (the syntax here comes from a proof tool called Coq)).
+Inductive peano =
+| I : peano (* base case *)
+| S : ∀(n : peano), peano. (* inductive case *)
+(a) Unary encoding of Peano natural numbers.
+Fixpoint add n m :=
+match n with (* break
+into
+cases *)
+| I => S m (* if n is one,
+return S m *)
+| S p => S (add p m) (* otherise ,
+recurse
+*)
+end.
+(b) Addition using structural pattern matching.
+Figure 1: Representing structural recursion.
+This describes the construction of instances of the datatype, with two cases: (1) the base case where one
+is a positive natural number denoted I, and (2) the inductive case where adding one to any positive natural
+number n gives a new positive natural number S n
+We can write recursive functions and proofs over this datatype. Consider addition using structural pattern
+matching and recursion, as in Figure 1b.1 In the base case, add 1 m2 is its successor S m. In the inductive
+case, we recurse: we compute add (S p) m by recursively computing add p m and then taking its successor.
+The nice thing about this representation is that it constructs datatypes from scratch, by describing all ways of
+constructing those datatypes, and establishing their semantics by functions defined over them. Importantly,
+these semantics are independent of specific character representations and any preexisting associations
+(for example, to numbers) that a model may have learned; what we call these datatypes is irrelevant.
+Still, this simple representation corresponds to a broad class of datatypes that is well studied in
+programming languages, and that makes it simple for us to define important recursive tasks.
+3
+Tasks
+We consider two tasks: the binary successor function (Section 3.1) and a tree traversal (Section 3.2). For
+each task, we choose (1) an inductive representation of a datatype (like peano), (2) a recursive function
+1For those unfamiliar with structural pattern matching, one can view match as a glorified if statement that can
+split into cases based on substructures in a smart way. There are some helpful tutorials for Python online, for example:
+https://peps.python.org/pep-0636/.
+2Coq uses parentheses only for grouping, not for function calls; in Python this would be written add(1, m).
+2
+
+over that datatype (like add), and (3) variants of a learning task to approximate that function. Since our
+interest is in whether the model can lean to emulate recursion, we train each model to approximate the
+function’s computation, rather than to explicitly represent the function.
+3.1
+Binary Successor
+The binary successor function task is a simplification of a common benchmark used for over two decades
+of symbolic proof automation [23, 33]. It captures the essence of what it means to adapt functions and
+proofs defined over the unary peano natural numbers so that they instead are defined over binary natural
+numbers. Its appeal is that it is simple and useful, yet still structurally interesting, in that its structure does
+not just amount to counting.
+Inductive Representation
+A positive binary number can be defined inductively:
+Inductive bin_pos :=
+| 01 : bin_pos (* base case *)
+| XO : ∀(b : bin_pos), bin_pos (* first inductive
+case :
+shift
+left
+*)
+| X1 : ∀(b : bin_pos), bin_pos. (* second inductive case :
+shift
+right and increment
+*)
+That is, a positive binary number is either (1) one (the base case, denoted 01), (2) any another positive
+binary number shifted to the left (the first inductive case, denoted XO b for positive binary b), or (3) any
+other positive binary number shifted to the left and then incremented by one (the second inductive case,
+denoted X1 b for positive binary b). One can uniquely construct all positive binary numbers by making
+sequences of XO and X1 calls on 01. For example, two can be written as XO 01: shift 01 to the left. Three
+can be written as X1 01: shift 01 to the left and then increment. And so on.
+To recover the “natural” ordering we might write on paper, we can just reverse the result and remove the
+Xs. So, for example, XO XO 01 becomes 100 (four). The “reverse” ordering makes it easy to define functions
+recursively, since it is structurally decreasing—functions on sequences can be defined in terms of functions
+on the subsequences that follow. We train separate models to learn from input/output examples defined
+using each of the “natural” and “reverse” orderings.
+Recursive Computation
+We target the successor function:
+Fixpoint s n :=
+match n with (* break
+into
+cases *)
+| 01 => XO 01 (* if n is one,
+return two *)
+| XO b => X1 b (* if the LSB is zero ,
+flip
+it *)
+| X1 b => XO (s b) (* otherwise ,
+recurse and
+shift
+*)
+end.
+O1
+O1
+O1
+XO O1
+XO
+XO O1
+X1
+XO O1
+XO
+b
+X1
+b
+X1
+X1
+X1 O1
+b
+XO
+s(b)
+XO
+s(X1 O1)
+Recursive Case
+Pattern Matching
+The function matches over the first character (the least significant bit or LSB) and increments. In the base
+case, it increments one (01) to two (XO 01). In the first inductive case, given some binary number b shifted
+to the left (XO b), it increments by flipping the LSB from zero to one (X1 b). In the second inductive case,
+given some binary number b shifted to the left and incremented by one (X1 b), it increments by recursively
+computing the successor of b (s b), and then shifting the result to the left (XO (s b). For example, the
+successor of eleven (1011, represented as X1 X1 XO 01) is twelve (1100, represented as XO XO X1 01), since:
+s (X1 X1 XO 01) = XO (s (X1 XO 01)) = XO XO (s (XO 01) = XO XO X1 01
+Details on the importance of this particular function can be found in Appendix A.2.1.
+Recursion by Example
+We train our binary successor models on input-output pairs representing
+computation of the successor function. For inspiration and understanding, it is worth thinking through
+how to learn the binary successor function from examples as a human. We can learn this function from
+a small number of input/output examples, without invoking knowledge of numbers:
+s 01 = XO 01
+s (XO 01) = X1 01
+s (X1 01) = XO XO 01
+s (XO XO 01) = X1 XO 01
+s (X1 XO 01) = XO X1 01
+s (XO X1 01) = X1 X1 01
+These examples fully represent the three cases. We compose instances using only three symbols: XO, X1,
+and the base case 01. Heuristics and prior knowledge guide us, considering pattern matching and recursion,
+and preferring simple functions. We can infer a template, match cases, and fill in the template based on
+input-output examples. More details can be found in Appendix A.2.1.
+3
+
+This approach to learning s is roughly how symbolic automation for program synthesis works. This can
+get considerably more complicated—and require more examples—if we assume that it is possible for
+our synthesized function to call other functions in its computation, or to do unbounded recursion [19].
+But this is still the essence of synthesizing recursive functions symbolically—and it needs no knowledge
+of the fact that bin_pos represents numbers, let alone binary positive numbers.
+Our goal for this task is to see how much of this semantic information a transformer model can learn
+without the priors we just described—plus how it represents the information it learns, and where the
+learned algorithms fall short.
+3.2
+Tree Traversal
+For a second and more challenging task, we consider tree traversals. How transformer models approximate
+the behavior of tree traversals is informative for many important symbolic domains, since tree traversals
+are at the heart of the symbolic search procedures for programs, games, and proofs. If transformers can
+approximate tree traversals, this may mean better performance of neural tools for these procedures without
+the need for a symbolic search procedure to guide the way.
+Inductive Representation
+We study the traversal of binary trees with character values. The code for
+this is in Appendix A.2.2; it includes an empty Leaf base case, and a Branch inductive case that stores a
+character value, a left subtree, and a right subtree. For example, we can represent a tree with ’a’ at the
+root, ’c’ in a node to its left, and ’t’ in a node to its right as follows:
+Branch ’a’ (Branch ’c’ Leaf Leaf) (Branch ’t’ Leaf Leaf)
+Recursion by Example
+We consider preorder and inorder traversals.
+Details are deferred to
+Appendix A.2.2. As with the previous example, we consider the problem of learning these recursive
+functions from input-output examples. Since the tree datastructure is not sequential in its recursive structure
+(that is, each pass of recursion visits both the left and right subtrees), we also decompose these traversals
+into atomic computations and see if those are easier to learn. The machine learning inspiration for these
+atomic computations comes from chain of thought reasoning, while the exact atomic computations we
+choose come from programming languages research. These atomic computations decompose recursion
+into one reduction step at a time. For example, to compute:
+inorder (Branch ’a’ (Branch ’c’ Leaf Leaf) (Branch ’t’ Leaf Leaf))
+we can reduce one step by selecting the Branch case and substituting in the right values:
+(inorder (Branch ’c’ Leaf Leaf)) ++ [’a’] ++ (inorder (Branch ’t’ Leaf Leaf))
+Two more reductions (see Appendix A.2.2) get us to the final result, [’c’; ’a’; ’t’]. Each reduction step
+here has a formal meaning in programming languages, in terms of “reduction rules” named after various
+Greek letters. Computation amounts to composition of these reduction rules until it is no longer possible
+to reduce further; the order of reduction does not matter. Using this as inspiration, in addition to training
+models to learn the traversal all at once, we also train models to reduce the traversal just one, two, or three
+times at once, to see at what point performance degrades.
+4
+Computation Model: Abstract State Machines
+We now need a computation model that can encompass both the original recursive implementation and its
+approximate simulation by a learned transformer network. Intuitively, transformers do not implement stacks
+to trace recursion, yet instead are sequence models by construction. On the other hand, computation models
+like Turing machines operate on low levels of abstraction, making them hard to interpret. Abstract State Ma-
+chines (ASMs) [17] were introduced with the explicit goal of capturing the semantics of programs at various
+levels of abstraction, and so provide us with a flexible yet powerful framework to analyze transformers.
+The states of ASMs are first-order structures of the form (U,f1,...,fk), where U, called the algo-
+rithm’s universe, is a set that includes the constants true, false, undef and where the collec-
+tion of functions fi : Uni →U includes Boolean functions not: U →{true,false,undef} and
+and:U2→{true,false,undef}. The Boolean constants and functions are needed to implement condition-
+als and other flow control structures and guards, such as if ...
+then ...
+else. The set U can be
+4
+
+infinite and has minimal restrictions on the datatypes it can take, e.g., real matrices or tensors, streams, and
+so on. Likewise, the functions fi can include operations like matrix multiplication, list or stream operations,
+and so on. Closer to our purposes, U may include token- and positional-embeddings, while the functions
+fi may include the MLPs, self- and cross-attention matrices, and all other building blocks of transformer
+networks [32]. Each decoding step of an encoder-decoder transformer is naturally a sequential ASM update.
+Notably, the two key features of ASMs are a finite instruction set and a possibly infinite state. Starting
+from this perspective, we can analyze the algorithms implemented by learned transformers by attempting
+to search for its pattern classifiers and the if-else structure following each pattern, as well as the
+functions applied in each case at each time step. A simple example of such procedure would be “if {the
+sequence to be generated is complete} then generate [EOS] token.”
+The challenge arises when using learned transformer networks to approximate or simulate recursive
+algorithms. First, the ASM it simulates lacks recursive structure by nature. Also, training samples provide
+a partial extensional description of the unknown recursive function, while the pattern classifier determining
+recursive calls is an intensional description not encoded in the training objective or data. To this end,
+understanding whether the class of sequential ASMs implemented by transformer networks can effectively
+approximate recursive ASMs comes down to reconstructing the program by identifying the conditionals
+and functions it implements, examining the correctness of its approximated program, and evaluating its
+capability of correctly executing that program. We discuss experimentation toward this end in Appendix B.
+5
+Empirical Analysis
+We trained transformer models to tackle the binary successor (Section 5.1) and tree traversal (Section 5.2)
+tasks from Section 3. We focused on encoder-decoder models since encoder-only and decoder-only archi-
+tectures performed worse under our set-up (Appendix E). We framed both tasks as sequence-to-sequence
+problems. We summarize the results here; we defer training details to Appendix A.1.
+5.1
+Binary Successor Task
+For the binary successor task, we found the following:
+1. The model’s attention maps exhibit clear recursion-capturing patterns (Section 5.1.1). These
+attention maps unveil what we call recursion heads.
+2. A perturbation analysis provides a granular explanation of the algorithm (Section 5.1.2).
+We are able to reverse engineer the learned algorithm by perturbing tokens on the fly.
+3. A majority of failures are foreseeable from the reconstructed algorithm (Section 5.1.3). We
+can predict 91% of failure cases from the reverse engineered algorithm.
+4. Learning rates impact learned algorithms and generalization abilities (Section 5.1.4). The
+model appears to learn different algorithms for different learning rates.
+A detailed reconstruction of the learned algorithms we reverse engineered for this task is in Appendix C.
+5.1.1
+The Model’s Attention Maps Exhibit Clear Recursion-Capturing Patterns
+Our first step to understanding the algorithm implemented by the model was to visualize the attention
+maps of the model. For an encoder-decoder transformer, three types of attention can be analyzed: decoder
+self-attention, encoder-decoder cross attention, and encoder self-attention. For this task, we found that cross-
+attention was not interesting, but decoder and encoder self-attentions exhibited visibly interesting behaviors.
+Our visualization of decoder self-attention revealed a noteworthy phenomenon in the final layer—something
+we call a recursion head that specializes to recursive cases. This was present in both the natural and reverse
+orders, though it served different purposes in each order, since each order implemented a different algorithm:
+• In the natural order (Figure 6e), the model commences attending to the last bit prior to flipping
+from X1 to XO, and continues to do so until the end of the sequence. Thereafter, the recursion
+head predominantly allocates its attention towards the token we have described.
+• In the reverse order (Figure 2a), the recursion head directs its attention towards the X1 tokens
+that have been generated earlier. This attention mechanism distinguishes between recursive
+5
+
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X1
+X0
+X1
+X0
+X1
+X0
+01
+<\s>
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X1
+X0
+X1
+X0
+X1
+X0
+01
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+(a)
+Decoder
+self-
+attention.
+Reverse
+Order.
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X1
+X1
+01
+<\s>
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X1
+X1
+01
+<\s>
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+(b)
+Encoder
+self-
+attention.
+Reverse
+Order
+01
+X1
+X0
+X0
+X0
+X0
+X1
+X0
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+<\s>
+01
+X1
+X0
+X0
+X0
+X0
+X1
+X0
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+X1
+<\s>
+0.00
+0.02
+0.04
+0.06
+0.08
+0.10
+0.12
+0.14
+0.16
+(c)
+Encoder
+self-
+attention. Natural order
+Figure 2: Attention Maps.
+Mutate
+01 X1 X1 X0
+X0 X0
+Randomly Chosen Location
+X0 X1
+Insert Random String
+01 X1 X1 X0 X0 X1 X0 X0
+01 X1 X1     
+X0
+X0 X0
+Delete Random Substring
+01 X1 X1 X0
+01 X1 X1 X0 X0 X0
+X1
+01 X1 X1 X0 X1 X0
+Replace with a different token
+Insertion
+Deletion
+Flip
+Randomly Chosen Token
+01 X1 X1 X0 X0 X0
+Decoder 
+Encoder(X1 X1 X1 X1 X1 X1 X0 X1 01)
+Decoder 
+Decoding step t
+Decoding step t+1
+(a) String manipulation workflow for natural order.
+01 X1 X1 X0 X0 X0
+Decoder 
+Encoder(X1 X1 X1 X1 X1 X1 X0 X1 01)
+Decoder 
+Decoding step t
+Decoding step t+1
+Mutate
+X0 X0 X0 X0
+X1
+X0 X0 X1 X0
+Replace with X1
+Flip
+Randomly Chosen Token In Recursive Segment
+(b) String manipulation workflow for reversed order.
++
+Decoder Positional Encoding
+Decoder Token Embedding
++
++
++
++
+Location before start of recursion
+(c) SOR Perturb.
++
++
+Location before [EOS]
+[EOS]
++
+(d) EOS Perturb.
+01
+X1
+X0
+X0
+X1
+X0
+X0
+X0
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+01
+X1
+X0
+X0
+X1
+X0
+X0
+X0
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(e) Nat. SOR.
+X0
+X0
+X0
+X0
+X0
+X1
+X1
+X1
+X1
+X1
+X0
+X0
+X1
+X0
+X0
+X1
+X0
+X0
+X1
+01
+X0
+X0
+X0
+X0
+X0
+X1
+X1
+X1
+X1
+X1
+X0
+X0
+X1
+X0
+X0
+X1
+X0
+X0
+X1
+01
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(f) Rev. Flip Token.
+Figure 3: Perturbation analysis for the binary successor task. Figures 3c and 3d are positional-encoding
+perturbations. SOR stands for ‘start-of-recusion’ and EOS stands for ‘end-of-sentence’. Figure 3e is the
+attention map of the recursion head on the natural order (Nat.) after adding the positional encoding of
+the token before the start of recursion to the bit after recursion starts. Figure 3f is the attention map of the
+recursion head on the reversed order (Rev.) after randomly flipping a token in the recursive segment to X1.
+segments, which necessitate modifications, and non-recursive segments, which do not require
+any rewrites. The first occurrence of an X1 token encountered by the recursion head serves as
+a boundary that separates these distinct segments.
+The encoder self-attention maps suggest that encoders also play a part in modeling semantics by helping
+differentiate between cases (Figure 2b, and Figure 2c). In particular, the model employs its low-level
+attention to identify and differentiate symbols by attending to tokens of the same kind.
+5.1.2
+A Perturbation Analysis Provides a Granular Explanation of the Algorithm
+Attention maps are useful for forming hypotheses about model behavior, but they reveal only correlations,
+without any causal information. To gain causal insights into the model’s behavior, we conducted
+perturbation analyses—mutating tokens (i.e. randomly inserting, removing or flipping, as illustrated in
+Figures 3a and 3b) and swapping positional encodings (see Figures 3c and 3d) on the fly on the decoder
+side to see how this impacted the model’s behavior.
+From this analysis, we were able to reconstruct the algorithm the model learns for the natural order: (1)
+It computes the total number of bits required based on the input, and identifies the position at which the
+concluding bit of the subsequence eligible for direct copying from the input sequence is located. (2) It
+copies this particular segment, followed by a single X1, followed by XO tokens until it reaches the designated
+halting position.
+We determined this algorithm by perturbing both token content and positional encodings. Interestingly, we
+found that the decoder exhibits a stronger reliance on positional information rather than the content asso-
+ciated with each position. When we corrupted partial output using the token mutation process (Figure 3a),
+6
+
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Perturbation Success Rate
+Test Group
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) SOR Perturbation.
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Perturbation Success Rate
+Test Group
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) EOS Perturbation.
+Figure 4: Results of positional embedding swap for natural order models. Perturbation success rate is
+the percentage of cases following the behavior described in Section 5.1.2
+the model could still recover the remaining sequence. But when we changed the positional encoding of the
+bit before the recursive segment to a random location (Figure 3c), the model started “recursing” at the next
+time step by generating an X1 followed by XOs. Furthermore, if we replaced the positional encoding just
+before [EOS] with a non-terminal token, the model immediately stops generation by producing [EOS].
+In the reverse order, the model behaves differently. For the most part, it behaves as follows: (1) Based
+on the input sequence, the it determines the appropriate position for generating the first X1 token. (2)
+The decoder, while generating subsequent tokens, simultaneously examines the tokens it has previously
+generated to determine if an X1 token has already been produced. The presence of an X1 token serves as a
+signal for the model to switch from generating XO tokens to copying the remaining portion of the sequence.
+We determined this by systematically replacing each XO token within the recursive segment (excluding
+the last token) with an X1 token. The purpose was to observe whether the model would indeed initiate the
+process of copying the remaining tokens. Intriguingly, our results indicate that in approximately 93.15%
+of the cases, the model successfully copied the remaining tokens with complete accuracy. However, in
+the remaining cases, the model initially began generating X1 tokens, but exhibited confusion after a few
+tokens, deviating from the expected behavior. These findings provide empirical support for our hypothesis
+and echo the model behavior reflected from the attention maps.
+5.1.3
+A Majority of Failures are Foreseeable from the Reconstructed Algorithm
+The models fail in interesting ways. As shown in Figures 20 through 25 in Appendix F, the model is prone
+to failing in the maximum possible recursion depths for each test group on both directions. Interestingly,
+our perturbation analysis lets us correctly predict that the model will fail on these cases—and gives us
+an understanding of why that is true, too.
+The specific failure cases are constructed by applying consecutive X1 operators immediately after the 01
+case. The algorithm that the model learns in the natural order falls short for these cases: it identifies the
+location before recursion starts and generates an X1 followed by XOs, when the correct answer should be
+applying XOs immediately after 01. In these cases, the shortcut is not applicable.
+In line with our understanding of the learned algorithm, the model fails on these cases 100% of the
+time for the natural order task! Among all failure cases (for C =1), 91% are due to one less XO token
+generated, which is a consequence of the flaw of the model’s learned algorithm. From observation, we
+saw that the model indeed attempts to play the same trick by finding the position right before recursion
+starts. However, that position is no longer within the actual sequence, but rather in the “pre-padding”
+location. It encounters confusion between generating an X1 or a 01 to start. It settles on 01, but this leads
+it to prematurely terminate, generating a sequence that is one token too short.
+5.1.4
+Learning Rates Impact Learned Algorithms and Generalization Abilities
+Our analysis suggestions that the model may be learning different algorithms under different learning rates,
+and that this can have implications for out-of-domain generalization. We followed the original transformer
+learning rate scheduling scheme [38]: α=C∗d
+1
+2 ∗min{s−1
+2,s∗S
+−3
+2
+w } where d is the embedding size of
+the model, s is the current number of update steps, Sw is the predefined warmup step number, and C is the
+constant controlling the magnitude. To our surprise, we observed a significant difference in attention patterns
+7
+
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.50
+0.60
+0.70
+0.80
+0.90
+1.00
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Natural Order
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Natural Order-Constrained.
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.95
+0.96
+0.97
+0.98
+0.99
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Reverse Order
+Figure 5: Performance versus number of training examples. The performance is the average of samples
+with all possible recursion depths with in that length range. The error bar indicates the standard deviation
+across total of 3 runs with different random seeds. Figure 5b is trained with recursion depth up to 3.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+(a) C =0.1
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+(b) C =0.3
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+(c) C =0.5
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+(d) C =0.7
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+X1
+X1
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+X0
+<\s>
+0.0
+0.2
+0.4
+0.6
+0.8
+(e) C =1
+Figure 6: Self-attention of the last decoder layer under different LR factor C’s on natural order.
+when trained with different values of C on the natural order task. The “recursion head” phenomenon
+emerged when we held C close to 1, while it disappeared when the learning rate was small. As the learning
+rate grew, the model began to specialize one head into a recursion head gradually, as shown in Figure 6.
+In fact, smaller LR models learn weaker notion of executing the algorithm in Section 5.1.2 for longer
+sequences, as shown in Figures 4a and 4b. Also, when further constraining the recursion depths required to
+compute the successor during training (Figure 5b), the model trained on a small LR sees a steeper drop in test
+performance while still attaining near-perfect training accuracy. However, for the reverse order, such a depth
+constraint does not severely affect the model’s performance on either learning rate (Figure 9 in Appendix C).
+5.2
+Tree Traversal
+We applied counter-factual patching to identify the components that are the most crucial to models’
+performance. We focused on analyzing the model’s behavior as it performed tree traversal subtasks we
+designed (see Appendix D for details). These subtasks involved different stages such as copying initiation,
+inserting root nodes, and resuming copying after insertion. Below are our findings:
+1. Full traversals are hard; tricks are not (Section 5.2.1). Models poorly learn full traversal, but
+pick up tricks if possible.
+2. Models learn simple parenthesis and bracket tracking rules to perform reduction
+(Section 5.2.2). Models learn to track depth this way.
+3. Models learn depth-specific tricks (Section 5.2.3). Models find depth-specific shortcuts during
+reduction, resulting in better performance for certain recursive depths.
+5.2.1
+Full Traversals are Hard; Tricks are Not
+As shown in Figure 7, models can perform full preorder traversals on unseen trees, but fail completely
+for inorder traversals. Examining the attention behavior of the model, we observed that the model primarily
+focuses on numerical values and disregards brackets and EMPTY tokens in preorder traversals, as observed
+through its cross-attention shown in Figure 16b. We hypothesize that there is no clear shortcut for sequence
+models to perform inorder traversals without using a stack. Unlike preorder traversals, which can be done
+linearly, inorder traversals demand “understanding” and capturing recursive relationships between nodes.
+8
+
+1
+2
+3
+4
+Full
+Num. Unroll Steps
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Pre-order
+Tree Depth
+5
+6
+Trained On
+Depth 5 Only
+Depth 5 and 6
+1
+2
+3
+4
+Full
+Num. Unroll Steps
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+In-order
+Figure 7: Accuracy of tree traversal.
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 0
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 1
+0.2
+0.4
+0.6
+0.8
+(a) Pre-order full traversal.
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 0
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 1
+0.05
+0.10
+0.15
+0.20
+(b) In-order reduce.
+Figure 8: Traversal Cross-attention. We looked at snapshots of
+attention at a particular time step as the decoding proceeds.
+5.2.2
+Models Learn Simple Parenthesis and Bracket Tracking Rules to Perform Reduction
+In addition to heads that write-out node values, those heads that are the most impactful for task performance
+are responsible for tracking brackets and parentheses—that is, attempting to track recursion depth—both
+looking ahead to future closures and looking back at the existing output. For example, in the preorder
+traversal task, among the four cross-attention heads, those at Layer 0 displayed a clear separation of tasks
+where one head looked ahead in the encoded sequence and attended most to forward parenthesis, brackets,
+and EMPTY tokens, while the other attention head tended to attend to the encoder sequence tokens in a
+fairly linear fashion. Depending on the task, closure or opening of brackets acted as signals for the network
+to change its behavior. In steps when behavior change was required (e.g., completing the copy of a subtree
+and inserting a non-consecutive symbol or node from the encoder input), we see that the attention heads
+pay particular attention to the brackets and symbols. For example, decoder self-attention heads will attend
+to a previous UNROLL symbol when determining whether an EMPTY token should be copied or omitted.
+5.2.3
+Models Learn Depth-Specific Tricks
+Our observations showed that models learned specific tricks for certain depths. For example, for simple
+two-step reductions in the inorder case, the model can simply copy the root node from the beginning of a par-
+enthetical sequence once that subtree has been copied into an UNROLL statement. But in deeper trees with
+three reductions, the model needs to track the difference between parent nodes and the base root node. As
+such, we observed that when performing these deeper reductions the model relies on decoder self-attention
+and will attend to completed UNROLL phrases which we use to symbolize application of one-step reduction
+on the subtree inside of it (See Section 3.2 and the appendix), composing this input with cross-attention
+to the parentheses and key parent nodes—a phenomenon we did not see for more shallow reductions.
+Conceivably, decoder cross-attention heads could use this as a signal to attend to and copy the first node
+prior to the initial node inside the UNROLL statement, similar to the induction heads found in GPT-2 [11].
+6
+Related Work
+Understanding Transformers
+Work on understanding the underlying mechanisms of transformers spans
+many angles, from categorizing computational capabilities [10, 44, 45, 43] by measuring performance
+on synthetic tasks, to deriving theoretical arguments [22, 25, 30, 31, 18], to analyzing the functionalities
+of parameters [14], to reverse engineering learned algorithms from the perspective of mechanistic
+interpretability [27, 6]. Our work in particular focuses on the ways in which transformer models fail on the
+very tasks they are trained for, with an emphasis on an important class of algorithms that can be modeled
+by structural recursion.
+9
+
+Mechanistic Interpretability
+Our analyses of the algorithms performed by our trained models was
+inspired by existing work in the relatively new field of mechanistic interpretability, and includes methods
+such as counterfactual patching[24], circuit tracing[39], automatic circuit discovery [7], and component
+ablation. In our work we use a number of these techniques to reverse-engineer the critical components
+of the model and how they carry out the algorithm that solves the tasks in question.
+Program and Proof Synthesis
+The tasks we choose are inspired by work in program and proof
+synthesis [15, 19, 29, 26, 34, 33, 23, 3], and are also an important class of functions for inductive logic
+programming [8]. Transformer-based large language models have brought significant progress to program
+synthesis [5, 4], but current tools still struggle to emulate function behavior without prompt engineering
+techniques like chain of thought prompting [40] or scratchpad reasoning [28]. Our work pursues a better
+understanding of how transformer models fail to represent recursive function behavior. We also hope
+that our work will help open the door to later working making sense of why these prompt engineering
+techniques may help to begin with.
+7
+Conclusions, Limitations, and Future Work
+Transformer models can approximate the behavior of important structurally recursive functions, but the
+shortcuts they learn fall short. We have shown that, by reconstructing the algorithms corresponding to
+these shortcuts, it is possible to understand and even predict how and why they fall short. In this work,
+our main focus was on toy transformer models trained from scratch, while we deferred the understanding
+of large pretrained language models to future work. One next step is to use similar analyses to understand
+the shortcomings of large pretrained language models on programming and reasoning tasks, and to make
+sense of why tricks like chain of thought reasoning and scratchpadding help on those tasks. Beyond that,
+we are excited to use our newfound understanding to drive future improvements to training and prompting
+techniques, neural architectures, and evaluation methodologies.
+References
+[1]
+Arpan Agrawal et al. “Proofster: Automated Formal Verification”. In: ICSE Demo. May 2023.
+[2]
+Loubna Ben Allal et al. SantaCoder: don’t reach for the stars! 2023. arXiv: 2301.03988 [cs.SE].
+[3]
+Swarat Chaudhuri et al. “Neurosymbolic programming”. In: Foundations and Trends® in Program-
+ming Languages 7.3 (2021), pp. 158–243.
+[4]
+Mark Chen et al. “Evaluating Large Language Models Trained on Code”. In: CoRR abs/2107.03374
+(2021). arXiv: 2107.03374. URL: https://arxiv.org/abs/2107.03374.
+[5]
+Aakanksha Chowdhery et al. “PaLM: Scaling Language Modeling with Pathways”. In: CoRR
+abs/2204.02311 (2022). DOI: 10.48550/arXiv.2204.02311. arXiv: 2204.02311. URL: https:
+//doi.org/10.48550/arXiv.2204.02311.
+[6]
+Bilal Chughtai, Lawrence Chan, and Neel Nanda. A Toy Model of Universality: Reverse Engineering
+How Networks Learn Group Operations. 2023. DOI: 10.48550/ARXIV.2302.03025. URL:
+https://arxiv.org/abs/2302.03025.
+[7]
+Arthur Conmy et al. Towards Automated Circuit Discovery for Mechanistic Interpretability. 2023.
+arXiv: 2304.14997 [cs.LG].
+[8]
+Andrew Cropper et al. “Inductive logic programming at 30”. In: CoRR abs/2102.10556 (2021).
+arXiv: 2102.10556. URL: https://arxiv.org/abs/2102.10556.
+[9]
+Mostafa Dehghani et al. Universal Transformers. 2019. arXiv: 1807.03819 [cs.CL].
+[10]
+Grégoire Delétang et al. Neural Networks and the Chomsky Hierarchy. 2022. DOI: 10.48550/
+ARXIV.2207.02098. URL: https://arxiv.org/abs/2207.02098.
+[11]
+N Elhage et al. “A mathematical framework for transformer circuits”. In: Transformer Circuits
+Thread (2021).
+[12]
+Emily First and Yuriy Brun. “Diversity-Driven Automated Formal Verification”. In: ICSE (ICSE).
+May 2022, pp. 749–761. DOI: 10.1145/3510003.3510138.
+[13]
+Emily First et al. Baldur: Whole-Proof Generation and Repair with Large Language Models. 2023.
+arXiv: 2303.04910 [cs.LG].
+10
+
+[14]
+Mor Geva et al. Transformer Feed-Forward Layers Are Key-Value Memories. 2020. DOI: 10.48550/
+ARXIV.2012.14913. URL: https://arxiv.org/abs/2012.14913.
+[15]
+Sumit Gulwani, Oleksandr Polozov, and Rishabh Singh. “Program Synthesis”. In: Foundations and
+Trends® in Programming Languages 4.1-2 (2017), pp. 1–119. ISSN: 2325-1107. DOI: 10.1561/
+2500000010. URL: http://dx.doi.org/10.1561/2500000010.
+[16]
+Rahul Gupta et al. “DeepFix: Fixing Common C Language Errors by Deep Learning”. In: AAAI.
+2017.
+[17]
+Yuri Gurevich. “Evolving Algebras 1993: Lipari Guide”. In: Specification and Validation Methods.
+Specification and Validation Methods. Oxford University Press, Jan. 1995, pp. 9–36. URL: https:
+//www.microsoft.com/en-us/research/publication/103-evolving-algebras-1993-
+lipari-guide/.
+[18]
+Michael Hahn. “Theoretical Limitations of Self-Attention in Neural Sequence Models”. In: Transac-
+tions of the Association for Computational Linguistics 8 (Dec. 2020), pp. 156–171. DOI: 10.1162/
+tacl_a_00306. URL: https://doi.org/10.1162%2Ftacl_a_00306.
+[19]
+Woosuk Lee and Hangyeol Cho. “Inductive Synthesis of Structurally Recursive Functional Programs
+from Non-Recursive Expressions”. In: Proc. ACM Program. Lang. 7.POPL (Jan. 2023). DOI:
+10.1145/3571263. URL: https://doi.org/10.1145/3571263.
+[20]
+Raymond Li et al. StarCoder: may the source be with you! 2023. arXiv: 2305.06161 [cs.CL].
+[21]
+Yujia Li et al. “Competition-Level Code Generation with AlphaCode”. In: DeepMind (2022).
+[22]
+Bingbin Liu et al. Transformers Learn Shortcuts to Automata. 2022. DOI: 10.48550/ARXIV.2210.
+10749. URL: https://arxiv.org/abs/2210.10749.
+[23]
+Nicolas Magaud and Yves Bertot. “Changing Data Structures in Type Theory:A Study of Natural
+Numbers”. In: vol. 2277. Dec. 2000, pp. 181–196. ISBN: 978-3-540-43287-6. DOI: 10.1007/3-
+540-45842-5_12.
+[24]
+Kevin Meng et al. Locating and Editing Factual Associations in GPT. 2023. arXiv: 2202.05262
+[cs.CL].
+[25]
+William Merrill and Ashish Sabharwal. Transformers Can Be Expressed In First-Order Logic with
+Majority. 2022. DOI: 10.48550/ARXIV.2210.02671. URL: https://arxiv.org/abs/2210.
+02671.
+[26]
+Anders Miltner et al. “Synthesizing Symmetric Lenses”. In: Proc. ACM Program. Lang. 3.ICFP
+(July 2019). DOI: 10.1145/3341699. URL: https://doi.org/10.1145/3341699.
+[27]
+Neel Nanda et al. Progress measures for grokking via mechanistic interpretability. 2023. DOI:
+10.48550/ARXIV.2301.05217. URL: https://arxiv.org/abs/2301.05217.
+[28]
+Maxwell Nye et al. “Show your work: Scratchpads for intermediate computation with language
+models”. In: arXiv preprint arXiv:2112.00114 (2021).
+[29]
+Peter-Michael Osera and Steve Zdancewic. “Type-and-Example-Directed Program Synthesis”. In:
+Proceedings of the 36th ACM SIGPLAN Conference on Programming Language Design and
+Implementation. PLDI ’15. Portland, OR, USA: Association for Computing Machinery, 2015,
+pp. 619–630. ISBN: 9781450334686. DOI: 10.1145/2737924.2738007. URL: https://doi.
+org/10.1145/2737924.2738007.
+[30]
+Jorge Pérez, Pablo Barceló, and Javier Marinkovic. “Attention is Turing-Complete”. In: Journal of
+Machine Learning Research 22.75 (2021), pp. 1–35. URL: http://jmlr.org/papers/v22/20-
+302.html.
+[31]
+Jorge Pérez, Javier Marinkovi´c, and Pablo Barceló. On the Turing Completeness of Modern Neural
+Network Architectures. 2019. arXiv: 1901.03429 [cs.LG].
+[32]
+Mary Phuong and Marcus Hutter. Formal Algorithms for Transformers. 2022. arXiv: 2207.09238
+[cs.LG].
+[33]
+Talia Ringer. “Proof Repair”. PhD thesis. 2021.
+[34]
+Talia Ringer et al. “Proof Repair across Type Equivalences”. In: Proceedings of the 42nd ACM SIG-
+PLAN International Conference on Programming Language Design and Implementation. PLDI 2021.
+Virtual, Canada: Association for Computing Machinery, 2021, pp. 112–127. ISBN: 9781450383912.
+DOI: 10.1145/3453483.3454033. URL: https://doi.org/10.1145/3453483.3454033.
+11
+
+[35]
+Ripon K. Saha et al. “ELIXIR: Effective object oriented program repair”. In: ASE. 2017, pp. 648–
+659.
+[36]
+Alex Sanchez-Stern et al. “Generating Correctness Proofs with Neural Networks”. In: Proceed-
+ings of the 4th ACM SIGPLAN International Workshop on Machine Learning and Programming
+Languages. MAPL 2020. London, UK: Association for Computing Machinery, 2020, pp. 1–10.
+ISBN: 9781450379960. DOI: 10.1145/3394450.3397466. URL: https://doi.org/10.1145/
+3394450.3397466.
+[37]
+Alex Sanchez-Stern et al. “Passport: Improving Automated Formal Verification Using Identifiers”.
+In: ACM TOPLAS (2023).
+[38]
+Ashish Vaswani et al. “Attention is All you Need”. In: Advances in Neural Information
+Processing Systems. Ed. by I. Guyon et al. Vol. 30. Curran Associates, Inc., 2017. URL:
+https : / / proceedings . neurips . cc / paper _ files / paper / 2017 / file /
+3f5ee243547dee91fbd053c1c4a845aa-Paper.pdf.
+[39]
+Kevin Wang et al. “Interpretability in the Wild: a Circuit for Indirect Object Identification in GPT-2
+small”. In: arXiv preprint arXiv:2211.00593 (2022).
+[40]
+Jason Wei et al. “Chain of thought prompting elicits reasoning in large language models”. In: arXiv
+preprint arXiv:2201.11903 (2022).
+[41]
+Chunqiu Steven Xia, Yuxiang Wei, and Lingming Zhang. “Automated program repair in the era
+of large pre-trained language models”. In: Proceedings of the 45th International Conference on
+Software Engineering (ICSE 2023). Association for Computing Machinery. 2023.
+[42]
+Kaiyu Yang and Jia Deng. “Learning to prove theorems via interacting with proof assistants”. In:
+International Conference on Machine Learning. PMLR. 2019, pp. 6984–6994.
+[43]
+Shunyu Yao et al. “Self-Attention Networks Can Process Bounded Hierarchical Languages”.
+In: Proceedings of the 59th Annual Meeting of the Association for Computational Linguistics
+and the 11th International Joint Conference on Natural Language Processing (Volume 1: Long
+Papers). Online: Association for Computational Linguistics, Aug. 2021, pp. 3770–3785. DOI:
+10.18653/v1/2021.acl-long.292. URL: https://aclanthology.org/2021.acl-
+long.292.
+[44]
+Chiyuan Zhang et al. Pointer Value Retrieval: A new benchmark for understanding the limits of
+neural network generalization. 2022. arXiv: 2107.12580 [cs.LG].
+[45]
+Yi Zhang et al. Unveiling Transformers with LEGO: a synthetic reasoning task. 2022. DOI: 10.
+48550/ARXIV.2206.04301. URL: https://arxiv.org/abs/2206.04301.
+12
+
+A
+Experimental Details
+This appendix elaborates on details of our experiments, including training (Appendix A.1) and the tasks
+we choose (Appendix A.2).
+A.1
+Training Details
+To examine the performance of our models for the experiments in Section 5, we computed accuracy based
+on exact match of complete sequences under a greedy decoding set-up, i.e.:
+Acc=
+P
+i∈Dtest1( ˆYi==Yi)
+|Dtest|
+(1)
+In order to address the inherent limitation of transformers in generating longer sequences beyond their
+training exposure, and to explore whether the learned algorithms in transformers can extrapolate, we
+implemented a straightforward approach inspired by previous research [9]. This involved introducing
+a simple mechanism where we randomly adjust the positional encoding by adding random lengths of
+padding to the inputs. By doing so, we challenged the model to generate both the actual sequence and the
+corresponding padding accurately.
+We experimented with encoder-decoder transformer models with 2 encoder layers, 2 decoder layers, a
+hidden dimension of 128, and 2 heads. For simplicity of analysis, we used sinusoidal positional encoding
+and greedy decoding.
+For binary successor tasks, we train the model on binary string pairs from 1 to n, where n is the number
+of examples we would like to use for training. For example, the maximum number we used for training
+is 131072, which corresponds to a 17-bit string. One can observe that the distribution of depths is
+non-uniform, as it aligns with the natural occurrence of different depths.
+For tree traversal experiments, by default, we split the train and test sets by tree structures, where we wish
+to understand the model’s capability of dealing with unseen topologies of the tree.
+A.2
+More Task Details
+We evaluated model performance on variants of the two tasks from Section 3. This appendix elaborates
+on those tasks.
+A.2.1
+Binary Successor
+The binary successor function from Section 3.1 is significant in that it requires no explicit knowledge
+of any other number format, and yet it entirely grounds binary positive numbers in the semantics of other
+number formats. Once we have s, for example, we can align unary and binary positive natural numbers.
+In fact, it turns out that it is impossible to determine how to, in general, move functions and proofs between
+these two number formats without discovering something that behaves like s along the way [34]. And
+yet the relation is not completely obvious, since the structures of unary and binary natural numbers are
+different from one another [33]. This makes s an apt choice for our first task, in that it gets us closer to
+discovering the semantic relations current neural tools struggle to infer.
+From our six input-output examples and our priors described in Section 3.1, we can infer the shape of
+the function we are synthesizing:
+Fixpoint s n :=
+match n with (* break
+into
+cases *)
+| 01 => ?? (* if n is one,
+return ?? *)
+| XO b => ?? (* if
+the LSB is zero , ?? *)
+| X1 b => ?? (* otherwise , ?? *)
+end.
+To fill in those ?? holes, we can look at our six input/output examples. The first example already fills
+one hole:
+| 01 => XO 01 (* if n is one,
+return two *)
+For the other two holes, we can fill in the behavior on the least significant bit first:
+13
+
+Binary Classification
+Recursion Depth Classification
+Train Acc
+Test Acc
+Train Acc
+Test Acc
+Nat C=1
+0.68
+0.66
+0.21
+0.14
+Nat C=0.1
+0.62
+0.52
+0.22
+0.13
+Rev C=1
+0.67
+0.56
+0.20
+0.13
+Rev C=0.1
+0.64
+0.51
+0.21
+0.14
+Table 1: Sequence pattern-matching accuracy table.
+Encoder Embedding
+Decoder Embedding
+Train Acc
+Test Acc
+Train Acc
+Test Acc
+Nat C=1
+0.33
+0.25
+0.68
+0.54
+Nat C=0.1
+0.62
+0.52
+0.62
+0.53
+Rev C=1
+0.32
+0.24
+0.47
+0.37
+Rev C=0.1
+0.33
+0.23
+0.44
+0.32
+Table 2: Recursion-depth recognition accuracy table.
+| XO b => X1 ?? (* if the LSB is zero ,
+flip ?? *)
+| X1 b => XO ?? (* otherwise , ?? and
+shift
+*)
+The first remaining hole is satisfied on all examples by the identity function on b. The second remaining
+hole, however, must recurse. Filling in those holes accordingly gives us the definition of s from Section 3.1.
+A.2.2
+Tree Traversal
+We can represent the binary trees from Section 3.2 inductively:
+Inductive tree :=
+| Leaf (* the base case is an empty leaf *)
+| Branch (v : char) (l r : tree). (* the inductive
+case is a branch with a character
+value and two
+subtrees
+*)
+We can then write an inorder traversal this way:
+Fixpoint inorder t :=
+match t with
+| Leaf => []
+| Branch val l r => (inorder l) ++ [v] ++ (inorder r)
+end.
+The reduction alluded to in Section 3.2 selects the appropriate case of inorder and takes one step at a time.
+That is, to compute:
+inorder (Branch ’a’ (Branch ’c’ Leaf Leaf) (Branch ’t’ Leaf Leaf))
+it can reduce one step at a time by selecting the Branch case and substituting in the right values:
+(inorder (Branch ’c’ Leaf Leaf)) ++ [’a’] ++ (inorder (Branch ’t’ Leaf Leaf))
+It can reduce inorder on the left and right subtrees:
+((inorder Leaf) ++ [’c’] ++ (inorder Leaf)) ++ [’a’] ++ ((inorder Leaf) ++ [’t’] ++ (inorder Leaf))
+Finally, it can reduce the Leaf cases:
+([] ++ [’c’] ++ []) ++ [’a’] ++ ([] ++ [’t’] ++ [])
+to get [’c’; ’a’; ’t’].
+B
+How Effectively did the Transformer Simulate a Recursive ASM?
+As discussed in Section 4, one of the primary objectives of our study was to investigate whether the model
+implicitly implemented a recursive algorithm by utilizing pattern matching on the most significant bit. To
+accomplish this, we conducted an initial analysis to examine the embeddings of the encoder and decoder
+for pattern-matching and recursion-depth-related information. (Figure 9 shows model performance—first
+alluded to in Section 5.1—when models were trained on data with more constrained recursion depths.)
+14
+
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Basic-Depth3
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Basic-Depth6
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.95
+0.96
+0.97
+0.98
+0.99
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Reversed-Depth3
+0
+20000
+40000
+60000
+80000
+100000
+120000
+Training Size
+0.95
+0.96
+0.97
+0.98
+0.99
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Reversed-Depth6
+Figure 9: Model performance when trained on data with more constrained recursion depths.
+Our ideal outcome was to identify evidence supporting the implementation of a recursive Abstract State
+Machine (ASM) employing a pattern-matching scheme. Alternatively, we expected that a sequentialized
+algorithm for the recursive task might exhibit indications of tracking the depth of recursion.
+To delve deeper into this matter, we designed a straightforward experiment. We sought to train a simple lin-
+ear classifier capable of distinguishing between cases such as XO bb and X1 bb based on the model’s internal
+representations. We computed the average encoder output across the sequence and trained a linear classifier
+on the fixed encoder representations for both binary classification and recursion-depth classification. The
+outcomes of these experiments are presented in Table 1. Regrettably, our attempts to train a classifier that
+could detect the distributional distinctions in the embeddings between the two cases proved unsuccessful.
+Additionally, we aimed to investigate the extent to which the embeddings of individual tokens contained
+information regarding the recursion depth. To achieve this, we trained a classifier to recognize the recursion
+depth of each token using both the encoder embeddings and the output embedding of the final decoder layer.
+The results, presented in Table 2, demonstrate that the encoder embeddings do not possess positional infor-
+mation, while the decoder embeddings do exhibit a certain degree of positional information in the natural
+direction. However, we did not observe this phenomenon when considering the embeddings in reverse order.
+In conclusion, our analysis suggests that the model does not explicitly exhibit evidence of implementing
+a recursive algorithm based on pattern matching or tracking the recursion depth. Moreover, the encoder
+embeddings lack positional information, while the decoder embeddings exhibit some level of positional
+information in the natural direction.
+15
+
+200
+100
+0
+100
+200
+200
+150
+100
+50
+0
+50
+100
+0-01
+1-X0
+2-X0
+3-X1
+4-X1 5-X1
+6-X0
+7-X0
+8-X0
+9-X1
+10-X1
+11-X1
+12-X1 13-X1
+14-X1
+15-X1
+16-X1
+17-X1
+18-X1
+19-X1
+20-X1
+21-X1
+Figure 10: T-SNE plot for the encoder embedding.
+300
+200
+100
+0
+100
+200
+100
+0
+100
+200
+300
+400
+0-01
+1-X02-X0
+3-X14-X1
+5-X1
+6-X0
+7-X0
+8-X1
+9-X010-X0
+11-X0
+12-X0
+13-X0
+14-X0
+15-X0
+16-X0
+17-X0
+18-X0
+19-X0
+20-X0
+21-X0
+22-<\s>
+Figure 11: T-SNE plot for the decoder layer 0 self-attention output (before cross-attention).
+C
+Algorithm Reconstruction for Binary Successor
+We summarized our results for the binary successor task in Section 5.1. Here, we (1) present more evidence
+for our findings in the natural order, and (2) provide pseudocode for the reconstructed algorithms in both
+the natural and reverse orders.
+Figures 10, 11, and 12 show T-SNE plots of the internal representation for the respective layers, with
+recursive segments in red and non-recursive segments in blue. The encoder (Figure 10) distinguishes
+between recursive and non-recursive segments. The first decoder layer (Figure 11) recognizes symbols.
+Finally, the cross-attention between encoder and decoder (Figure 12) injects instructions from the encoder
+about the start of recursion and end of sentence.
+The pseudocode for the reconstructed algorithms that we described informally in Section 5.1 can be found
+in Figures 13 and 14, respectively.
+16
+
+150
+100
+50
+0
+50
+100
+300
+200
+100
+0
+100
+200
+0-01
+1-X0
+2-X0
+3-X1
+4-X1
+5-X1
+6-X0
+7-X0
+8-X1
+9-X0
+10-X0
+11-X0
+12-X0
+13-X0
+14-X0
+15-X0
+16-X0
+17-X0
+18-X0
+19-X0
+20-X0
+21-X0
+22-<\s>
+Figure 12: T-SNE plot for the decoder layer 1 self-attention output.
+Procedure BinarySuccessorNaturalOrder
+Input: BinarySequence b
+Output: BinarySequence b'
+  HyperParameters: maxDecodingLength
+  Initialize decodingCounter=1,isInRecursion=False
+  Initialize BinarySequence b' = [<s>]
+  recursionStartPosition,sequenceLastPosition = Model.Encoder.recognizeImportantPositions(b)
+while decodingCounter < maxDecodingLength do
+    startRecursionFlag = Model.Decoder.checkIsRecusrionStart(\
+    Model.Decoder.positionalEncoding(decodingCounter),\
+    recursionStartPosition)
+if not startRecursionFlag:
+if startRecursionFlag = Model.Decoder.checkIsLastBit(\
+        Model.Decoder.positionalEncoding(decodingCounter),\
+        sequenceLastPosition):
+bit = Model.Decoder.generateX1()
+else:
+bit = Model.Decoder.copy(b[decodingCounter])
+else:
+if not isInRecursion:
+        isInRecursion=True
+bit = Model.Decoder.generateX1()
+else:
+bit = Model.Decoder.generateX0()
+b'.append(bit)
+if Model.Decoder.positionalEncoding(decodingCounter) == sequenceLastPosition:
+b'.append("<\s>")
+return b'
+else:
+    decodingCounter += 1
+Figure 13: Reconstructed Algorithm: Natural Order
+Procedure BinarySuccessorReverseOrder
+Input: BinarySequence b
+Output: BinarySequence b'
+  HyperParameters: maxDecodingLength
+  Initialize decodingCounter=1,isInCopyMode=False
+  Initialize BinarySequence b' = [<s>]
+while decodingCounter < maxDecodingLength do:
+    inCopyMode = Model.Decoder.hasGeneratedX1(b')
+if inCopyMode:
+bit = b[decodingCounter]
+else:
+if Model.crossAttentionCheckIfFirstX1(Model.Encoder.findFirstX1(b),\
+          Model.Decoder.InternalState(b')):
+bit = Model.Decoder.GenerateX1()
+else:
+bit = Model.Decoder.GenerateX0()
+b'.append(bit)
+    decodingCounter += 1
+return b'
+Figure 14: Reconstructed Algorithm: Reverse Order
+17
+
+D
+Algorithm Reconstruction for Tree Traversal
+Here we describe our reconstruction of the algorithms for the tree traversals initially described in Section 5.2.
+D.1
+Approach
+Our overall approach to reverse-engineering the tranformer’s behavior in the tree traversal task involved
+the following:
+1. decomposing the multi-step inference task into key subtasks,
+2. conducting activation patching in order to determine what parts of the network were most
+important to accomplishing the subtask, and
+3. examining the attention pattern behavior for the most significant attention heads, as well as the
+patterns of earlier heads that likely contributed to the given head’s behavior.
+D.2
+Decomposition of Tasks
+We decomposed overall tree traversal task performance into seven key subtasks and examined the behavior
+of each. Not all applied to each case (e.g., some were relevant for only preorder or inorder traversal), but
+overall these subtasks included:
+1. copy initiation,
+2. midpoint of left tree copy,
+3. end of left tree copy,
+4. insertion of root node from initial sequence,
+5. insertion of the UNROLL symbol,
+6. resumption of copy after insertion, and
+7. end of sequence.
+D.3
+Activation Patching
+Using counterfactual patching experiments inspired by prior work [24], we identified the most important
+attention heads in the transformer’s final output. To summarize the technique, we replaced neural
+activations from a forward pass where the model produced counterfactual answer B with activations from
+a forward pass when prompted to produce answer A. The activations were patched during the forward
+pass, and their effects propagated to later layers.
+This process was performed one attention head at a time, and the resulting difference in logits between
+correct answer A and incorrect answer B was measured. The degree to which the patch restored the
+original logit difference was taken as a measure of significance for the corresponding head. Typically,
+cross-attention heads most significantly affected the final result, but patching decoder self-attention also
+sometimes yielded significant, task-dependent changes in the logit difference.
+We utilized this technique to determine which attention heads were most important to the final output
+of the transformer. This did not reveal the full circuit used to perform the task, but did provide suggestive,
+causal evidence of what the transformer is doing. After identifying these key components of the model,
+we focused our investigation on the roles and composition behavior of these attention heads, leaving a
+comprehensive analysis of the entire circuit for future research.
+D.4
+Reconstructed Algorithms
+Based on the attention patterns at various steps of the traversal task, our encoder-decoder architecture
+appears to follow a simple, interpretable set of rules. All traversals begin by providing the complete
+parenthesized tree sequence to the encoder, and then providing the decoder with a starting <s> token. The
+remaining portion of the output was produced autoregressively.
+In-order Partial Reduction Traversal (Example: Reduce Twice, Depth 2-3)
+18
+
+<s>
+UNROLL[
+695
+(
+425
+EMPTY
+EMPTY
+)
+EMPTY
+]
+<s>
+UNROLL[
+695
+(
+425
+EMPTY
+EMPTY
+)
+EMPTY
+]
+Head 0
+<s>
+UNROLL[
+695
+(
+425
+EMPTY
+EMPTY
+)
+EMPTY
+]
+<s>
+UNROLL[
+695
+(
+425
+EMPTY
+EMPTY
+)
+EMPTY
+]
+Head 1
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Figure 15: Layer 1 decoder self-attention during in-order partial reduction at a higher depth. The model’s
+next token is a non-consecutive node ID (as per in-order traversal, a parent node which occurs before
+its two children should be copied to the position after its left child and before its right child), which should
+only be copied once a bracket statement containing an unreduced part of the tree has been copied. Here,
+the most significant heads attend to the beginning and end of the bracket statement.
+1. The network always starts by inserting an "UNROLL[" symbol.
+2. Cross-attention attends to the first parenthesized node and writes this token into the final token
+position.
+3. This process continues with the model attending to target tokens and parentheses in sequence
+until the first parenthesis is closed.
+4. The model inserts a closing "]" bracket. The left subtree is now complete.
+5. The model attends to the token immediately preceding the closed first parenthesis, and writes
+this token out.
+6. The model then performs the same copy operation with the right subtree.
+For higher depths, the model performs essentially the same operation but additionally uses decoder
+self-attention to attend to the beginning and end of the relevant bracket level as per Figure 15. The
+significance of this attention pattern seems to suggest that it helps the network track which parent node
+to copy over. For shallower trees, the model only needs to copy over the root node at the beginning of the
+19
+
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 0
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 1
+0.0
+0.2
+0.4
+0.6
+0.8
+(a) Layer 0 cross-attention. The model attends only to nodes, not to parentheses or EMPTY tokens.
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 0
+<s>
+573
+(
+796
+(
+594
+(
+871
+EMPTY
+EMPTY
+)
+(
+798
+(
+459
+EMPTY
+EMPTY
+)
+(
+701
+(
+617
+EMPTY
+EMPTY
+)
+(
+123
+EMPTY
+EMPTY
+)
+)
+)
+)
+(
+661
+(
+857
+(
+516
+EMPTY
+EMPTY
+)
+(
+52
+(
+711
+EMPTY
+EMPTY
+)
+(
+3
+EMPTY
+EMPTY
+)
+)
+)
+(
+956
+(
+331
+(
+541
+EMPTY
+EMPTY
+)
+(
+324
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+)
+)
+(
+943
+(
+420
+(
+255
+(
+965
+EMPTY
+(
+491
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+(
+87
+(
+341
+(
+148
+EMPTY
+EMPTY
+)
+(
+963
+EMPTY
+EMPTY
+)
+)
+(
+<s>
+573
+796
+594
+871
+798
+459
+701
+617
+Head 1
+0.2
+0.4
+0.6
+0.8
+(b) Layer 1 cross-attention. Attention is consolidated on the next node to be copied, skipping all non-node items.
+Figure 16: Cross-attention on the preorder full traversal task.
+encoder sequence, so it doesn’t need to track multiple parent nodes; however, for deeper trees, the model
+needs some indication of where the appropriate parent node can be found. Potentially, the model could
+use the start of the "UNROLL[]" sequence as a way to point to the token immediately after the appropriate
+parent node, which could then be used as a query to find the node prior to it in the original encoder sequence.
+Pre-order Partial Reduction Traversal (Example: Reduce Twice, Depth 2-3)
+1. The model begins by copying node numbers without parentheses.
+2. Depending on the depth, the model is trained to output an "UNROLL[" token once two reductions
+have occurred. When writing out this token, cross-attention patterns of the key heads indicate
+that the model is attending to A). the parenthesis immediately prior to the node after which the
+"UNROLL[" token is to be inserted, and B). the following opening parenthesis, and C). the final
+closing parenthesis of the subsequence that will be copied into the "UNROLL[...]" statement.
+This seems to suggest that the model is keeping track of the parenthetical depth when deciding
+where to insert the "UNROLL[...]" wrapper.
+3. In parts of the output sequence into which an EMPTY token would normally be inserted with a sim-
+ple copy operation, decoder self-attention is more significant to the final logit difference. Looking
+at attention patterns once again, we see that the model is attending to the preceding "UNROLL["
+token, if present, and is likely using it as a basis for whether to output this token or not. (Sub-
+sequences inside the wrapper should contain "EMPTY" tokens, while those outside should not.)
+4. The model completes the sequence with the end token ("<\s>"). It is less clear what the model
+is doing here, but the most significant contributing heads attend to a combination of the final
+brackets and EMPTY tokens as well as the <\s> token of the original encoder output.
+Preorder Full Traversal
+1. The model conducts a straightforward copy operation of all node IDs in the encoder sequence,
+omitting brackets, EMPTY tokens, and parens.
+2. Lower-level heads seem to attend to "nodes in general", with attention being paid to many
+different nodes both ahead of and behind the current output position, ignoring all non-node
+tokens, as seen in Figure 16a.
+20
+
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 0
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 1
+0.05
+0.10
+0.15
+0.20
+(a) Layer 0 cross-attention. The model attends to distant parens and EMPTY tokens as well as the next tokens to
+be copied.
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 0
+<s>
+109
+(
+390
+(
+97
+EMPTY
+(
+595
+EMPTY
+EMPTY
+)
+)
+(
+579
+(
+340
+EMPTY
+EMPTY
+)
+EMPTY
+)
+)
+(
+755
+(
+420
+EMPTY
+(
+479
+EMPTY
+EMPTY
+)
+)
+EMPTY
+)
+<\s>
+<s>
+UNROLL[
+Head 1
+0.0
+0.2
+0.4
+0.6
+0.8
+(b) Layer 1 cross-attention. At this point the model has consolidated its attention primarily on the token to be copied.
+Figure 17: Cross-attention during inorder traversal task.
+3. Later heads attend more exclusively to the next token to be copied from the encoder sequence,
+as seen in Figure 16b.
+D.5
+Separation of Tasks in Attention Heads
+The analysis of attention patterns reveals important insights. In the in-order traversal task, Layer 0
+cross-attention heads show distinct behavior: one head focuses on forward parenthesis, brackets, and
+EMPTY tokens, while the other attends to encoder sequence tokens linearly (Figure 17a). At Layer 1
+(Figure 17b), both heads correctly attend to the token to be copied, suggesting they write out the next
+correct token based on Layer 0’s output. Brackets and symbols play a crucial role in signaling behavior
+changes, particularly in steps requiring the insertion of non-consecutive symbols. Decoder self-attention
+heads attend to previous UNROLL symbols when determining the inclusion or omission of EMPTY
+tokens. For in-order traversal, higher depths involve attending to bracket statements for copying root nodes,
+unlike binary trees with a single root node. This behavior may be utilized by decoder cross-attention heads
+to copy the first node within the UNROLL statement.
+Our analysis indicates that the individual encoder self-attention heads do not appear to play a significant
+independent role in the transformer model’s performance. This is demonstrated by our counterfactual
+patching experiments, which resulted in minimal changes to the network’s predictions. On the other hand,
+decoder cross-attention appears to be a crucial component of the transformer circuit. As the sequence
+progresses, however, decoder self-attention becomes increasingly important and the model takes into
+account the structure of the previously-generated content (especially at higher depths, where keeping track
+of multiple levels of parent nodes becomes vital).
+21
+
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+Extrapolation Length
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Performance
+89.49
+92.05 90.91
+87.78 86.36
+86.36
+84.66 82.39
+78.69
+74.72
+69.89
+59.94
+50.57
+46.14
+26.74
+1.30
+0.02
+0.00
+0.00
+0.00
+0.00
+0.00 0.00
+0.00
+0.00 0.00
+98.77
+98.91
+98.91 98.82 97.84
+90.29
+60.91
+20.38
+0.48 0.010.00
+0.00
+0.00
+99.09
+99.38
+98.98
+Encoder-Decoder
+Decoder-Only
+Encoder-Only
+Figure 18: Performance of Extrapolation Study
+1.00
+1.00
+1.00
+0.99
+1.00
+0.99
+1.00
+0.90
+0.88
+0.52
+0.04
+0.52
+0.99
+0.77
+0.76
+0.31
+0.00
+0.18
+0.85
+0.33
+0.24
+0.09
+0.00
+0.04
+0.01
+0.03
+0.06
+0.00
+0.00
+0.00
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Encoder-Only Full Training
+Range
+Encoder-Only Train Up To
+Depth 3
+Encoder-Only Train Up To
+Depth 6
+ Decoder-Only Full Training
+Range
+ Decoder-Only Train Up To
+Depth 3
+ Decoder-Only Train Up To
+Depth 6
+Train
+Train Length +2 to +4
+Train Length +4 to +6
+Train Length +8 to +10
+Train Length +18 to +20
+Figure 19: Accuracy of encoder-only and decoder-only transformers on natural order binary successor task.
+E
+Extrapolation of Different Model Architectures
+We were initially not sure whether to evaluate the tasks of interests on an encoder-only, decoder-only, or
+encoder-decoder transformer model. To decide, we ran preliminary experiments to evaluate these three
+architectures under our setup for a related toy experiment, as well as on one of our two tasks.
+Our toy experiment focused on string reversal. We trained models on strings of lengths ranging from
+10 to 37, and tested up to length 50. We used three different architectures: a 2-layer encoder-decoder
+transformer model, a 4-layer encoder-only model, and a 4-layer decoder-only model. We trained until
+we achieved perfect accuracy on both the training and in-domain validation datasets. We employed the
+same “random-padding” strategy as in the main experiment.
+The encoder-decoder model exhibited the best extrapolation performance among the three architectures
+(Figure 18). Both the encoder-only and decoder-only models experienced a rapid decline in performance as
+the extrapolation length increased. Interestingly, we also observed that the model failed to extrapolate when
+22
+
+trained on a fixed-length “learnable token” setup, even though we ensured that the positional embeddings
+were seen during training. Moreover, the model also struggled to extrapolate when padding was not applied.
+The results of the encoder-only and decoder-only transformers on the natural order binary successor task
+(each with 4 layers) are presented in Figure 19.
+F
+Binary Successor Performance By Depth
+Figures 20 through 25 show detailed extrapolation performance for the binary successor task based on
+recursion depth. The error bars indicate the standard deviation across three runs with different random seeds.
+23
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+1.2
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 20: Accuracy versus recursion depth: natural order.
+24
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.6
+0.7
+0.8
+0.9
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.70
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+1.05
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.2
+0.4
+0.6
+0.8
+1.0
+Performance
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 21: Accuracy versus recursion depth: reverse order.
+25
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 22: Accuracy versus recursion depth with maximum training depth constrained to 3: Natural order.
+26
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 23: Accuracy versus recursion depth with maximum training depth constrained to 6: Natural order.
+27
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 24: Accuracy versus recursion depth with maximum training depth constrained to 3: Reverse order.
+28
+
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.75
+0.80
+0.85
+0.90
+0.95
+1.00
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(a) Trained on Binary Strings Up to 2048
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(b) Trained on Binary Strings Up to 4096
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.2
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(c) Trained on Binary Strings Up to 8192
+0
+5
+10
+15
+20
+25
+30
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(d) Trained on Binary Strings Up to 16384
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(e) Trained on Binary Strings Up to 32768
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(f) Trained on Binary Strings Up to 65536
+0
+5
+10
+15
+20
+25
+30
+35
+Recursion Depth
+0.2
+0.4
+0.6
+0.8
+1.0
+Accuracy
+Test Group
+Train
+LT rain
+max +2 to LT rain
+max +4
+LT rain
+max +4 to LT rain
+max +6
+LT rain
+max +8 to LT rain
+max +10
+LT rain
+max +18 to LT rain
+max +20
+Learning Rate Factor C
+0.1
+1.0
+(g) Trained on Binary Strings Up to 131072
+Figure 25: Accuracy versus recursion depth with maximum training depth constrained to 6: Reverse order.
+29
+

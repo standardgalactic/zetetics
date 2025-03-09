@@ -1,0 +1,2210 @@
+Sophia: A Scalable Stochastic Second-order Optimizer for
+Language Model Pre-training
+Hong Liu
+Zhiyuan Li
+David Hall
+Percy Liang
+Tengyu Ma
+Stanford University
+{hliu99, zhiyuanli, dlwh, pliang, tengyuma}@cs.stanford.edu
+Abstract
+Given the massive cost of language model pre-training, a non-trivial improvement of the optimization
+algorithm would lead to a material reduction on the time and cost of training. Adam and its variants have
+been state-of-the-art for years, and more sophisticated second-order (Hessian-based) optimizers often incur
+too much per-step overhead. In this paper, we propose Sophia, Second-order Clipped Stochastic Optimization,
+a simple scalable second-order optimizer that uses a light-weight estimate of the diagonal Hessian as the
+pre-conditioner. The update is the moving average of the gradients divided by the moving average of the
+estimated Hessian, followed by element-wise clipping. The clipping controls the worst-case update size
+and tames the negative impact of non-convexity and rapid change of Hessian along the trajectory. Sophia
+only estimates the diagonal Hessian every handful of iterations, which has negligible average per-step time
+and memory overhead. On language modeling with GPT-2 models of sizes ranging from 125M to 770M,
+Sophia achieves a 2x speed-up compared with Adam in the number of steps, total compute, and wall-clock
+time. Theoretically, we show that Sophia adapts to the curvature in different components of the parameters,
+which can be highly heterogeneous for language modeling tasks. Our run-time bound does not depend on the
+condition number of the loss.
+1
+Introduction
+Language models (LLMs) have gained phenomenal capabilities as their scale grows (Radford et al.,
+2019; Kaplan et al., 2020; Brown et al., 2020; Zhang et al., 2022; Touvron et al., 2023; OpenAI, 2023).
+However, pre-training LLMs is incredibly time-consuming due to the massive datasets and model
+sizes—hundreds of thousands of updates to the model parameters are required. For example, PaLM
+was trained for two months on 6144 TPUs, which costed 10 million dollars (Chowdhery et al., 2022).
+Pre-training efficiency is thus a major bottleneck in scaling up LLMs. This work aims to improve
+pre-training efficiency with a faster optimizer, which either reduces the time and cost to achieve the
+same pre-training loss, or alternatively achieves better pre-training loss with the same budget.
+Adam (Kingma & Ba, 2014) (or its variants (Loshchilov & Hutter, 2017; Shazeer & Stern, 2018; You
+et al., 2019)) is the dominantly used optimizer for training LLMs, such as GPT (Radford et al., 2019;
+Brown et al., 2020), OPT (Zhang et al., 2022), Gopher (Rae et al., 2021) and LLAMA (Touvron et al.,
+2023). Designing faster optimizers for LLMs is challenging. First, the benefit of the first-order
+(gradient-based) pre-conditioner in Adam is not yet well understood (Liu et al., 2020; Zhang et al.,
+2020; Kunstner et al., 2023). Second, the choice of pre-conditioners is constrained because we can
+only afford light-weight options whose overhead can be offset by the speed-up in the number
+of iterations. For example, the block-diagonal Hessian pre-conditioner in K-FAC is prohibitively
+1
+arXiv:2305.14342v1  [cs.LG]  23 May 2023
+
+0K
+50K
+100K
+150K
+200K
+Number of Steps
+2.5
+2.6
+2.7
+2.8
+2.9
+3.0
+3.1
+3.2
+Validation Loss
+2x Speedup
+(a) GPT-2 Large (770M)
+AdamW
+Sophia-H
+0.0
+59.75
+119.5
+179.25
+239.0
+Compute / exaFLOPs
+2.6
+2.8
+3.0
+3.2
+3.4
+Validation Loss
+2x Speedup
+(b) GPT-2 Medium (355M)
+AdamW
+Sophia-H
+Sophia-G
+200
+400
+600
+Model Size / M
+2.5
+2.6
+2.7
+2.8
+2.9
+Validation Loss
+40% More Parameters
+(c) Scaling Laws
+AdamW
+Sophia-H
+Figure 1: Sophia achieves a 2x speedup over AdamW in GPT-2 pre-training on OpenWebText. (a),
+(b) Comparison of the number of steps needed to achieve the same level of validation loss on (a)
+GPT-2-large (770M) and (b) GPT-2-medium (355M). Across all model sizes, Sophia achieves a 2x
+speedup over AdamW. (c) Validation losses of models with different sizes pre-trained for 100K steps.
+The gap between Sophia-H and AdamW gets larger as models size grows. Notably, using Sophia-H
+on a 540M-parameter model results in the same loss as using AdamW on a 770M-parameter model.
+See Section 3 for details and more results.
+expensive for LLMs (Martens & Grosse, 2015; Grosse & Martens, 2016; Ba et al., 2017; Martens
+et al., 2018). On the other hand, Chen et al. (2023) automatically search among the light-weight
+gradient-based pre-conditioners and identify Lion, which is substantially faster than Adam on vision
+Transformers and diffusion models but only achieves limited speed-up on LLMs (Chen et al., 2023).
+This paper introduces Sophia, Second-order Clipped Stochastic Optimization, a light-weight second-
+order optimizer that uses an inexpensive stochastic estimate of the diagonal of the Hessian as a
+pre-conditioner and a clipping mechanism to control the worst-case update size. On pre-training
+language models such as GPT-2, Sophia achieves the same validation pre-training loss with 50%
+fewer number of steps than Adam. Because Sophia maintains almost the memory and average time
+per step, the speedup also translates to 50% less total compute and 50% less wall-clock time (See
+Figure 1 (a)&(b).). Moreover, the scaling law based on model size from 125M to 770M is in favor
+of Sophia over Adam—the gap between Sophia and Adam with 100K steps increases as the model
+size increases (Figure 1 (c)). In particular, Sophia on a 540M-parameter model with 100K steps gives
+the same validation loss as Adam on a 770M-parameter model with 100K steps. Note that the latter
+model needs 40% more training time and 40% more inference cost.
+Concretely, Sophia estimates the diagonal entries of the Hessian of the loss using a mini-batch of
+examples every k step (with k = 10 in our implementation). We consider two options for diagonal
+Hessian estimators: (a) an unbiased estimator that uses a Hessian-vector product with the same
+run-time as a mini-batch gradient up to a constant factor, and (b) a biased estimator that uses one
+mini-batch gradient calculated with resampled labels. Both the two estimators only introduce 5%
+overheads per step (in average). At every step, Sophia updates the parameter with an exponential
+moving average (EMA) of the gradient divided by the EMA of the diagonal Hessian estimate,
+subsequently clipped by a scalar. (All operations are element-wise.) See Algorithm 3 for the
+pseudo-code.
+Additionally, Sophia can be seamlessly integrated into existing training pipelines, without any
+special requirements on the model architecture or computing infrastructure. With the either of the
+Hessian estimators, Sophia only require either standard mini-batch gradients, or Hessian-vector
+products which are supported in auto-differentiation frameworks such as PyTorch (Paszke et al.,
+2019) and JAX (Bradbury et al., 2018).
+2
+
+Algorithm 1 Hutchinson(θ)
+1: Input: parameter θ.
+2: Compute mini-batch loss L(θ).
+3: Draw u from N(0, Id).
+4: return u ⊙∇(⟨∇L(θ), u⟩).
+Figure 2: The motivating toy example. θ[1]
+is the sharp dimension and θ[2] is the flat di-
+mension.
+GD’s learning rate is limited by
+the sharpness in θ1, and makes slow progress
+along θ[2]. Adam and SignGD bounce along
+θ[1] while making slow progress along θ[2].
+Vanilla Newton’s method converges to a sad-
+dle point. Sophia makes fast progress in both
+dimensions and converges to the minimum
+with a few steps.
+Algorithm 2 Gauss-Newton-Bartlett(θ)
+1: Input: parameter θ.
+2: Draw a mini-batch of input {xb}B
+b=1.
+3: Compute
+logits
+on
+the
+mini-batch:
+{f(θ, xb)}B
+b=1.
+4: Sample ˆyb ∼softmax(f(θ, xb)), ∀b ∈[B].
+5: Calculate ˆg = ∇(1/B P ℓ(f(θ, xb), ˆyb)).
+6: return B · ˆg ⊙ˆg.
+Algorithm 3 Sophia
+1: Input: θ1, learning rate {ηt}T
+t=1, hyperparam-
+eters λ, β1, β2, ϵ, and estimator choice Estima-
+tor ∈{Hutchinson,Gauss-Newton-Bartlett}
+2: Set m0 = 0, v0 = 0, h1−k = 0
+3: for t = 1 to T do
+4:
+Compute minibach loss Lt(θt).
+5:
+Compute gt = ∇Lt(θt).
+6:
+mt = β1mt−1 + (1 −β1)gt
+7:
+if t mod k = 1 then
+8:
+Compute ˆht = Estimator(θt).
+9:
+ht = β2ht−k + (1 −β2)ˆht
+10:
+else
+11:
+ht = ht−1
+12:
+θt = θt −ηtλθt (weight decay)
+13:
+θt+1 = θt −ηt · clip(mt/ max{ht, ϵ}, ρ)
+Thanks to the Hessian-based pre-conditioner, Sophia adapts more efficiently, than Adam does, to the
+heterogeneous curvatures in different parameter dimensions, which can often occur in the landscape
+of LLMs losses and cause instability or slowdown. Sophia has a more aggressive pre-conditioner
+than Adam—Sophia applies a stronger penalization to updates in sharp dimensions (where the
+Hessian is large) than the flat dimensions (where the Hessian is small), ensuring a uniform loss
+decrease across all parameter dimensions. In contrast, Adam’s updates are mostly uniform across all
+parameter dimensions, leading to a slower loss decrease in flat dimensions. (See Section 2.1 for more
+discussions.) These make Sophia converge in fewer iterations. Thanks to the light-weight diagonal
+Hessian estimate, the speed-up in the number of steps translates to a speed-up in total compute and
+wall-clock time.
+Sophia’s clipping mechanism controls the worst-case size of the updates in all directions, safeguard-
+ing against the negative impact of inaccurate Hessian estimates, rapid Hessian changes over time,
+and non-convex landscape (with which the vanilla Newton’s method may converge to local maxima
+or saddle points instead of local minima). The safeguard allows us to estimate Hessian infrequently
+(every k = 10 step) and stochastically. In contrast, prior second-order methods often update Hessian
+estimates every step (Martens & Grosse, 2015; Grosse & Martens, 2016; Anil et al., 2020; Yao et al.,
+2021).
+3
+
+We provide theoretical analyses of Sophia on convex functions. The runtime bound does not depend
+on the local condition number (the ratio between maximum and minimum curvature at the local
+minimum) and the worst-case curvature (that is, the smoothness parameter), demonstrating the
+advantage of Sophia in adapting to heterogeneous curvatures across parameter dimensions.
+2
+Method
+We first instantiate gradient descent (GD) and Adam on a simplified 2D problem and motivate
+the use of second-order information and per-coordinate clipping in Section 2.1. Then, we present
+Sophia in detail in Section 2.2, and the pseudo-code in Algorithm 3. We introduce two choices of
+estimators of diagonal Hessian used in Sophia in Section 2.3.
+2.1
+Motivations
+0.000
+0.002
+0.004
+0.006
+0.008
+0.010
+0.012
+0.014
+Value
+100
+101
+102
+103
+104
+Count
+Figure 3: Histogram of positive
+entries of the diagonal Hessian
+of a 125M-parameter GPT-2.
+Heterogeneous curvatures. The loss functions of modern deep
+learning problems often have different curvatures across different
+parameter dimensions (Sagun et al., 2016; Ghorbani et al., 2019;
+Zhang et al., 2020; Yao et al., 2020). E.g., on a 125M-parameter
+GPT-2 model, Figure 3 shows that the distribution of positive
+diagonal entries of the Hessian is dispersed.
+We demonstrate the limitations of Adam and GD on heteroge-
+neous landscapes by considering a two-dimensional loss function
+L(θ[1], θ[2]) = L1(θ[1]) + L2(θ[2]) where L1 is much sharper than
+L2. We plot the loss landscape of L(θ[1], θ[2]) in Figure 2.1 For
+simplicity, we discuss GD and deterministic versions of Adam.
+Recall that GD’s update in this setting is:
+θ[1] ←θ[1] −η · L′
+1(θ[1]) and θ[2] ←θ[2] −η · L′
+2(θ[2]) .
+(1)
+A common simplification of Adam that is more amenable to analysis (Balles & Hennig, 2018;
+Bernstein et al., 2018; Zhuang et al., 2020; Kunstner et al., 2023) is SignGD, which dates back to
+RProp (Braun & Riedmiller, 1992) that motivated RMSProp (Hinton et al., 2012) and Adam. Observe
+that without using the EMA (for both the gradient and second moments of the gradient), Adam’s
+update is simplified to η · ∇L(θ)/|∇L(θ)| = η · sign(∇L(θ)) (where all operations are entry-wise),
+which is called SignGD. Applying the update rule to our setting gives:
+θ[1] ←θ[1] −η · sign(L′
+1(θ[1])) and θ[2] ←θ[2] −η · sign(L′
+2(θ[2])) .
+(2)
+Limitations of GD and SignGD (Adam). It is well known that the optimal learning rate of GD
+should be proportional to the inverse of the curvature, that is, the Hessian/second derivative at the
+local minimum. More precisely, let h1 and h2 be the curvatures of L1 and L2 at the local minimum
+(and thus h1 ≫h2). The optimal learning rate for the update of θ[1] in equation (1) is ≍1/h1, which
+is much smaller than the optimal learning rate that the update of θ[2] needs, which is ≍1/h2. As
+a result, the largest shared learning rate can only be 1/h1; consequently, the convergence in θ[2]
+dimension is slow as demonstrated in the brown curve in Figure 2.
+The update size of SignGD is the learning rate η in all dimensions. The same update size translates to
+less progress in decreasing the loss in the flat direction than in the sharp direction. As observed from
+the yellow curve in Figure 2, the progress of SignGD in the flat dimension θ[2] is slow because each
+1Concretely, in Figure 2, L1(θ[1]) = 8(θ[1] −1)2(1.3θ2
+[1] + 2θ[1] + 1) and L2(θ[2]) = 1/2(θ[2] −4)2.
+4
+
+step only decreases the loss L2(θ[2]) slightly. On the other hand, along the direction θ[1], the iterate
+quickly travels to the valley in the first three steps and then starts to bounce. To fully converge in the
+sharp dimension, the learning rate η needs to decay to 0, which will exacerbate the slow convergence
+in the flat dimension θ[2]. The trajectory of Adam in this example is indeed similar to SignGD, which
+is also plotted as the red curve in Figure 2.
+The behavior of SignGD and Adam above indicates that a more aggressive pre-conditioning is
+needed—sharp dimensions should have relatively smaller updates than flat dimensions so that
+the decrease of loss is equalized in all dimensions. As suggested by well-established literature on
+second-order optimization (Boyd & Vandenberghe, 2004) for convex functions, the optimal pre-
+conditioner should be the Hessian, which captures the curvature on each dimension; as in Newton’s
+method, the update is the gradient divided by the Hessian in each dimension:
+θ[1] ←θ[1] −η · L′
+1(θ[1])/h1 and θ[2] ←θ[2] −η · L′
+2(θ[2])/h2 .
+(3)
+Limitations of Newton’s method. Nevertheless, Newton’s method has known limitations as well.
+For non-convex functions, vanilla Newton’s method could converge to a global maximum when
+the local curvature is negative. In the blue curve of Figure 2, Newton’s method quickly converges
+to a saddle point instead of a local minimum. The curvature might also change rapidly along the
+trajectory, making the second-order information unreliable. To address these limitations, we propose
+considering only pre-conditioners that capture positive curvature, and introduce a pre-coordinate
+clipping mechanism to mitigate the rapid change of Hessian (more detail in Section 2.2). Applying
+our algorithm on the toy case results in the following update:
+θ[1] ←θ[1] −η · clip(L′
+1(θ[1])/max{h1,ϵ}, ρ) and θ[2] ←θ[2] −η · clip(L′
+2(θ[2])/max{h2,ϵ}, ρ) ,
+(4)
+where ρ is a constant to control the worst-case update size, ϵ is a very small constant (e.g., 1e-12),
+which avoids dividing by 0. When the curvature of some dimension is rapidly changing or negative
+and thus the second-order information is misleading and possibly leads to a huge update before
+clipping, the clipping mechanism kicks in and the optimizer defaults to SignGD (even though this
+is sub-optimal for benign situations). Numerous prior methods such as trust region (Conn et al.,
+2000), backtracking line search (Boyd & Vandenberghe, 2004), and cubic regularization (Nesterov &
+Polyak, 2006) also tackle the same issue of Newton’s method, but the clipping mechanism is much
+simpler and more efficient.
+As shown in the black curve in Fig. 2, the update in equation (4) starts off similarly to SignGD due
+to the clipping mechanism in the non-convex region, making descent opposed to converging to a
+local maximum. Then, in the convex valley, it converges to the global minimum with a few steps.
+Compared with SignGD and Adam, it makes much faster progress in the flat dimension θ[2] (because
+the update is bigger in dimension θ[2]), while avoiding boucing in the sharp dimension θ[1] (because
+the update is significantly shrunk in the sharp dimension θ[1]).
+2.2
+Sophia: Second-order Clipped Stochastic Optimization
+Section 2.1 demonstrates that Adam does not sufficiently adapt to the heterogeneous curvatures. On
+the other hand, vanilla Newton’s method has a pre-conditioner optimal for convex functions, but is
+vulnerable to negative curvature and rapid change of Hessian. With these insights, we design a new
+optimizer, Sophia, which is more adaptive to heterogeneous curvatures than Adam, more resistant
+to non-convexity and rapid change of Hessian than Newton’s method, and also uses a low-cost
+pre-conditioner.
+We use θt to denote the parameter at time step t. At each step, we sample a mini-batch from the data
+distribution and calculate the mini-batch loss, denoted by Lt(θt). We denote by gt the gradient of
+5
+
+Lt(θt), i.e. gt = ∇Lt(θt). Let mt be the EMA of gradients, mt ←β1mt−1 + (1 −β1)gt, which is the
+numerator of the update.
+EMA of diagonal Hessian estimates. Sophia uses a diagonal Hessian-based pre-conditioner, which
+directly adjusts the update size of different parameter dimensions according to their curvatures. We
+will present two options in detail in Section 2.3 for estimating the diagonal Hessian efficiently. To
+mitigate the overhead, we only estimate the Hessian every k steps (k = 10 in our implementation).
+At time step t with t mod k = 1, the estimator returns an estimate ˆht of the diagonal of the Hessian
+of the mini-batch loss.
+Similar to the gradient of the mini-batch loss function, the estimated diagonal Hessian can also have
+large noise. Inspired by the EMA of moments of gradients in Adam, we also denoise the diagonal
+Hessian estimates with EMA across iterations. We update the EMA every k steps, resulting in the
+following update rule for the diagonal Hessian estimate:
+ht = β2ht−k + (1 −β2)ˆht if t mod k = 1; else ht = ht−1 .
+(5)
+Pre-coordinate clipping. As discussed in Section 2.1, on nonconvex functions, vanilla Newton’s
+method, which uses Hessian as the pre-conditioner, may converge to local maxima instead of local
+minima. In addition, the inaccuracy of Hessian estimates and the change of Hessian along the
+trajectory can make the second-order information unreliable. To this end, we only consider the
+positive entries of the diagonal Hessian and introduce per-coordinate clipping to the update. Let
+clip(z, ρ) = max{min{z, ρ}, −ρ} be the clipping function with threshold ρ > 0. The update rule can
+be written as:
+θt+1 ←θt −ηt · clip(mt/ max{ht, ϵ}, ρ),
+(6)
+where ϵ > 0 is a very small constant to avoid dividing by 0, and all the operations are applied
+element-wise. We present the pseudo-code of the Sophia in Algorithm 3.
+When any entry of ht is negative, e.g., ht[i] < 0, the corresponding entry in the pre-conditioned
+gradient mt[i]/ max{ht[i], ϵ} = mt[i]/ϵ is extremely large and has the same sign as mt[i], and thus
+η·clip(mt[i]/ max{ht[i], ϵ}, ρ) = ηρ·sign(mt[i]), which is the same as stochastic momentum SignSGD.
+In other words, Sophia uses stochastic momentum SignSGD as a backup when the Hessian is
+negative (or mistakenly estimated to be negative or very small.) We also note that the clipping
+mechanism controls the worst-case size of the updates in all parameter dimensions to be at most
+ρ, which also improves the stability (which could be a severe issue for second-order methods).
+Moreover, because for many parameter dimensions, the clipping is not activated and the update
+is automatically adjusted, our worst-case update size ηρ can be chosen to be larger than the worst
+update size η in stochastic momentum SignSGD.
+Several previous works (Becker & Le Cun, 1988; Chapelle et al., 2011; Schaul et al., 2013), including
+the recent work AdaHessian (Yao et al., 2021), use diagonal Hessian as a pre-conditioner in optimizers
+for training neural networks. However, they use more frequent Hessian estimations, which leads
+to significant per-step computation overhead (more than two gradient computations), most likely
+because of the lack of the clipping mechanism that safeguards against inaccurate and changing
+Hessian. In general, previous second-order optimizers do not achieve a speed-up on large language
+models in wall-clock time or total compute (Gupta et al., 2018; Yao et al., 2021) (see more discussions
+in Section 5).
+2.3
+Diagonal Hessian Estimators
+We introduce two diagonal Hessian estimators, both of which have memory and run-time costs
+similar to computing a gradient (up to constant factors).
+6
+
+Option 1: Hutchinson’s unbiased estimator. For any loss function ℓ(θ) on parameters θ ∈Rd, the
+Hutchinson’s estimator (Hutchinson, 1989; Roosta-Khorasani & Ascher, 2015; Yao et al., 2021) first
+draws u ∈Rd from the spherical Gaussian distribution N(0, Id), and then outputs ˆh = u ⊙(∇2ℓ(θ)u),
+where ⊙denotes the element-wise product, and ∇2ℓ(θ)u is the product of the Hessian with the
+vector u. The Hutchinson’s estimator is an unbiased estimator for the diagonal of the Hessian,
+because
+E[ˆh] = diag(∇2ℓ(θ)) .
+(7)
+The estimator only requires a Hessian-vector product (i.e., ∇2ℓ(θ)u), which have efficient implemen-
+tations in PyTorch and JAX, instead of the full Hessian matrix.
+Option 2: Gauss-Newton-Bartlett (GNB) estimator. We leverage the structure of the loss to design
+a biased stochastic estimator for the diagonal Hessian, following Schraudolph (2002); Martens
+(2020); Wei et al. (2020). Suppose ℓ(θ, (x, y)) is a loss function on an example (x, y) of the form
+ℓ(θ, (x, y)) = ℓce(f(θ, x), y) where ℓce is the cross-entropy loss and f(θ, x) ∈RV is the logits, and
+V is the number of items/classes in a multi-class classification problem (e.g., the vocabulary size
+in LLMs). First, the Hessian of ℓ(θ, (x, y)) (w.r.t to variable θ) has the well-known Gauss-Newton
+decomposition (Ortega & Rheinboldt, 2000; Schraudolph, 2002) (which is a simple consequence of
+the chain rule),
+∇2
+θ ℓ(θ) = Jθf(θ, x) · S · Jθf(θ, x)⊤+ Jθθf(θ, x)[q]
+(8)
+where Jθf(θ, x) is the Jacobian of f w.r.t to θ viewed as a matrix in Rd×V , S = ∂2ℓce(t,y)
+∂t2
+
+t=f(θ,x) ∈
+RV ×V is the second-order derivatives of the loss w.r.t to the logits, q = ∂ℓce(t,y)
+∂t
+
+t=f(θ,x) ∈RV is the
+first-order derivatives of the loss w.r.t to the logits, and Jθθf(θ, x) is the second-order derivatives
+of the multi-variate function f(θ, x) w.r.t θ, viewed as a linear map from RV to Rd×d, where d is the
+dimension of the parameter θ.
+In the context of neural networks, past works have found that the second term Jθθf(θ, x)[q] in
+Equation 8 is often relative smaller than the first term Jθf(θ, x) · S · Jθf(θ, x)⊤(Sankar et al., 2021),
+which is often referred to as the Gauss-Newton matrix (Dennis Jr & Schnabel, 1996; Ortega &
+Rheinboldt, 2000; Schraudolph, 2002; Chen, 2011) and used as pre-conditioners in second-order
+optimizers (Botev et al., 2017; Martens, 2020; Gargiani et al., 2020). Following this line of work, we
+build an unbiased estimator for the diagonal of the Gauss-Newton matrix, which is a biased estimator
+for the diagonal of the Hessian.
+We first claim that S only depends f(θ, x) but not y, even though the loss depends on y.2 Thus,
+S = ∂2ℓce(t,ˆy)
+∂t2
+
+t=f(θ,x) for any ˆy ∈{1, . . . , V }, which implies that S = Eˆy∼p(θ,x)
+
+∂2ℓce(t,ˆy)
+∂t2
+
+t=f(θ,x)
+
+.
+Because ℓce(t, y) is the negative log-probability of the probabilistic model defined by the categorical
+distribution Cat(t) with parameter t, by Bartlett’s second identity (Bartlett, 1953), we have that,
+S =
+E
+ˆy∼Cat(t)
+∂2ℓce(t, ˆy)
+∂t2
+
+=
+E
+ˆy∼Cat(t)
+"
+∂ℓce(t, ˆy)
+∂t
+∂ℓce(t, ˆy)
+∂t
+⊤#
+,
+(9)
+where the first equality holds for t = f(θ, x) and the second equality holds for all t by Bartlett’s
+second identity. Therefore, the Gauss-Newton matrix satisfies
+2Denote by p(θ, x) = softmax(f(θ, x)) ∈RV the probability vector obtained by applying softmax on the logits. Indeed,
+a simple derivation shows that S = diagonal(p(θ, x)) −p(θ, x)p(θ, x)⊤, where diagonal(p(θ, x)) is the matrix with the
+vector p(θ, x) residing on the diagonal. In fact, this is a general property of exponential families—the Hessian of the
+negative log-likelihood of any exponential family distribution only depends on the parameters of that exponential family,
+but not on the example on which the likelihood is evaluated.
+7
+
+Jθf(θ, x) · S · Jθf(θ, x)⊤=
+E
+ˆy∼Cat(t)
+"
+Jθf(θ, x)∂ℓce(t, ˆy)
+∂t
+∂ℓce(t, ˆy)
+∂t
+⊤
+Jθf(θ, x)⊤
+#
+=
+E
+ˆy∼Cat(t)
+h
+∇θℓce(f(θ, x), ˆy)∇θℓce(f(θ, x), ˆy)⊤i
+,
+(10)
+which implies that diag(Jθf(θ, x) · S · Jθf(θ, x)⊤) = Eˆy∼Cat(t) [∇θℓce(f(θ, x), ˆy) ⊙∇θℓce(f(θ, x), ˆy)].
+Hence, the quantity ℓce(f(θ, x), ˆy) ⊙∇θℓce(f(θ, x), ˆy) is an unbiased estimator of the Gauss-Newton
+matrix for the Hessian of a one-example loss ℓ(f(θ, x), y).
+Mini-batch version. Given a mini-batch of inputs {(xb, yb)}B
+b=1. The most natural way to build an
+estimator for the diagonal of the Gauss-Newton matrix for the Hessian of the mini-batch loss is
+using
+1
+B
+B
+X
+b=1
+∇ℓce(f(θ, xb), ˆyb) ⊙∇θℓce(f(θ, xb), ˆyb) ,
+(11)
+where ˆyb’s are labels sampled from the model on inputs xb’s respectively. However, as noted
+by Grosse (2022), implementing this estimator is inconvenient under the current auto-differentiation
+frameworks, where the users only have access to the average gradient over a mini-batch (as opposed
+to the individual ones). Fortunately, by the Bartlett’s first identity (Bartlett, 1953) (which generally
+holds for the negative log-likelihood loss of any probabilistic model), we have:
+∀b, Eˆyb∇ℓce(f(θ, xb), ˆyb) = 0 .
+(12)
+Let bL(θ) = 1
+B
+PB
+b=1 ℓce(f(θ, xb), ˆyb) be the mini-batch loss on the sampled labels (as opposed to the
+original labels). Observing that ˆyb’s are independent with each other, we have
+Eˆy′
+bs
+h
+B · ∇θ bL(θ) ⊙∇θ bL(θ)
+i
+= Eˆy′
+bs
+"
+1
+B
+B
+X
+b=1
+∇ℓce(f(θ, xb), ˆyb) ⊙
+B
+X
+b=1
+∇ℓce(f(θ, xb), ˆyb)
+#
+= Eˆy′
+bs
+"
+1
+B
+B
+X
+b=1
+∇ℓce(f(θ, xb), ˆyb) ⊙∇ℓce(f(θ, xb), ˆyb)
+#
+.
+(13)
+Note that the RHS of Equation 13 is the same as the expectation of Equation 11, which, by Equation 10,
+also equals to the diagonal of the Gauss-Newton matrix for the mini-batch loss. Hence, we use
+B · ∇θ bL(θ) ⊙∇θ bL(θ) as the estimator.
+To the best of our knowledge, this estimator of Gauss-Newton matrix was first used in Wei et al.
+(2020). Given the use Bartlett’s first and second identities that are central to the estimator, we call it
+Gauss-Newton-Bartlett (GNB) estimator.
+Comparisons of Hessian estimators. The Hutchinson’s estimator does not assume any structure
+of the loss, but requires a Hessian-vector product. The GNB estimator only estimates the Gauss-
+Newton term but always gives a positive semi-definite (non-negative) diagonal Hessian estimate.
+The PSDness ensures that the pre-conditioned update is always a descent direction (Dennis Jr &
+Schnabel, 1996). The GNB estimator can also be easily extended to the negative log-likelihood loss
+of any exponential family distribution, and be adapted to estimating the trace of the Gauss-Newton
+matrix as in Wei et al. (2020) or efficiently implementing the product of Gauss-Newton matrix with
+a vector. The authors suspect the GNB estimator has a smaller variance than the Hutchinson’s
+estimator, but more empirical and theoretical investigation are needed to support the hypothesis.
+8
+
+3
+Experiments
+We call the algorithm using the Hutchinson’s estimator and the GNB estimator Sophia-H and Sophia-
+G, respectively. We evaluate Sophia on auto-regressive language modeling with GPT-2 (Radford
+et al., 2019) of model sizes ranging from 125M to 770M. Results indicate that Sophia is 2x faster than
+AdamW (Loshchilov & Hutter, 2017) and Lion (Chen et al., 2023) in number of steps, total compute,
+and wall-clock time across all model sizes. Moreover, the scaling law is in favor of Sophia over
+AdamW.
+3.1
+Experimental Setup
+Language modeling. We train autoregressive models on OpenWebText (Gokaslan & Cohen, 2019).
+Following the standard protocol of GPT-2 (Radford et al., 2019), we set the context length to 1024.
+We use decoder-only Transformers (Vaswani et al., 2017) with 125M (small), 355M (medium), and
+770M (large) parameters. Detailed model configurations are deferred to Section B.2.
+Baselines.
+We
+mainly
+compare
+Sophia
+with
+Adam
+with
+decoupled
+weight
+decay
+(AdamW) (Loshchilov & Hutter, 2017) which is the dominantly used optimizer on language mod-
+eling tasks, and Lion (Chen et al., 2023), which is an first-order adaptive optimizer discovered by
+symbolic search. All optimizers are well-tuned. The hyperparameters of AdamW on GPT-2 are
+already well-established in the literature (Radford et al., 2019; Karamcheti et al., 2021). The weight
+decay is set to 0.1. We use β1 = 0.9 and β2 = 0.95. For Lion, we use β1 = 0.95 and β2 = 0.98
+following Chen et al. (2023). Although Chen et al. (2023) suggests using 0.1 times the learning rate
+(LR) of AdamW for vision tasks, we find out the LR should be larger on LMs by a grid search. The
+LR of Sophia-H is set to the LR of AdamW /ρ (Section B.1).
+Implementation. We set batch size to 480, and use cosine LR schedule with the final LR equal to
+0.05 times the peak LR, following Rae et al. (2021). We use the standard gradient clipping (by norm)
+threshold 1.0. We adopt a fixed 2k steps of LR warm-up. For Sophia, we use β1 = 0.96, β2 = 0.99,
+ϵ =1e-12 and update diagonal Hessian every 10 steps. For Sophia-H, we use ρ = 0.01, and only
+a subset of 32 examples from the mini-batch to calculate the diagonal Hessian to further reduce
+overhead. For Sophia-G, we use ρ = 20, and use a subset of 240 examples from the mini-batch to
+calculate the diagonal Gauss-Newton. We implement the algorithms in PyTorch (Paszke et al., 2019)
+and train all the models in bfloat16. The 125M and 355M models are trained on A5000 GPUs, while
+the 770M models are trained on A100 GPUs.
+Evaluation. We pre-train the models with each optimizer for 100K, 200K, or 400K steps to compare
+the speed. Note that, as is standard, the LR schedule depends on the total pre-specified target
+number of steps, as shown in Figure 5 (a). This makes the loss curve of the same optimizer different
+for various total numbers of steps because the LR schedule with fewer total steps decays the LR
+earlier. For example, the 200K runs in Figure 5 (b) are not the continuation of the 100K runs.
+We primarily evaluate the models with their log perplexity on OpenWebText and plot the loss
+curves. We also report in-context learning results (with 2-shot exemplars and greedy decoding) on
+SuperGLUE (Wang et al., 2019). We average the results of 5 prompts (Section B.3).
+3.2
+Results
+Figure 4 illustrates the validation loss curve (token-level log perplexity) on OpenWebText with the
+same number of steps (100K). Our method consistently achieves better validation loss than AdamW
+and Lion. As the model size grows, the gap between Sophia and baselines also becomes larger.
+Sophia-H and Sophia-G both achieve a 0.04 smaller validation loss on the 355M model (Figure 4 (b)).
+9
+
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+2.9
+3.0
+3.1
+3.2
+3.3
+Validation Loss
+(a) GPT-2 Small (125M)
+AdamW
+Lion
+Sophia-H
+Sophia-G
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+2.6
+2.7
+2.8
+2.9
+3.0
+3.1
+3.2
+Validation Loss
+(b) GPT-2 Medium (355M)
+AdamW
+Lion
+Sophia-H
+Sophia-G
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+2.5
+2.6
+2.7
+2.8
+2.9
+3.0
+3.1
+3.2
+Validation Loss
+(c) GPT-2 Large (770M)
+AdamW
+Sophia-H
+Figure 4: Validation loss on OpenWebText with 100K steps. (a) GPT-2 Small (125M). Adam: 2.921, Lion: 2.924, Sophia-H:
+2.901, Sophia-G: 2.895 (b) GPT-2 Medium (355M). Adam: 2.691, Lion: 2.678, Sophia-H: 2.645. (c) GPT-2 Large (770M).
+Adam: 2.613, Sophia-H: 2.559.
+0K
+100K
+200K
+300K
+400K
+Number of Steps
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Scheduler Coefficient
+(a) Learning Rate Schedules
+Total steps: 100K
+Total steps: 200K
+Total steps: 400K
+0.0
+59.75
+119.5
+179.25
+239.0
+Compute / exaFLOPs
+2.6
+2.8
+3.0
+3.2
+3.4
+Validation Loss
+2x Speedup
+(b) GPT-2 Medium (355M)
+AdamW, 100K
+AdamW, 200K
+Lion, 200K
+Sophia-H, 100K
+Sophia-G, 100K
+0K
+50K
+100K
+150K
+200K
+Number of Steps
+2.9
+3.0
+3.1
+3.2
+3.3
+Validation Loss
+2x Speedup
+(c) GPT-2 Small (125M)
+AdamW, 100K
+AdamW, 200K
+Sophia-H, 100K
+Sophia-G, 100K
+Figure 5: Comparison of numbers of steps to reach the same validation loss on OpenWebText. (a)
+Learning rate schedules. (b) GPT2-medium (355M). GPT2-large (770M) results are in Figure 1(a).
+Across all model sizes, Sophia achieve a 2x speedup over AdamW in terms of the number of steps.
+Sophia-H achieves a 0.05 smaller validation loss on the 770M model (Figure 4, (c)), with the same
+100K steps. This is a significant improvement since according to scaling laws in this regime (Kaplan
+et al., 2020) and results in Figure 5, a improvement in loss of 0.05 is equivalent to 2x improvement in
+terms of number of steps or total compute to achieve the same validation loss.
+Sophia is 2x faster in terms of number of steps, total compute and wall-clock time. The improve-
+ment in validation loss brought by Sophia can be translated into reduction of number of steps or total
+compute. In Figure 1 (a)&(b) and Figure 5, we evaluate the optimizers by comparing the number of
+steps or total compute needed to achieve the same validation loss level. As can be observed in Figure 1
+(a)&(b), Sophia-H and Sophia-G achieve a 2x speedup compared with AdamW and Lion across
+different model sizes.
+The scaling law is in favor of Sophia-H over AdamW. In Figure 1 (c), we plot the validation loss of
+models of different sizes pre-trained for 100K steps. The gap between Sophia and AdamW grows as
+we scale up the models. Moreover, the 540M model trained by Sophia-H has smaller loss than the
+770M model trained by AdamW. The 355M model trained by Sophia-H has comparable loss as the
+540M model trained by AdamW.
+Few-shot Evaluation on Downstream Tasks (SuperGLUE). As shown in Figure 6, as expected,
+the improvement in validation loss transfers to an improvement in downstream task accuracy.
+With the same number of steps in pre-training, GPT-2 medium and GPT-2 large pre-trained with
+Sophia have better few-shot accuracy on most subtasks. Also, models pre-trained with Sophia-H
+have comparable few-shot accuracy as models pre-trained with AdamW for 2x number of steps.
+3.3
+Analysis
+10
+
+BoolQ
+CB
+COPA
+RTE
+Average
+45
+50
+55
+60
+65
+70
+Accuracy %
+Few-shot Evaluation of GPT-2 Medium (355M) on SuperGLUE
+AdamW, 100K
+Lion, 100K
+Sophia, 100K
+AdamW, 200K
+BoolQ
+CB
+COPA
+RTE
+Average
+45
+50
+55
+60
+65
+70
+Accuracy %
+Few-shot Evaluation of GPT-2 Large (770M) on SuperGLUE
+AdamW, 100K
+Sophia, 100K
+AdamW, 200K
+Figure 6: Few-shot evaluation on SuperGLUE. With the same 100K steps, models pre-trained with
+Sophia outperforms models pre-trained with AdamW and Lion on most tasks. Models pre-trained
+with Sophia for 100K steps have comparable performance as models pre-trained with AdamW for
+200K steps.
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+0
+10K
+20K
+30K
+40K
+50K
+60K
+70K
+Number of clipped steps
+(a) GPT-2 Small (125M)
+AdamW
+Lion
+Sophia
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+2.7
+2.8
+2.9
+3.0
+3.1
+3.2
+Validation Loss
+(b) GPT-2 Medium (355M)
+AdamW, w/ tricks, lr = 3e-4
+Lion, w/ tricks, lr = 6e-5
+Sophia, w/o tricks, lr = 3e-2
+AdamW, w/o tricks, lr = 1.5e-4
+AdamW, w/o tricks, lr = 3e-4
+Lion, w/o tricks, lr = 3e-5
+0.9
+0.99
+0.999
+2
+0.02
+0.01
+0.005
+3.39
+3.374
+3.377
+3.388
+3.373
+3.38
+3.382
+3.376
+3.384
+(c) Sensitivity to 
+2 and 
+Figure 7: Sophia improves pre-training stability and is insensitive to hyperparameters. (a) With
+AdamW and Lion, gradient clipping is triggered frequently. With Sophia, gradient clipping rarely
+happens. (b) AdamW and Lion require the trick of re-parameterizing the attention with a tempera-
+ture that is the inverse of the layer index (Karamcheti et al., 2021). The plot shows the largest LR that
+AdamW and Lion without the trick can use to be stable, which is much smaller than with the trick.
+In contrast, Sophia does not need this trick. (c) Sophia is not sensitive to hyperparameter choice.
+Table 1: Wall-clock time and compute.
+Algorithm Model Size T(step) T(Hessian) Compute
+AdamW
+770M
+3.25s
+–
+2550
+Sophia-H
+770M
+3.40s
+0.12s
+2708
+Sophia-G
+770M
+3.42s
+0.17s
+2678
+AdamW
+355M
+1.77s
+–
+1195
+Sophia-H
+355M
+1.88s
+0.09s
+1249
+Sophia-G
+355M
+1.86s
+0.09s
+1255
+Comparison of wall-clock time and amount of com-
+pute. We compare the total compute (TFLOPs) per
+step and the wall-clock time on A100 GPUs in Table 1.
+We report the average time per step (T(step)), the
+time spent in Hessian computation (T(Hessian)) and
+the total compute following Chowdhery et al. (2022).
+Since we calculate the diagonal Hessian estimate with
+a reduced batch size every 10 steps, the computation
+of the Hessian accounts for 6% of the total compute, and the overall wall-clock time overhead is less
+than 5% compared with AdamW. In terms of memory usage, our optimizer has two states, m and h,
+which results in the same memory cost as AdamW.
+Sensitivity to ρ and β2, and transferability of hyperparameters. On a 30M model, we perform a grid
+search to test the sensitivity of Sophia-H to hyperparamters (Figure 7 (c)). All combinations have a
+similar performance, while β2 = 0.99 and ρ = 0.1 performs the best. Moreover, this hyperparameter
+choice is transferable across model sizes. For all the experiments on 125M, 355M and 770M, we use
+the hyperparameters searched on the 30M model, which is ρ = 0.01, β2 = 0.99.
+Training Stability. Sophia-H has better stability in pre-training compared to AdamW and Lion.
+Gradient clipping (by norm) is an important technique in language model pre-training as it avoids
+11
+
+messing up the moment of gradients with one mini-batch gradient computed from rare data (Zhang
+et al., 2020). In practice, the frequency that gradients clipping is triggered is related to the training
+stability—if the gradient is frequently clipped, the iterate can be at a very instable state. We compare
+the proportion of steps where gradient clipping is triggered on GPT-2 small (125M) in Figure 7 (a).
+Although all methods use the same clipping threshold 1.0, Sophia-H seldomly triggers gradient
+clipping, while AdamW and Lion trigger gradient clipping in more than 10% of the steps.
+Another common trick of pre-training deep Transformers is scaling the product of keys and values
+by the inverse of the layer index as implemented by Mistral (Karamcheti et al., 2021) and Hug-
+gingface (Wolf et al., 2020). This stabilizes training and increases the largest possible learning rate.
+Without this trick, the maximum learning rate of AdamW and Lion on GPT-2 medium (355M) can
+only be 1.5e-4, which is much smaller than 3e-4 with the trick (the loss will blow up with 3e-4
+without the trick). Moreover, the loss decreases much slower without the trick as shown in Figure 7
+(b). In all the experiments, Sophia-H does not require scaling the product of keys and values by the
+inverse of the layer index.
+4
+Theoretical Analysis
+This section provides runtime bounds for the deterministic version of Sophia that does not depend
+on the local condition number (the ratio between maximum and minimum curvature at the local
+minimum) and the worst-case curvature (that is, the smoothness parameter), demonstrating the
+advantage of Sophia in adapting to heterogeneous curvatures across parameter dimensions.
+We start with standard assumptions on the differentiability and uniqueness of the minimizer.
+Assumption 4.1. L : Rd →R is a twice continuously differentiable, strictly convex function with θ∗being
+its minimizer. For convenience, we denote λmin(∇2L(θ∗)) by µ.
+The following assumptions state that the Hessian has a certain form of continuity—within a neigh-
+borhood of size R, the ratio between the Hessians, ∇2L(θ′)−1∇2L(θ), is assumed to be bounded by
+a constant 2.
+Assumption 4.2. There exists a constant R > 0, such that
+∀θ, θ′ ∈Rd,
+θ −θ′
+2 ≤R =⇒
+∇2L(θ′)−1∇2L(θ)
+
+2 ≤2
+(14)
+We analyze the convergence rate of the deterministic version of the Sophia on convex functions,
+θt+1 = θt −ηV ⊤
+t clip(Vt(∇2L(θt))−1∇L(θt), ρ),
+(15)
+where ∇2L(θt) = V ⊤
+t ΣtVt is an eigendecomposition of ∇2L(θt). Here, we use the full Hessian as
+the pre-conditioner because the diagonal Hessian pre-conditioner cannot always work for general
+functions which may not have any alignment with the natural coordinate system. Moreover, the
+matrix Vt transforms (∇2L(θt))−1∇L(θt) into eigenspace and thus the clipping can be done element-
+wise in the eigenspace. We do not need the max between Hessian and ϵ in the original version of
+Sophia because the Hessian is always PSD for convex functions. Finally, the matrix V ⊤
+t
+transforms
+the update back to the original coordinate system for the parameter update.
+Theorem 4.3. Under Assumption 4.1 and Assumption 4.2, let η = 1/2, ρ =
+R
+2
+√
+d, the update in Equation 15
+reaches a loss at most ϵ in T ≲d · L(θ0)−min L
+µR2
++ ln µR2
+32dϵ steps.
+The first term in the runtime bound is a burn-in time before reaching a local region, where the error
+decays exponentially fast so that the runtime bound is logarithmic in 1/ϵ as the second term in
+12
+
+the runtime bound shows. We remark that the bound does not depend on the condition number
+(the ratio between the maximum and minimum eigenvalue of Hessian), as opposed to the typical
+dependency on the maximum eigenvalue of the Hessian (or the smoothness parameter) in standard
+analysis of gradient descent in convex optimization (Boyd & Vandenberghe, 2004). Moreover, even
+on simple quadratic functions, the convergence rate of simplified Adam (SignGD) depends on
+the condition number (Appendix E.1). This demonstrates the advantage of Sophia in adapting to
+heterogeneous curvatures across parameter dimensions.
+5
+Related work
+Stochastic Adaptive First-order Optimizers in Deep Learning. The idea of adaptive first-order
+optimizers dates back to RProp (Braun & Riedmiller, 1992). AdaGrad (Duchi et al., 2011) adapted
+the learning rate of features by estimated geometry and assign larger learning rate to infrequent
+features. RMSProp (Hinton et al., 2012) generalized RProp and is capable to work with smaller
+batch sizes. Adam (Kingma & Ba, 2014) improved RMSProp by introducing a running average of
+gradients, and has so far become the dominant approach to solve optimization problems in deep
+learning, especially for training Transformers (Vaswani et al., 2017). Many follow-up works proposed
+variants of Adam (Dozat, 2016; Shazeer & Stern, 2018; Reddi et al., 2019; Loshchilov & Hutter, 2017;
+Zhuang et al., 2020; You et al., 2019). Chen et al. (2023) performed a search over adaptive first-order
+algorithms and discovered Lion, which is a improved version of sign momentum SGD.
+Second-order Optimizers in Deep Learning. Second-order optimizers are believed to have the
+potential to outperform adaptive first-order optimizers. Classical second-order optimization algo-
+rithms pre-condition the gradient with curvature information (Broyden, 1970; Nesterov & Polyak,
+2006; Conn et al., 2000). Over the years, people have developed numerous ways to adapt these
+methods to deep learning. To the best of our knowledge, Becker & Le Cun (1988) was the first to
+use diagonal Hessian as the pre-conditioner. Martens et al. (2010) approximated the Hessian with
+conjugate gradient. Schaul et al. (2013) automatically tuned learning rate of SGD by considering
+diagonal Hessian. Pascanu & Bengio (2013) considered Gaussian Newton’s approximation of Hes-
+sian and Fisher information matrix. Martens & Grosse (2015) and follow-up works (Ba et al., 2017;
+George et al., 2018; Martens et al., 2018) proposed to approximate the Hessian based on the structure
+of neural networks. Yao et al. (2021) proposed to use the square root of the EMA of squared Hessian
+as the pre-conditioner. Despite these progress, the de facto optimization algorithms in modern large
+models are Adam and its variants. Especially previous second-order optimizers have the following
+limidations: (1) they have fundamental computational / memory overhead due to frequent Hessian
+computation, therefore they cannot achieve improvement in wall-clock time (Martens & Grosse,
+2015; Gupta et al., 2018) (2) they are difficult to implement and scale up. None of them can work on
+the scale of GPT-2 (3) they depend heavily on specific model architecture or hardware structures,
+e.g., Anil et al. (2020) offloads hessian computation to CPUs; George et al. (2018) needs ResNets and
+very large batch size to approximate the Fisher information matrix.
+Gradient Clipping. Global gradient clipping has been a standard practice in pre-training language
+models (Merity et al., 2017; Radford et al., 2019; Izsak et al., 2021; Zhang et al., 2022). It helps
+stabilizes training and avoids the effect of rare examples and large gradient noise. Zhang et al.
+(2019); Mai & Johansson (2021) showed that global gradient clipping is faster than standard SGD
+when global smoothness does not hold. Zhang et al. (2020); Crawshaw et al. (2022) found out per-
+coordinate gradient clipping can function as adaptivity. In addition to gradient clipping, Sophia is
+the first to clip the update in second-order methods to avoid the effect of Hessian’s changing along
+the trajectory and the inaccuracy of Hessian approximation.
+13
+
+Optimization Algorithms in LM Pre-training. Adam (Kingma & Ba, 2014) (with decoupled weight
+decay (Loshchilov & Hutter, 2017)) has become the dominant approach for language model pre-
+training (Vaswani et al., 2017; Devlin et al., 2018; Radford et al., 2019; Brown et al., 2020; Zhang
+et al., 2022; Touvron et al., 2023). Different from vision tasks with CNNs (He et al., 2016) where
+models trained with SGD generalize better than models trained with Adam, Adam outperforms
+SGD by a huge margin on language modeling tasks with Transformers (Anil et al., 2019; Liu et al.,
+2020; Kunstner et al., 2023). Raffel et al. (2020); Chowdhery et al. (2022) trained Transformers with
+AdaFactor (Shazeer & Stern, 2018), which is a low rank version of Adam. You et al. (2019) proposed
+to make the update of Adam proportional to per-layer paramter norm to stably train LLMs.
+6
+Conclusion
+We introduced Sophia, a scalable second-order optimizer for language model pre-training. Sophia
+converges in fewer steps than first-order adaptive methods, while maintaining almost the same
+per-step cost. On language modeling with GPT-2, Sophia achieves a 2x speed-up compared with
+AdamW in the number of steps, total compute, and wall-clock time.
+Acknowledgements
+We thank Jeff Z. HaoChen, Neil Band, Garrett Thomas for valuable feedbacks. HL is supported by
+Stanford Graduate Fellowship. The authors would like to thank the support from NSF IIS 2211780.
+References
+Anil, R., Gupta, V., Koren, T., and Singer, Y. Memory efficient adaptive optimization. Advances in
+Neural Information Processing Systems, 32, 2019.
+Anil, R., Gupta, V., Koren, T., Regan, K., and Singer, Y. Scalable second order optimization for deep
+learning. arXiv preprint arXiv:2002.09018, 2020.
+Ba, J., Grosse, R., and Martens, J. Distributed second-order optimization using kronecker-factored
+approximations. In International Conference on Learning Representations, 2017.
+Balles, L. and Hennig, P. Dissecting adam: The sign, magnitude and variance of stochastic gradients.
+In International Conference on Machine Learning, pp. 404–413. PMLR, 2018.
+Bartlett, M. Approximate confidence intervals. Biometrika, 40(1/2):12–19, 1953.
+Becker, S. and Le Cun, Y. Improving the convergence of back-propagation learning with. 1988.
+Bernstein, J., Wang, Y.-X., Azizzadenesheli, K., and Anandkumar, A. signsgd: Compressed optimisa-
+tion for non-convex problems. In International Conference on Machine Learning, pp. 560–569. PMLR,
+2018.
+Botev, A., Ritter, H., and Barber, D. Practical gauss-newton optimisation for deep learning. In
+International Conference on Machine Learning, pp. 557–565. PMLR, 2017.
+Boyd, S. P. and Vandenberghe, L. Convex optimization. Cambridge university press, 2004.
+Bradbury, J., Frostig, R., Hawkins, P., Johnson, M. J., Leary, C., Maclaurin, D., Necula, G., Paszke,
+A., VanderPlas, J., Wanderman-Milne, S., and Zhang, Q. JAX: composable transformations of
+Python+NumPy programs, 2018. URL http://github.com/google/jax.
+14
+
+Braun, H. and Riedmiller, M. Rprop: a fast adaptive learning algorithm. In Proceedings of the
+International Symposium on Computer and Information Science VII, 1992.
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., Neelakantan, A., Shyam, P.,
+Sastry, G., Askell, A., et al. Language models are few-shot learners. Advances in neural information
+processing systems, 33:1877–1901, 2020.
+Broyden, C. G. The convergence of a class of double-rank minimization algorithms 1. general
+considerations. IMA Journal of Applied Mathematics, 6(1):76–90, 1970.
+Chapelle, O., Erhan, D., et al. Improved preconditioner for hessian free optimization. In NIPS
+Workshop on Deep Learning and Unsupervised Feature Learning, volume 201. Citeseer, 2011.
+Chen, P. Hessian matrix vs. gauss–newton hessian matrix. SIAM Journal on Numerical Analysis, 49(4):
+1417–1435, 2011.
+Chen, X., Liang, C., Huang, D., Real, E., Wang, K., Liu, Y., Pham, H., Dong, X., Luong, T., Hsieh, C.-J.,
+et al. Symbolic discovery of optimization algorithms. arXiv preprint arXiv:2302.06675, 2023.
+Chowdhery, A., Narang, S., Devlin, J., Bosma, M., Mishra, G., Roberts, A., Barham, P., Chung, H. W.,
+Sutton, C., Gehrmann, S., et al. Palm: Scaling language modeling with pathways. arXiv preprint
+arXiv:2204.02311, 2022.
+Conn, A. R., Gould, N., and Toint, P. L. Trust-region methods, siam. MPS, Philadelphia, 2000.
+Crawshaw, M., Liu, M., Orabona, F., Zhang, W., and Zhuang, Z. Robustness to unbounded smooth-
+ness of generalized signsgd. arXiv preprint arXiv:2208.11195, 2022.
+Dennis Jr, J. E. and Schnabel, R. B. Numerical methods for unconstrained optimization and nonlinear
+equations. SIAM, 1996.
+Devlin, J., Chang, M.-W., Lee, K., and Toutanova, K. Bert: Pre-training of deep bidirectional
+transformers for language understanding. arXiv preprint arXiv:1810.04805, 2018.
+Dozat, T. Incorporating nesterov momentum into adam. 2016.
+Duchi, J., Hazan, E., and Singer, Y. Adaptive subgradient methods for online learning and stochastic
+optimization. Journal of Machine Learning Research, 12(Jul):2121–2159, 2011.
+Gargiani, M., Zanelli, A., Diehl, M., and Hutter, F. On the promise of the stochastic generalized
+gauss-newton method for training dnns. arXiv preprint arXiv:2006.02409, 2020.
+George, T., Laurent, C., Bouthillier, X., Ballas, N., and Vincent, P. Fast approximate natural gradient
+descent in a kronecker factored eigenbasis. Advances in Neural Information Processing Systems, 31,
+2018.
+Ghorbani, B., Krishnan, S., and Xiao, Y. An investigation into neural net optimization via hessian
+eigenvalue density. In International Conference on Machine Learning, pp. 2232–2241. PMLR, 2019.
+Gokaslan, A. and Cohen, V. Openwebtext corpus, 2019.
+Grosse, R. Neural Network Training Dynamics. 2022.
+Grosse, R. and Martens, J. A kronecker-factored approximate fisher matrix for convolution layers.
+In International Conference on Machine Learning, pp. 573–582. PMLR, 2016.
+15
+
+Gupta, V., Koren, T., and Singer, Y. Shampoo: Preconditioned stochastic tensor optimization. In
+International Conference on Machine Learning, pp. 1842–1850. PMLR, 2018.
+He, K., Zhang, X., Ren, S., and Sun, J. Deep residual learning for image recognition. In Proceedings of
+the IEEE conference on computer vision and pattern recognition, pp. 770–778, 2016.
+Hinton, G., Srivastava, N., and Swersky, K. Neural networks for machine learning lecture 6a
+overview of mini-batch gradient descent. Cited on, 14(8):2, 2012.
+Hutchinson, M. F. A stochastic estimator of the trace of the influence matrix for laplacian smoothing
+splines. Communications in Statistics-Simulation and Computation, 18(3):1059–1076, 1989.
+Izsak, P., Berchansky, M., and Levy, O. How to train bert with an academic budget. arXiv preprint
+arXiv:2104.07705, 2021.
+Kaplan, J., McCandlish, S., Henighan, T., Brown, T. B., Chess, B., Child, R., Gray, S., Radford, A., Wu,
+J., and Amodei, D. Scaling laws for neural language models. arXiv preprint arXiv:2001.08361, 2020.
+Karamcheti, S., Orr, L., Bolton, J., Zhang, T., Goel, K., Narayan, A., Bommasani, R., Narayanan, D.,
+Hashimoto, T., Jurafsky, D., Manning, C. D., Potts, C., Ré, C., and Liang, P. Mistral – a journey
+towards reproducible language model training. https://crfm.stanford.edu/2021/08/
+26/mistral.html, 2021.
+Kingma, D. P. and Ba, J. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980,
+2014.
+Kunstner, F., Chen, J., Lavington, J. W., and Schmidt, M. Noise is not the main factor behind the gap
+between sgd and adam on transformers, but sign descent might be. arXiv preprint arXiv:2304.13960,
+2023.
+Liu, L., Liu, X., Gao, J., Chen, W., and Han, J. Understanding the difficulty of training transformers.
+arXiv preprint arXiv:2004.08249, 2020.
+Loshchilov, I. and Hutter, F. Decoupled weight decay regularization. arXiv preprint arXiv:1711.05101,
+2017.
+Mai, V. V. and Johansson, M. Stability and convergence of stochastic gradient clipping: Beyond
+lipschitz continuity and smoothness. In International Conference on Machine Learning, pp. 7325–7335.
+PMLR, 2021.
+Martens, J. New insights and perspectives on the natural gradient method. The Journal of Machine
+Learning Research, 21(1):5776–5851, 2020.
+Martens, J. and Grosse, R. Optimizing neural networks with kronecker-factored approximate
+curvature. In International conference on machine learning, pp. 2408–2417. PMLR, 2015.
+Martens, J., Ba, J., and Johnson, M. Kronecker-factored curvature approximations for recurrent
+neural networks. In International Conference on Learning Representations, 2018.
+Martens, J. et al. Deep learning via hessian-free optimization. In ICML, volume 27, pp. 735–742,
+2010.
+Merity, S., Keskar, N. S., and Socher, R. Regularizing and optimizing lstm language models. arXiv
+preprint arXiv:1708.02182, 2017.
+16
+
+Nesterov, Y. and Polyak, B. T. Cubic regularization of newton method and its global performance.
+Mathematical Programming, 108(1):177–205, 2006.
+OpenAI. Gpt-4 technical report. arXiv, 2023.
+Ortega, J. M. and Rheinboldt, W. C. Iterative solution of nonlinear equations in several variables. SIAM,
+2000.
+Pascanu, R. and Bengio, Y.
+Revisiting natural gradient for deep networks.
+arXiv preprint
+arXiv:1301.3584, 2013.
+Paszke, A., Gross, S., Massa, F., Lerer, A., Bradbury, J., Chanan, G., Killeen, T., Lin, Z., Gimelshein,
+N., Antiga, L., Desmaison, A., Kopf, A., Yang, E., DeVito, Z., Raison, M., Tejani, A., Chil-
+amkurthy, S., Steiner, B., Fang, L., Bai, J., and Chintala, S.
+Pytorch: An imperative style,
+high-performance deep learning library.
+In Wallach, H., Larochelle, H., Beygelzimer, A.,
+d'Alché-Buc, F., Fox, E., and Garnett, R. (eds.), Advances in Neural Information Processing Systems
+32, pp. 8024–8035. Curran Associates, Inc., 2019. URL http://papers.neurips.cc/paper/
+9015-pytorch-an-imperative-style-high-performance-deep-learning-library.
+pdf.
+Radford, A., Wu, J., Child, R., Luan, D., Amodei, D., Sutskever, I., et al. Language models are
+unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+Rae, J. W., Borgeaud, S., Cai, T., Millican, K., Hoffmann, J., Song, F., Aslanides, J., Henderson, S.,
+Ring, R., Young, S., et al. Scaling language models: Methods, analysis & insights from training
+gopher. arXiv preprint arXiv:2112.11446, 2021.
+Raffel, C., Shazeer, N., Roberts, A., Lee, K., Narang, S., Matena, M., Zhou, Y., Li, W., and Liu, P. J.
+Exploring the limits of transfer learning with a unified text-to-text transformer. Journal of Machine
+Learning Research, 21:1–67, 2020.
+Reddi, S. J., Kale, S., and Kumar, S. On the convergence of adam and beyond. arXiv preprint
+arXiv:1904.09237, 2019.
+Roosta-Khorasani, F. and Ascher, U. Improved bounds on sample size for implicit matrix trace
+estimators. Foundations of Computational Mathematics, 15(5):1187–1212, 2015.
+Sagun, L., Bottou, L., and LeCun, Y. Eigenvalues of the hessian in deep learning: Singularity and
+beyond. arXiv preprint arXiv:1611.07476, 2016.
+Sankar, A. R., Khasbage, Y., Vigneswaran, R., and Balasubramanian, V. N.
+A deeper look at
+the hessian eigenspectrum of deep neural networks and its applications to regularization. In
+Proceedings of the AAAI Conference on Artificial Intelligence, volume 35, pp. 9481–9488, 2021.
+Schaul, T., Zhang, S., and LeCun, Y. No more pesky learning rates. In International conference on
+machine learning, pp. 343–351. PMLR, 2013.
+Schraudolph, N. N. Fast curvature matrix-vector products for second-order gradient descent. Neural
+computation, 14(7):1723–1738, 2002.
+Shazeer, N. and Stern, M. Adafactor: Adaptive learning rates with sublinear memory cost. In
+International Conference on Machine Learning, pp. 4596–4604. PMLR, 2018.
+17
+
+Srivastava, N., Hinton, G., Krizhevsky, A., Sutskever, I., and Salakhutdinov, R. Dropout: a simple
+way to prevent neural networks from overfitting. The journal of machine learning research, 15(1):
+1929–1958, 2014.
+Touvron, H., Lavril, T., Izacard, G., Martinet, X., Lachaux, M.-A., Lacroix, T., Rozière, B., Goyal, N.,
+Hambro, E., Azhar, F., et al. Llama: Open and efficient foundation language models. arXiv preprint
+arXiv:2302.13971, 2023.
+Vaswani, A., Shazeer, N., Parmar, N., Uszkoreit, J., Jones, L., Gomez, A. N., Kaiser, L., and Polosukhin,
+I. Attention is all you need. arXiv preprint arXiv:1706.03762, 2017.
+Wang, A., Pruksachatkun, Y., Nangia, N., Singh, A., Michael, J., Hill, F., Levy, O., and Bowman, S.
+Superglue: A stickier benchmark for general-purpose language understanding systems. Advances
+in neural information processing systems, 32, 2019.
+Wei, C., Kakade, S., and Ma, T. The implicit and explicit regularization effects of dropout. arXiv
+preprint arXiv:2002.12915, 2020.
+Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C., Moi, A., Cistac, P., Rault, T., Louf, R.,
+Funtowicz, M., Davison, J., Shleifer, S., von Platen, P., Ma, C., Jernite, Y., Plu, J., Xu, C., Scao,
+T. L., Gugger, S., Drame, M., Lhoest, Q., and Rush, A. M. Transformers: State-of-the-art natural
+language processing. In Proceedings of the 2020 Conference on Empirical Methods in Natural Language
+Processing: System Demonstrations, pp. 38–45, Online, October 2020. Association for Computational
+Linguistics. URL https://www.aclweb.org/anthology/2020.emnlp-demos.6.
+Yao, Z., Gholami, A., Keutzer, K., and Mahoney, M. W. Pyhessian: Neural networks through the lens
+of the hessian. In 2020 IEEE international conference on big data (Big data), pp. 581–590. IEEE, 2020.
+Yao, Z., Gholami, A., Shen, S., Mustafa, M., Keutzer, K., and Mahoney, M. Adahessian: An adaptive
+second order optimizer for machine learning. In proceedings of the AAAI conference on artificial
+intelligence, volume 35, pp. 10665–10673, 2021.
+You, Y., Li, J., Reddi, S., Hseu, J., Kumar, S., Bhojanapalli, S., Song, X., Demmel, J., Keutzer, K., and
+Hsieh, C.-J. Large batch optimization for deep learning: Training bert in 76 minutes. arXiv preprint
+arXiv:1904.00962, 2019.
+Zhang, J., He, T., Sra, S., and Jadbabaie, A. Why gradient clipping accelerates training: A theoretical
+justification for adaptivity. arXiv preprint arXiv:1905.11881, 2019.
+Zhang, J., Karimireddy, S. P., Veit, A., Kim, S., Reddi, S., Kumar, S., and Sra, S. Why are adaptive
+methods good for attention models? Advances in Neural Information Processing Systems, 33:15383–
+15393, 2020.
+Zhang, S., Roller, S., Goyal, N., Artetxe, M., Chen, M., Chen, S., Dewan, C., Diab, M., Li, X., Lin, X. V.,
+et al. Opt: Open pre-trained transformer language models. arXiv preprint arXiv:2205.01068, 2022.
+Zhuang, J., Tang, T., Ding, Y., Tatikonda, S. C., Dvornek, N., Papademetris, X., and Duncan, J.
+Adabelief optimizer: Adapting stepsizes by the belief in observed gradients. Advances in neural
+information processing systems, 33:18795–18806, 2020.
+18
+
+A
+Additional Experiment Results
+Dynamics of Sophia in training. We measure the ℓ2 norm of the EMA of the diagonal Hessian ht,
+and the proportion of parameters where clipping happens (that is, mt/ht is larger than ρ) during pre-
+training in Figure 8. After the initial stage, the norm of the Hessian steadily grows. The proportion
+of parameters where clipping happens approaches 60%, which corroborates the importance of
+per-coordinate clipping in the algorithm.
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+0.6
+0.7
+0.8
+0.9
+1.0
+Proportion
+Proportion of Paramters with Clipped Update
+Sophia
+0K
+25K
+50K
+75K
+100K
+Number of Steps
+0
+20
+40
+60
+80
+100
+Norm
+Hessian Norm
+Sophia
+Figure 8: Visualization of training statistics. (a) The proportion of parameters whose update is
+clipped. (b) ℓ2 norm of the EMA of Hessian ht.
+Results with different number of steps. Due to space limit, runs with different number of steps
+and their comparison are provided in Figure 9. Across different total number of steps, Sophia
+outperforms AdamW and Lion with a large margin as the main experiments we presented in
+Section 3.2.
+0K
+100K
+200K
+300K
+400K
+Number of Steps
+2.8
+2.9
+3.0
+3.1
+3.2
+3.3
+Validation Loss
+2x Speedup
+(a) GPT-2 Small (125M)
+AdamW
+Lion
+Sophia
+0K
+50K
+100K
+150K
+200K
+Number of Steps
+2.6
+2.8
+3.0
+3.2
+3.4
+Validation Loss
+2x Speedup
+(b) GPT-2 Medium (355M)
+AdamW, 100K
+AdamW, 200K
+Sophia, 100K
+Sophia, 200K
+Figure 9: Results of training for different steps.
+B
+Additional Experiment Details
+B.1
+Hyperparamter Tuning
+The hyperparameters for AdamW on GPT-2 are well-established. Most hyperparameters are used
+across all model sizes: ϵ =1e-6, β1 = 0.9 β2 = 0.95, and λ = 0.1 (weight decay). The gradient
+clipping (by norm) threshold is set to 1.0. The peak learning rate is different for different model
+sizes. Generally, larger models use smaller peak learning rate. For Lion, we use β1 = 0.95 β2 = 0.98
+as suggested by Chen et al. (2023). We also set λ to 0.1 and gradient clipping (by norm) threshold to
+1.0. However, the peak learning rate for Lion on language models is not established. The suggested
+0.1 times peak learning rate of AdamW in vision tasks (Chen et al., 2023) is not optimal for language
+modeling. We perform a grid search of peak learning rate of Lion and provide the result in Table 2.
+19
+
+Table 2: Model Configurations and Peak Learning Rate.
+Acronym
+Size
+d_model n_head depth AdamW lr Lion lr Sophia-H lr Sophia-G lr
+–
+30M
+384
+6
+6
+1e-3
+3e-4
+1e-1
+–
+Small
+125M
+768
+12
+12
+6e-4
+1.5e-4
+6e-2
+1e-5
+Medium
+355M
+1024
+16
+24
+3e-4
+6e-5
+3e-2
+7.5e-6
+–
+540M
+1152
+18
+30
+2.5e-4
+–
+2.5e-2
+–
+Large
+770M
+1280
+20
+36
+2e-4
+–
+2e-2
+–
+We use β1 = 0.96, ϵ =1e-12 and k = 10 for Sophia-H. We first tune ρ and β2 with grid search on
+a 30M model, and directly use ρ and β2 from the 30M model on larger models. Details of this
+tuning is provided in Section 3.3. For Sophia-G we use ρ = 20 and β2 = 0.99. We observe these
+hyperparameters choice work well across all model sizes. The peak learning rate of Sophia-H is set
+to 100 times the peak learning rate of AdamW (1/ρ times the peak learning rate of AdamW). The
+peak learning rate for Sophia-G is also provided in Table 2.
+B.2
+Model and Implementation Details
+We consider three sizes of GPT-2 corresponding to small, medium, and large in Radford et al. (2019).
+We also introduce a 30M model for efficient hyperparameter grid search and a 540M model for
+scaling law visualization. We provide the model specifications in Table 2. We use the nanoGPT
+(https://github.com/karpathy/nanoGPT/) code base. Following nanoGPT, we use GELU
+activations and disable bias and Dropout Srivastava et al. (2014) during pre-training.
+All models are trained on OpenWebText (Gokaslan & Cohen, 2019). The text is tokenized with the
+GPT-2 tokenizer (Radford et al., 2019). We use the train and validation split from nanoGPT. The
+training set contains 9B tokens, and the validation set contains 4.4M tokens.
+We observed AdamW and Lion does not perform well on 355M and 770M standard transformers.
+The iterates become unstable when the learning rate is close to the choice of Radford et al. (2019). We
+introduce scaling attention by the inverse of layer index to address this issue following Karamcheti
+et al. (2021); Wolf et al. (2020). Note that Sophia does not need this trick as mentioned in Section 3.3.
+We use distributed data parallel with gradient accumulation to enable a batch size of 480. All models
+are trained with bfloat16. The 125M and 355M models are trained on machines with 10 A5000 GPUs,
+while the 770M models are trained on an AWS p4d.24xlarge instance with 8 A100 GPUs.
+B.3
+Downtream Evaluation
+We perform few-shot evaluation of the models on 4 subtasks of SuperGLUE. We use 2-shot prompting
+and greedy decoding. The prompt consists of an instruction followed by two examples. The
+examples are sampled from the train split while we report the accuracy on validation split averaged
+over 5 selection of exemplars. Prompts for each subtask are illustrated in Figure 10.
+20
+
+The context is a passages containing some information. Given a question about the context, use the information to 
+answer the question with either 'Yes' or 'No’. 
+Context: 3-way lamp -- The center contact of the bulb typically connects to the medium-power filament, and the 
+ring connects to the low-power filament. Thus, if a 3-way bulb is screwed into a standard light socket that has only 
+a center contact, only the medium-power filament operates. In the case of the 50 W / 100 W / 150 W bulb, putting 
+this bulb in a regular lamp socket will result in it behaving like a normal 100W bulb. Question: do 3-way light bulbs 
+work in any lamp 
+Answer: Yes
+Context: Perfume: The Story of a Murderer (film) -- Perfume: The Story of a Murderer is a 2006 German period 
+psychological crime thriller film directed by Tom Tykwer and starring Ben Whishaw, Alan Rickman, Rachel Hurd-
+Wood, and Dustin Hoffman. Tykwer, with Johnny Klimek and Reinhold Heil, also composed the music. The 
+screenplay by Tykwer, Andrew Birkin, and Bernd Eichinger is based on Patrick Süskind's 1985 novel Perfume. Set in 
+18th century France, the film tells the story of Jean-Baptiste Grenouille (Whishaw), an olfactory genius, and his 
+homicidal quest for the perfect scent. Question: is the film perfume based on a true story 
+Answer: No
+Given a premise and a hypothesis, answer whether the 
+hypothesis logically follows from the premise with 'True' or 
+'False' or 'Neither’. 
+Context: B: She says that when her husband died oh, that my 
+uncle had said that he would never put her in a rest home. So
+it's kind of, uh, I don't know. I mean, I don't think my parents 
+would but she is getting pretty bad like she has to have like a 
+little toilet right by her bed and, it's, A: Uh-huh. B: and my mom 
+has to take care of her pretty much so it gets, I don't know. it's a 
+hard decision, but I don't think I would do it to my parents 
+personally. Question: she would do it to her parents 
+Answer: No 
+Context: B: No, it was, I didn't like the way it ended. A: I know, 
+well the only reason I know whxy it ended is on Arsenio Hall 
+one night, Christopher Reeves told, that, you know, B: Uh-huh. 
+A: I can't believe they killed them. Question: they killed them 
+Answer: Yes
+Choose the correct ending for the context. 
+Choice1: the woman kissed him. 
+Choice2: the woman made him blush. 
+Context: The man had lipstick on his cheek because
+Answer: Choice1 
+Choice1: i attended a yoga class. 
+Choice2: i bought fruits and vegetables. 
+Context: I made a resolution to eat a healthy diet so 
+Answer: Choice2
+Given a premise and a hypothesis, answer whether the hypothesis follows from the premise with 'Yes' or ‘No’. 
+Context: The Bank of Italy, the ultimate arbiter of Italian banking mergers, has been engulfed by scandal since 
+police wire taps revealed Fazio and his wife advised a local banker in a bid for Bank Antonveneta against Dutch bank 
+ABN AMRO. 
+Question: A local banker bids for Bank Antonveneta. 
+Answer: Yes 
+Context: The Statue of Liberty was reopened to the public on July 5 after its extensive refurbishing. 1986 is a 
+common year starting on Wednesday of the Gregorian calendar.
+Question: The Statute of Liberty was built in 1986. 
+Answer: None
+BoolQ
+CB
+COPA
+RTE
+Figure 10: Prompts for SuperGLUE downstream evaluation.
+C
+Amount of compute
+We train the 125M and 355M models on A5000 GPUs and the 770M models on A100 GPUs. The
+total amount of compute spent on all experiments is about 6000 hours on A100s and 10000 hours on
+A5000s. This amounts to 4.38e21 FLOPs.
+D
+Limitations
+Scaling up to larger models and datasets. Although Sophia demonstrates scalability up to 770M
+models and OpenWebText, and there is no essential constraints from further scaling up, we do not
+compare with AdamW and Lion on larger models and datasets due to limited resources. We believe
+Sophia is faster than AdamW and Lion on larger models given the improvement in scaling laws and
+better pre-training stability.
+Holistic downstream evaluation. We evaluate pre-trained checkpoints on 4 SuperGLUE subtasks,
+which only demonstrates the improvement in downstream performance several datasets. While a
+holistic evaluation of language models itself is an open research topic, better downstream evaluation
+is still important. The limitation in downstream evaluation is also due to the limited model size,
+because language models at this scale do not have enough capabilities such as in-context learning,
+and mathematical reasoning.
+Evaluation on other domains. While this paper focuses on optimizers for large language modeling,
+a more general optimizer should also be evaluated in other domains such as computer vision,
+reinforcement learning, and multimodel tasks. Due to the limitation of computation resources, we
+leave the application to other domains and models to future works.
+21
+
+E
+Theoretical Analyses: Details of Section 4
+Theorem 4.3 is a direct combination of the Lemma E.10 (Descent Lemma), Lemma E.9 and
+Lemma E.11. In the analysis, there will be two phases. In the first phase decrease loss to µρ2
+8
+in 8 L(θ(0))−min L
+ηµρ2
+steps. In the second phase, there will be an exponential decay of error.
+Lemma E.1. Under Assumption 4.1, we have that L(θ) →∞whenever ∥θ∥2 →∞.
+Proof of Lemma E.1. By convexity of L, we have ∀θ ∈Rd with ∥θ −θ∗∥2 ≥1,
+1
+∥θ −θ∗∥2
+L(θ) + ∥θ −θ∗∥2 −1
+∥θ −θ∗∥2
+L(θ∗) ≥L(θ∗+
+θ −θ∗
+∥θ −θ∗∥2
+) ≥
+min
+∥¯θ∥2=1
+L(θ∗+ ¯θ).
+(16)
+Since L is strictly convex, ∆≜min∥¯θ∥2=1 L(θ∗+ ¯θ) −L(θ∗) > 0. Thus we conclude that
+L(θ) ≥∥θ −θ∗∥2 ∆+ L(θ∗) ≥(∥θ∥2 −∥θ∗∥2)∆+ L(θ∗).
+(17)
+Therefore when ∥θ∥2 →∞, L(θ) →∞as well.
+Note that we don’t assume the Hessian of loss is Lipschitz. Assumption 4.2 only assumes the
+Hessian in a neighborhood of constant radius only differs by a constant in the multiplicative sense.
+Lemma E.2. For any θ ∈Rd satisfying L(θ) −min L ≤µR2
+4 , it holds that ∥θ −θ∗∥2 ≤2
+q
+L(θ)−min L
+µ
+≤R.
+Proof of Lemma E.2. We will prove by contradiction. Suppose there exists such θ with L(θ) ≤µR2
+4
+but
+∥θ −θ∗∥2 > 2
+q
+L(θ)−min L
+µ
+. We consider θ′ ≜θ∗+
+q
+2L(θ)
+µ
+·
+θ−θ∗
+∥θ−θ∗∥2 . Since θ′ is between θ and θ∗and
+that L is strictly convex, we know that L(θ′) < L(θ). However, by Taylor expansion on function
+f(t) ≜L(θ∗+ t(θ′ −θ∗)), we have that
+f(1) = f(0) + f′(0) + f′′(t)
+2
+,
+for some t ∈[0, 1].
+(18)
+Note that ∥θ′ −θ∗∥2 ≤∥θ −θ∗∥2 ≤R, by Assumption 4.2 and Assumption 4.1, we have f′′(t) =
+(θ′−θ∗)⊤∇2L(tθ′+(1−t)θ∗)(θ′−θ∗) ≥1
+2(θ′−θ∗)⊤∇2L(θ∗)(θ′−θ∗) ≥µ
+2 ∥θ′ −θ∗∥2
+2 = 2(L(θ)−min L)).
+Also note that f(1) = L(θ′), f(0) = L(θ∗) and f′(0) = 0, we conclude that L(θ′)−L(θ∗) ≥L(θ)−L(θ∗),
+namely (θ′) ≥L(θ). Contradiction!
+Lemma E.3. For any θ ∈Rd satisfying that ∥∇L(θ)∥2 ≤Rµ
+2 , it holds that ∥θ −θ∗∥2 ≤2∥∇L(θ)∥
+µ
+≤R.
+Proof of Lemma E.3. We
+will
+prove
+by
+contradiction.
+We
+consider
+function
+f(t)
+≜
+D
+θ−θ∗
+∥θ−θ∗∥2 , ∇L(θ∗+ t ·
+θ−θ∗
+∥θ−θ∗∥2 )
+E
+. Because of the strict convexity of L, f is a strict monotone increasing
+function. If ∥θ −θ∗∥> 2∥∇L(θ)∥
+µ
+but ∥∇L(θ)∥2 ≤Rµ
+2 , then we have f(R) < f(∥θ −θ∗∥2) ≤∥∇L(θ)∥2.
+On the other hand, by Assumption 4.2 and Assumption 4.1, f′(t) ≥
+µ
+2 for t ∈[0, R].
+Thus
+f(R) ≥f(0) +
+R 2∥∇L(θ)∥
+µ
+t=0
+f′(t)dt = ∥∇L(θ)∥. Contradiction!
+Lemma E.4. For any θ ∈Rd, the following differential equation has at least one solution on interval [0, 1]:
+dθ(t)
+dt
+= −(∇2L(θ(t)))−1∇L(θ),
+θ(0) = θ,
+(19)
+and the solution satisfies that ∇L(θ(t)) = (1 −t)∇L(θ) for all t ∈[0, 1] and θ(0) = θ∗.
+22
+
+Proof of Lemma E.4. Since ∇2L is continuous and positive definite by Assumption 4.1 , (∇2L)−1 is
+continuous and thus the above ODE (44) has a solution over interval [0, T) for some positive T and
+we let Tmax be the largest positive number such that the solution exists (or Tmax = ∞). Now we
+claim Tmax ≥1, otherwise ∥θ(t) −θ∗∥2 must diverge to infinity when t →Tmax. However, for any
+t ≤1, we have
+d∇L(θ(t))
+dt
+= −∇L(θ),
+(20)
+which implies that ∇L(θ(t)) = (1 −t)∇L(θ) for all t ∈[0, 1]. Therefore,
+dL(θ(t))
+dt
+= −(∇L(θ(t)))⊤(∇2L(θ(t)))−1∇L(θ) = (1 −t)(∇L(θ))⊤(∇2L(θ(t)))−1∇L(θ) ≤0.
+(21)
+Thus L(θ(t)) ≤L(θ(0)). By Lemma E.1, we know that ∥θ(t)∥remains bounded for all t ∈[0, Tmax],
+thus Tmax ≥1. Note that θ(1) has zero gradient, θ(1) must be θ∗. This completes the proof.
+Lemma E.5. For any θ ∈Rd satisfying (1) L(θ) −min L ≤µR2
+16 or (2) ∥∇L(θ)∥2 ≤Rµ
+4 , it holds that
+L(θ) −min L ≤∇L(θ)⊤(∇2L(θ))−1∇L(θ) ≤4(L(θ) −min L).
+(22)
+Proof of Lemma E.5. Let {θ(t)}1
+t=0 be the solution of Equation 44. We know that ∇L(θ(t)) = (1 −
+t)∇L(θ) for all t ∈[0, 1] and that θ(1) = θ∗by Lemma E.4. For case (1), by Lemma E.2, we
+know that for any t ∈[0, 1], ∥θ(t) −θ∗∥2 ≤R/2. For case (2), by Lemma E.3, we know that
+for any t ∈[0, 1], ∥θ(t) −θ∗∥2 ≤R/2. Thus in both two cases, ∥θ(t) −θ∥2 = ∥θ(t) −θ(0)∥2 =≤
+∥θ(t) −θ∗∥+ ∥θ(0) −θ∗∥≤R. By Assumption 4.2, it holds that
+2(∇2L(θ))−1 ⪰(∇2L(θ(t)))−1 ⪰1
+2(∇2L(θ))−1.
+(23)
+for all t ∈[0, 1]. Therefore, we have that
+L(θ) −min L = L(θ(0)) −L(θ(1)) =
+Z 1
+t=0
+(∇L(θ(t)))⊤(∇2L(θ(t)))−1∇L(θ)
+=
+Z 1
+t=0
+(1 −t)(∇L(θ))⊤(∇2L(θ(t)))−1∇L(θ).
+(24)
+The proof is completed by plugging Equation 23 into Equation 24 and noting that
+R 1
+t=0(1 −t) =
+1/2.
+Lemma E.6. For any θ ∈Rd satisfying (1) L(θ) −min L ≤µR2
+4
+or (2) ∥∇L(θ)∥2 ≤Rµ
+2 , it holds that
+L(θ) −min L ≤µ−1 ∥∇L(θ)∥2
+2
+(25)
+Proof of Lemma E.6. The proof of Lemma E.6 is almost the same as that of Lemma E.5 and thus
+omitted.
+Lemma E.7. For any θ ∈Rd satisfying L(θ) −min L ≤µR2
+16 , it holds that
+(∇2L(θ))−1∇L(θ)
+
+2 ≤
+s
+8(L(θ) −min L)
+µ
+.
+(26)
+23
+
+Proof of Lemma E.7. By Lemma E.2, we have that ∥θ −θ∗∥2 ≤R. By Assumption 4.2, we have
+∇2L(θ) ⪰1
+2∇2L(θ∗) ⪰µ
+2Id. By Lemma E.5, we have that
+4(L(θ) −min L) ≥∇L(θ)⊤(∇2L(θ))−1∇L(θ)
+(27)
+≥∇L(θ)⊤(∇2L(θ))−1∇2L(θ)(∇2L(θ))−1∇L(θ)
+(28)
+≥µ
+2
+∇L(θ)⊤(∇2L(θ))−1
+2
+2 .
+(29)
+This completes the proof.
+Lemma E.8. For any θ ∈Rd satisfying that
+((∇2L(θ))−1∇L(θ)
+
+2 ≤R
+2 , it holds that
+L(θ) −min L ≤∇L(θ)⊤(∇2L(θ))−1∇L(θ) ≤4(L(θ) −min L).
+(30)
+Proof of Lemma E.8. Let {θ(t)}1
+t=0 be the solution of Equation 44 and we claim that for all t ∈[0, 1],
+∥θ(t) −θ∥2 ≤R. Otherwise, let T be the smallest positive number such that ∥θ(T) −θ∥2 = R. Such
+T exists because ∥θ(t) −θ∥2 is continuous in t and ∥θ(0) −θ∥2 = 0. We have that
+R = ∥θ(T) −θ(0)∥2 ≤
+Z T
+t=0
+
+dθ(t)
+dt
+
+2
+dt
+(31)
+=
+Z T
+t=0
+((∇2L(θ(t)))−1∇L(θ)
+
+2 dt
+(32)
+≤
+Z T
+t=0
+(∇2L(θ(t)))−1∇2L(θ)
+
+2
+((∇2L(θ))−1∇L(θ)
+
+2 dt
+(33)
+≤2
+Z T
+t=0
+((∇2L(θ))−1∇L(θ)
+
+2 dt
+(34)
+≤2T R
+2 = RT,
+(35)
+which implies T = 1. Here in Equation 34, we use Assumption 4.2. Thus we conclude that for all
+t ∈[0, 1], ∥θ(t) −θ∥2 ≤R. By Assumption 4.2, it holds that
+2(∇2L(θ))−1 ⪰(∇2L(θ(t)))−1 ⪰1
+2(∇2L(θ))−1.
+(36)
+Therefore, we have that
+L(θ) −min L = L(θ(0)) −L(θ(1)) =
+Z 1
+t=0
+(∇L(θ(t)))⊤(∇2L(θ(t)))−1∇L(θ)
+=
+Z 1
+t=0
+(1 −t)(∇L(θ))⊤(∇2L(θ(t)))−1∇L(θ).
+(37)
+The proof is completed by plugging Equation 36 into Equation 37 and noting that
+R 1
+t=0(1 −t) =
+1/2.
+Lemma E.9. If ρ ≤
+R
+2
+√
+d, then for any ∆≤Rρµ
+10 and any θ ∈Rd satisfying
+d
+X
+i=1
+min{ρ
+v⊤
+i ∇L(θ)
+ , σ−1
+i
+v⊤
+i ∇L(θ)
+
+2
+} ≤∆,
+(38)
+24
+
+where ∇2L(θ) = V ⊤ΣV is the eigendecomposition of ∇2L(θ), vi is the ith row of V and Σ =
+diag(σ1, . . . , σd), it holds that
+L(θ) −min L ≤∆+ 25∆2
+ρ2µ
+(39)
+In particular, if we set ∆≜µρ2
+20 , we have L(θ) −min L ≤µρ2
+8 .
+Proof of Lemma E.9. Let Iθ ≜{i ∈[d] |
+v⊤
+i ∇L(θ)
+ σ−1
+i
+≤ρ} be the set of indices where clipping does
+not happen. Then we have that
+X
+i∈Iθ
+σ−1
+i
+v⊤
+i ∇L(θ)
+
+2
+≤∆
+(40)
+X
+i/∈Iθ
+ρ
+v⊤
+i ∇L(θ)
+ ≤∆
+(41)
+Now we consider a new strictly convex loss function in R|Iθ|, which is L restricted on the space of
+{θ + P
+i∈Iθ w[i]vi | w ∈R|Iθ|}, that is, Lθ(w) = L(θ + P
+i∈Iθ w[i]vi). This new loss function Lθ clearly
+satisfy Assumption 4.2 since it is a restriction of L into some subspace of Rd. By Lemma E.1, we
+know that infw Lθ(w) can be attained and we denote it by w∗. By Assumption 4.1, we know that Lθ
+is strictly convex and thus ∇2Lθ(w) ≻0, which means Assumption 4.1 also holds for Lθ.
+Next we will apply Lemma E.8 on Lθ at w = 0. We use VIθ ∈R|I|×d to denote the submatrix of V
+containing rows in I for any I ⊂[d]. One can verify by chain rule that ∇Lθ(w) = VIθ∇L(θ + V ⊤
+Iθ w)
+and that ∇2Lθ(w) = VIθ∇2L(θ + V ⊤
+Iθ w)V ⊤
+Iθ . Thus we have that
+(∇2Lθ(0))−1∇Lθ(0) = VIθ(∇2L(θ))−1∇L(θ).
+(42)
+By the definition of Iθ, we know that
+VIθ(∇2L(θ))−1∇L(θ)
+ ∞≤ρ. Thus
+(∇2Lθ(0))−1∇Lθ(0)
+
+2 ≤
+√
+d
+VIθ(∇2L(θ))−1∇L(θ)
+
+∞=
+√
+d · ρ ≤R
+2 . Thus we can apply Lemma E.8 on Lθ at w = 0 and
+conclude that
+Lθ(0) −Lθ(w∗) ≤∇Lθ(0)⊤(∇2Lθ(0))−1∇Lθ(0) =
+X
+i∈Iθ
+σ−1
+i
+v⊤
+i ∇L(θ)
+
+2
+≤∆
+(43)
+Thus L(θ) −L(θ + V ⊤
+Iθ w∗) = Lθ(0) −Lθ(w∗) ≤∆.
+It remains to show that L(θ + V ⊤
+Iθ w∗) −L(θ∗) ≤25∆2
+ρ2µ . To do so, our strategy is to first show that
+∇L(θ + V ⊤
+Iθ w∗)
+
+2 is small and then to use Lemma E.6. We will use Ic
+θ to denote the complement
+of Iθ in [d] and VIc
+θ ∈R(d−|Iθ|)×d to denote the submatrix of V which contains all the rows that do
+not belong to Iθ. Note that w∗is the minimizer of Lθ, we know that VIθ∇L(θ + V ⊤
+Iθ w∗) = 0 and that
+∇L(θ + V ⊤
+Iθ w∗)
+
+2 =
+VIc
+θ∇L(θ + V ⊤
+Iθ w∗)
+
+2.
+Now we consider the following ODE
+dw(t)
+dt
+= −(∇2Lθ(w(t)))−1∇Lθ(0),
+w(0) = 0.
+(44)
+By Lemma E.4, we know this ODE has solution w(t) over interval [0, 1] with w(1) = w∗. With the
+same argument in the proof of Lemma E.8, we know that ∥w(t)∥2 ≤R for all t ∈[0, 1]. Thus we have
+25
+
+for any t ∈[0, 1],
+VIc
+θ
+d∇L(θ + VIθw(t))
+dt
+
+2
+(45)
+=
+VIc
+θ∇2L(θ + VIθw(t))VIθ(∇2Lθ(w(t)))−1∇Lθ(0)
+
+2
+(46)
+=
+VIc
+θ∇2L(θ + VIθw(t))VIθV ⊤
+Iθ (∇2L(θ + VIθw(t)))−1∇L(θ)
+
+2
+(47)
+≤
+VIc
+θ
+p
+∇2L(θ + VIθw(t))
+
+F
+(48)
+·
+
+p
+∇2L(θ + VIθw(t))VIθV ⊤
+Iθ (∇2L(θ + VIθw(t)))−1∇L(θ)
+
+2
+(49)
+For the first term (Equation 48), by Assumption 4.2, we have that
+VIc
+θ
+p
+∇2L(θ + VIθw(t))
+
+2
+F ≤2VIc
+θ∇2L(θ)VIc
+θ = 2
+X
+i/∈Iθ
+σi ≤2
+X
+i/∈Iθ
+v⊤
+i ∇L(θ)
+ρ
+≤2∆
+ρ2 .
+(50)
+For the second term (Equation 49), by Assumption 4.2, we have that
+
+p
+∇2L(θ + VIθw(t))VIθV ⊤
+Iθ (∇2L(θ + VIθw(t)))−1∇L(θ)
+
+2
+2
+(51)
+≤8
+
+p
+∇2L(θ)VIθV ⊤
+Iθ (∇2L(θ))−1∇L(θ)
+
+2
+2
+(52)
+=8∇L(θ)⊤VIθV ⊤
+Iθ (∇2L(θ))−1VIθV ⊤
+Iθ ∇L(θ)
+(53)
+=8
+X
+i∈Iθ
+σ−1
+i
+v⊤
+i ∇L(θ)
+
+2
+≤8∆.
+(54)
+Thus we conclude that
+VIc
+θ
+d∇L(θ+VIθw(t))
+dt
+
+2 ≤4∆
+ρ , which implies that
+∇L(θ + V ⊤
+Iθ w∗)
+
+2 =
+VIc
+θ∇L(θ + V ⊤
+Iθ w∗)
+
+2
+(55)
+=
+VIc
+θ∇L(θ) +
+Z 1
+t=0
+VIc
+θ
+d∇L(θ + VIθw(t))
+dt
+dt
+
+2
+(56)
+≤
+VIc
+θ∇L(θ)
+
+2 +
+Z 1
+t=0
+VIc
+θ
+d∇L(θ + VIθw(t))
+dt
+
+2
+dt
+(57)
+≤∆
+ρ + 4∆
+ρ = 5∆
+ρ .
+(58)
+Applying Lemma E.6, we have that
+L(θ + V ⊤
+Iθ w∗) −min L ≤µ−1 ∇L(θ + V ⊤
+Iθ w∗)
+
+2
+2 = 25∆2
+ρ2µ .
+(59)
+This completes the proof.
+Lemma E.10 (Descent Lemma). For any η, ρ > 0 with ηρ ≤R/
+√
+d, θ ∈Rd and any eigendecomposition
+of ∇2L(θ), where VtV ⊤
+t
+= Id, σt is diagonal ∇2L(θ) = V ⊤ΣV , define
+θ+ ≜θ −ηV ⊤clip(V (∇2L(θ))−1∇L(θ), ρ),
+(60)
+it holds that
+L(θ+) −L(θ) ≤−(η −η2)
+d
+X
+i=1
+min{ρ
+v⊤
+i ∇L(θ)
+ , σ−1
+i
+v⊤
+i ∇L(θ)
+
+2
+},
+(61)
+where vi is the ith row of matrix V .
+26
+
+Proof of Lemma E.10. Let u ≜clip(V (∇2L(θ))−1∇L(θ), ρ). By the definition of clip operation, we
+know that
+V ⊤u
+
+2 = ∥u∥2 ≤
+√
+dρ. Thus we have ∥θ+ −θ∥= η
+V ⊤u
+
+2 ≤ηρ
+√
+d. Define f(t) =
+L(tθ+ + (1 −t)θ). By Assumption 4.2, we know that f′′(t) ≤2f′′(0) for all t ∈[0, 1] and thus
+f(1) = f(0) + f′(0) +
+Z 1
+s=0
+Z s
+t=0
+f′′(s)dsdt ≤f(0) + f′(0) + f′′(0).
+(62)
+It remains to show that
+1. f′(0) = −η Pd
+i=1 min{ρ
+v⊤
+i ∇L(θ)
+ , σ−1
+i
+v⊤
+i ∇L(θ)
+2};
+2. f′′(0) ≤η2 Pd
+i=1 min{ρ
+v⊤
+i ∇L(θ)
+ , σ−1
+i
+v⊤
+i ∇L(θ)
+2};
+First,
+by
+chain
+rule,
+we
+have
+f′(0)
+=
+
+∇L(θ), −ηV ⊤u
+
+=
+⟨V ∇L(θ), −ηu⟩
+=
+−η
+
+V ∇L(θ), clip(Σ−1V ∇L(θ), ρ)
+
+= −η Pd
+i=1 min{ρ
+v⊤
+i ∇L(θ)
+ , σ−1
+i
+v⊤
+i ∇L(θ)
+2}.
+Second, again by chain rule, we have f′′(0) = η2 
+V ⊤u, ∇2L(θ)V ⊤u
+
+= η2 ⟨u, Σu⟩= Pd
+i=1 |ui|2 σi.
+Note that by definition |ui| = min{
+v⊤
+i ∇L(θ)
+ /σi, ρ}, we have |ui|2 σi ≤min{
+v⊤
+i ∇L(θ)
+ /σi, ρ} ·
+v⊤
+i ∇L(θ)
+ /σi · σi = min{
+v⊤
+i ∇L(θ)
+2 /σi, ρ
+v⊤
+i ∇L(θ)
+}, which completes the proof.
+Lemma E.11. If ηρ ≤R/
+√
+d and for some T ∈N, L(θT ) −min L ≤µρ2
+8 , then if holds that for all t ≥T,
+1. θt+1 = θt −η(∇2L(θt))−1∇L(θt);
+2. L(θt) −min L ≤(1 −η(1 −η))t−T (L(θT ) −min L).
+Proof of Lemma E.11. First by Lemma E.10, we have for all t ≥T, (θt)−min L ≤L(θT )−min L ≤µρ2
+8 ,
+therefore by Lemma E.7, we have
+(∇2L(θt))−1∇L(θt)
+
+2 ≤ρ for all t ≥T, which implies clipping
+will not happen. This completes the proof of the first claim.
+For the second claim, by Lemmas E.5 and E.10, we have that
+L(θt+1) −L(θt) ≤−(η −η2)
+d
+X
+i=1
+σ−1
+i
+v⊤
+i ∇L(θt)
+
+2
+(63)
+= −(η −η2)∇L(θt)(∇2L(θt))−1∇L(θt)
+(64)
+≤−η(1 −η)(L(θt) −min L),
+(65)
+which completes the proof.
+E.1
+Lower bound for SignGD on 2-dimensional quadratic loss
+Define Lµ,β : R2 →R as a quadratic function with parameter µ, β as Lµ,β(θ) ≜µ
+2θ2
+[1] + β
+2 θ2
+[2]. We have
+the following lower bound, which shows signGD’s convergence rate has to depend on the condition
+number β/µ.
+Theorem E.12. For any µ, β, ∆, ϵ > 0, suppose there exist a learning rate η and a time T such that for
+all θ0 satisfying that Lµ,β(θ0) ≤∆, signGD reaches loss at most ϵ at step T −1 and T (in the sense that
+Lµ,β(θT ) ≤ϵ and Lµ,β(θT−1) ≤ϵ). Then, T must satisfy T ≥1
+2(
+q
+∆
+ϵ −
+√
+2)
+q
+β
+µ.
+Proof of Theorem E.12. We consider two initialization: θ0 = (0,
+q
+2∆
+β ) and θ′
+0 = (
+q
+2∆
+µ , 0), and let
+θt and θ′
+t be the iterates under the two initializations. For each coordinate i ∈{1, 2}, because
+27
+
+|(θt)[i] −(θt+1)[i]| = η, we have that |(θt)[i]| + |(θt+1)[i]| ≥η. Thus 2ϵ ≥Lµ,β(θT ) + Lµ,β(θT−1) ≥
+β
+2 ((θT )2
+[2] + (θT−1)2
+[2]) ≥βη2
+4 , which implies η ≤
+q
+8ϵ
+β .
+The fact that Lµ,β(θ′
+T ) + Lµ,β(θ′
+T−1) ≤2ϵ implies (θ′
+T )[1] ≤
+q
+4ϵ
+µ . Because SignGD can only move each
+coordinate by η at most, we have (T −1)η ≥
+p
+2∆/µ −
+q
+4ϵ
+µ . Using the fact that η ≤
+q
+8ϵ
+β , we have
+that 2(T −1) ≥(
+q
+∆
+ϵ −
+√
+2)
+q
+β
+µ, which completes the proof.
+28
+

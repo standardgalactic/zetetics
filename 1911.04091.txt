@@ -1,0 +1,3454 @@
+12
+Program Synthesis by Type-Guided Abstraction Refinement
+ZHENG GUO, UC San Diego, USA
+MICHAEL JAMES, UC San Diego, USA
+DAVID JUSTO, UC San Diego, USA
+JIAXIAO ZHOU, UC San Diego, USA
+ZITENG WANG, UC San Diego, USA
+RANJIT JHALA, UC San Diego, USA
+NADIA POLIKARPOVA, UC San Diego, USA
+We consider the problem of type-directed component based synthesis where, given a set of (typed) components
+and a query type, the goal is to synthesize a term that inhabits the query. Classical approaches based on
+proof search in intuitionistic logics do not scale up to the standard libraries of modern languages, which span
+hundreds or thousands of components. Recent graph reachability based methods proposed for languages
+like Java do scale, but only apply to monomorphic data and components: polymorphic data and components
+infinitely explode the size of the graph that must be searched, rendering synthesis intractable. We introduce
+type-guided abstraction refinement (TYGAR), a new approach for scalable type-directed synthesis over poly-
+morphic datatypes and components. Our key insight is that we can overcome the explosion by building a
+graph over abstract types which represent a potentially unbounded set of concrete types. We show how to use
+graph reachability to search for candidate terms over abstract types, and introduce a new algorithm that uses
+proofs of untypeability of ill-typed candidates to iteratively refine the abstraction until a well-typed result is
+found. We have implemented TYGAR in H+, a tool that takes as input a set of Haskell libraries and a query
+type, and returns a Haskell term that uses functions from the provided libraries to implement the query
+type. We have evaluated H+ on a set of 44 queries using a set of popular Haskell libraries with a total of 291
+components. Our results demonstrate that H+ returns an interesting solution within the first five results for
+32 out of 44 queries. Moreover, TYGAR allows H+ to rapidly return well-typed terms, with the median time to
+first solution of just 1.4 seconds.
+1
+INTRODUCTION
+Consider the task of implementing a function firstJust def mbs, which extracts the first non-
+empty value from a list of options mbs, and if none exists, returns a default value def. Rather than
+writing a recursive function, you suspect you can implement it more concisely and idiomatically
+using components from a standard library. If you are a Haskell programmer, at this point you
+will likely fire up Hoogle [Mitchell 2004], the Haskell’s API search engine, and query it with the
+intended type of firstJust, i.e. a →[Maybe a] →a. The search results will be disappointing,
+however, since no single API function matches this type1. In fact, to implement firstJust you
+need a snippet that composes three library functions from the standard Data.Maybe library, like so:
+\def mbs →fromMaybe def (listToMaybe (catMaybes mbs)). Wouldn’t you like a tool that could
+automatically synthesize such snippets from type queries?
+Scalable Synthesis via Graph Reachability. In general, our problem of type-directed component-
+based synthesis, reduces to that of finding inhabitants for a given query type [Urzyczyn 1997].
+1We tested this query at the time of writing with the default Hoogle configuration (Hoogle 4).
+Authors’ addresses: Zheng Guo, UC San Diego, USA, zhg069@ucsd.edu; Michael James, UC San Diego, USA, m3james@
+ucsd.edu; David Justo, UC San Diego, USA, djusto@ucsd.edu; Jiaxiao Zhou, UC San Diego, USA, jiz417@ucsd.edu; Ziteng
+Wang, UC San Diego, USA, ziw329@ucsd.edu; Ranjit Jhala, UC San Diego, USA, jhala@cs.ucsd.edu; Nadia Polikarpova, UC
+San Diego, USA, npolikarpova@ucsd.edu.
+2020. 2475-1421/2020/1-ART12
+https://doi.org/10.1145/3371080
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+arXiv:1911.04091v1  [cs.PL]  11 Nov 2019
+
+12:2
+Z. Guo et al.
+Consequently, one approach is to develop synthesizers based on proof search in intuitionistic logics
+[Augusstson 2005]. However, search becomes intractable in the presence of libraries with hundreds
+or thousands of components. Several papers address the issue of scalability by rephrasing the
+problem as one of reachability in a type transition network (TTN), i.e. a graph that encodes the
+library of components. Each type is represented as a state, and each component is represented as
+a directed transition from the component’s input type to its output type. The synthesis problem
+then reduces to finding a path in the network that begins at the query’s input type and ends at
+the output type [Mandelin et al. 2005]. To model components (functions) that take multiple inputs,
+we need only generalize the network to a Petri net which has hyper-transitions that link multiple
+input states with a single output. With this generalization, the synthesis problem can, once again,
+be solved by finding a path from the query’s input types to the desired output yielding a scalable
+synthesis method for Java [Feng et al. 2017].
+Challenge: Polymorphic Data and Components. Graph-based approaches crucially rely on the
+assumption that the size of the TTN is finite (and manageable). This assumption breaks down in
+the presence of polymorphic components that are ubiquitous in libraries for modern functional
+languages. (a) With polymorphic datatypes the set of types that might appear in a program is
+unbounded: for example, two type constructors [] and Int give rise to an infinite set of types
+(Int, [Int], [[Int]], etc). (b) Even if we bound the set of types, polymorphic components lead to a
+combinatorial explosion in the number of transitions: for example, the pair constructor with the
+type a →b →(a,b) creates a transition from every pair of types in the system. In other words,
+polymorphic data and components explode the size of the graph that must be searched, rendering
+synthesis intractable.
+Type-Guided Abstraction Refinement. In this work we introduce type-guided abstraction refine-
+ment (TYGAR), a new approach to scalable type-directed synthesis over polymorphic datatypes
+and components. A high-level view of TYGAR is depicted in Fig. 1. The algorithm maintains an
+abstract transition network (ATN) that finitely overapproximates the infinite network comprising
+all monomorphic instances of the polymorphic data and components. We use existing SMT-based
+techniques to find a suitable path in the compact ATN, which corresponds to a candidate term. If the
+term is well-typed, it is returned as the solution. Due to the overapproximation, however, the ATN
+can contain spurious paths, which correspond to ill-typed terms. In this case, the ATN is refined in
+order to exclude this spurious path, along with similar ones. We then repeat the search with the re-
+fined ATN until a well-typed solution is found. As such, TYGAR extends synthesis using abstraction
+refinement (SYNGAR) [Wang et al. 2018], from the domain of values to the domain of types. TYGAR’s
+support for polymorphism also allows us to handle higher-order components, which take functions
+as input, by representing functions (arrows) as a binary type constructor. Similarly, TYGAR can
+handle Haskell’s ubiquitous type classes, by following the dictionary-passing translation [Wadler
+and Blott 1989], which again, relies crucially on support for parametric polymorphism.
+Contributions. In summary, this paper makes the following contributions:
+1. Abstract Typing. Our first contribution is a novel notion of abstract typing grounded in the
+framework of abstract interpretation [Cousot and Cousot 1977]. Our abstract domain is parameter-
+ized by a finite collection of polymorphic types, each of which abstracts a potentially infinite set of
+ground instances. Given an abstract domain, we automatically derive an over-approximate type
+system, which we use to build the ATN. This is inspired by predicate abstraction [Graf and Saidi
+1997], where the abstract domain is parameterized by a set of predicates, and abstract program
+semantics at different levels of detail can be derived automatically from the domain.
+2. Type Refinement. Our second contribution is a new algorithm that, given a spurious program,
+refines the abstract domain so that the program no longer type-checks abstractly. To this end, the
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:3
+TYGAR
+Abstract 
+reachability
+Type checker
+Refinement
+program
+type
+error
+new 
+abstraction
+path
+no solution
+query
+component 
+library
+initial
+abstraction
+OK
+Fig. 1. Overview of the TYGAR synthesis algorithm.
+algorithm constructs a compact proof of untypeability of the program: it annotates each subterm
+with a type that is just precise enough to refute the program.
+3. H+. Our third contribution is an implementation of TYGAR in H+, a tool that takes as input a
+set of Haskell libraries and a type, and returns a ranked list of straight-line programs that have the
+desired type and can use any function from the provided libraries. To keep in line with Hoogle’s
+user interaction model familiar to Haskell programmers, H+ does not require any user input beyond
+the query type; this is in contrast to prior work on component-based synthesis [Feng et al. 2017; Shi
+et al. 2019], where the programmer provides input-output examples to disambiguate their intent.
+This setting poses an interesting challenge: given that there might be hundreds of programs of a
+given type (including nonsensical ones like head []), how do we select just the relevant programs,
+likely to be useful to the programmer? We propose a novel mechanism for filtering out irrelevant
+programs using GHC’s demand analysis [Sergey et al. 2017] to eliminate terms where some of the
+inputs are unused.
+We have evaluated H+ on a set of 44 queries collected from different sources (including Hoogle
+and StackOverflow), using a set of popular Haskell libraries with a total of 291 components. Our
+evaluation shows that H+ is able to find a well-typed program for 43 out of 44 queries within the
+timeout of 60 seconds. It finds the first well-typed program within 1.4 seconds on average. In 32 out
+of 44 queries, the top five results contains a useful solution2. Further, our evaluation demonstrates
+that both abstraction and refinement are important for efficient synthesis. A naive approach that
+does not use abstraction and instead instantiates all polymorphic datatypes up to even a small depth
+of 1 yields a massive transition network, and is unable to solve any benchmarks within the timeout.
+On the other hand, an approach that uses a fixed small ATN but no refinement works well on simple
+queries, but fails to scale as the solutions get larger. Instead, the best performing search algorithm
+uses TYGAR to start with a small initial ATN and gradually extend it, up to a given size bound,
+with instances that are relevant for a given synthesis query.
+2
+BACKGROUND AND OVERVIEW
+We start with some examples that illustrate the prior work on component-based synthesis that H+
+builds on (Sec. 2.1), the challenges posed by polymorphic components, and our novel techniques
+for addressing those challenges.
+2Unfortunately, ground truth solutions are not available for Hoogle benchmarks; we judge usefulness by manual inspection.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:4
+Z. Guo et al.
+-- | Value stored in the option
+-- or default if the option is empty
+fromMaybe :: α →Maybe α →α
+-- | All values from a list of options
+catMaybes :: List (Maybe α) →List α
+-- | Head of the list
+-- or empty option if the list is empty
+listToMaybe :: List α →Maybe α
+M a
+L a
+a
+L (M a)
+M (M a)
+f<a>
+f<M a>
+l<a>
+l<M a>
+c
+Fig. 2. (left) A tiny component library. (right) A Type Transition Net for this library and query
+a →List (Maybe a) →a. The transitions l<a>, f<a> (resp. l<M a>, f<M a>) correspond to the polymorphic
+instances of the components listToMaybe, fromMaybe at type a (resp. M a).
+2.1
+Synthesis via Type Transition Nets
+The starting point of our work is SyPet [Feng et al. 2017], a component-based synthesizer for Java.
+Let us see how SyPet works by using the example query from the introduction: a →[Maybe a] →a.
+For the sake of exposition, we assume that our library only contains three components listed in
+Fig. 2 (left). Hereafter, we will use Greek letters α, β, . . . to denote existential type variables—i.e. the
+type variables of components, which have to be instantiated by the synthesizer—as opposed to
+a,b, . . . for universal type variables found in the query, which, as far as the synthesizer is concerned,
+are just nullary type constructors. Since SyPet does not support polymorphic components, let us
+assume for now that an oracle provided us with a small set of monomorphic types that suffice
+to answer this query, namely, a, Maybe a, Maybe (Maybe a), [a], and [Maybe a]. For the rest of this
+section, we abbreviate the names of components and type constructors to their first letter (for
+example, we will write L (M a) for [Maybe a]) and refer to the query arguments as x1, x2.
+Components as Petri Nets. SyPet uses a Petri-net representation of the search space, which we
+refer to as the type transition net (TTN). The TTN for our running example is shown in Fig. 2 (right).
+Here places (circles) correspond to types, transitions (rectangles) correspond to components, and
+edges connect components with their input and output types. Since a component might require
+multiple inputs of the same type, edges can be annotated with multiplicities (the default multiplicity
+is 1). A marking of a TTN assigns a non-negative number of tokens to every place. The TTN can
+step from one marking to the next by firing a transition: if the input places of a transition have
+sufficiently many tokens, the transition can fire, consuming those input tokens and producing a
+token in the output place. For example, given the marking in Fig. 2, transition c can fire, consuming
+the token in L (M a) and producing one in L a; however transition f<a> cannot fire as there is no
+token in M a.
+Synthesis via Petri-Net Reachability. Given a synthesis query T1 →. . . →Tn →T, we set the
+initial marking of the TTN to contain one token for each input type Ti, and the final marking to
+contain a single token in the type T. The synthesis problem then reduces to finding a valid path, i.e.
+a sequence of fired transitions that gets the net from the initial marking to the final marking. Fig. 2
+shows the initial marking for our query, and also indicates the final marking with a double border
+around the return type a (recall that the final marking of a TTN always contains a single token
+in a given place). The final marking is reachable via the path [c, l, f], marked with thick arrows,
+which corresponds to a well-typed program f x1 (l (c x2)). In general, a path might correspond
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:5
+to multiple programs—if several tokens end up in the same place at any point along the path—of
+which at least one is guaranteed to be well-typed; the synthesizer can then find the well-typed
+program using explicit or symbolic enumeration.
+2.2
+Polymorphic Synthesis via Abstract Type Transition Nets
+Libraries for modern languages like Haskell provide highly polymorphic components that can be
+used at various different instances. For example, our universe contains three type constructors—a,
+L, and M—which can give rise to infinitely many types, so creating a place for each type is out of
+question. Even if we limit ourselves to those constructors that are reachable from the query types by
+following the components, we might still end up with an infinite set of types: for example, following
+head :: List α →α backwards from a yields L a, L (L a), and so on. This poses a challenge for
+Petri-net based synthesis: which finite set of (monomorphic) instances do we include in the TTN?
+On the one hand, we have to be careful not to include too many instances. In the presence of
+polymorphic components, these instances can explode the number of transitions. Fig. 2 illustrates
+this for the f and l components, each giving rise to two transitions, by instantiating their type
+variable α with two different TTN places, a and Maybe a. This proliferation of transitions is especially
+severe for components with multiple type variables. On the other hand, we have to be careful not
+to include too few instances. We cannot, for example, just limit ourselves to the monomorphic types
+that are explicitly present in the query (a and L (M a)), as this will preclude the synthesis of terms
+that generate intermediate values of some other type, e.g. L a as returned by the component c,
+thereby preventing the synthesizer from finding solutions.
+Abstract Types. To solve this problem, we introduce the notion of an abstract type3, which stands
+for (infinitely) many monomorphic instances. We represent abstract types simply as polymorphic
+types, i.e. types with free type variables. For example, the abstract type τ stands for the set of all
+types, while L τ stands for the set {L t | t ∈Type}. This representation supports different levels of
+detail: for example, the type L (M a) can be abstracted into itself, L (M τ), L τ, or τ.
+Abstract Transition Nets. A Petri net constructed out of abstract types, which we dub an abstract
+transition net (ATN), can finitely represent all types in our universe, and hence all possible solutions
+to the synthesis problem. The ATN construction is grounded in the theory of abstract interpretation
+and ensures that the net soundly over-approximates the concrete type system, i.e. that every well-
+typed program corresponds to some valid path through the ATN. Fig. 3 (2) shows the ATN for
+our running example with places τ, L τ and a. In this ATN, the rightmost f transition takes a
+and τ as inputs and returns a as output. This transition represents the set of monomophic types
+{a →t →a | t ∈Type} and over-approximates the set of instances of f where the first argument
+unifies with a and the second argument unifies with τ (which in this case is a singleton set
+{a →M a →a}). Due to the over-approximation, some of the ATN’s paths yield spurious ill-typed
+solutions. For example, via the highlighted path, this ATN produces the term f x1 (l x2), which is
+ill-typed since the arguments to f have the types a and M (M a).
+How do we pick the right level of detail for the ATN? If the places are too abstract, there are
+too many spurious solutions, leading, in the limit, to a brute-force enumeration of programs. If
+the places are too concrete, the net becomes too large, and the search for valid paths is too slow.
+Ideally, we would like to pick a minimal set of abstract types that only make distinctions pertinent
+to the query at hand.
+Type-Guided Abstraction Refinement. H+ solves this problem using an iterative process we call
+type-guided abstraction refinement (TYGAR) where an initial coarse abstraction is incrementally
+3Not to be confused with existing notions of abstract data type and abstract class. We use “abstract” here is the sense of
+abstract interpretation [Cousot and Cousot 1977], i.e. an abstraction of a set of concrete types.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:6
+Z. Guo et al.
+τ
+f
+2
+c
+l
+τ
+L τ
+a
+f
+2
+f
+f
+l
+c
+τ
+L τ
+a
+L (M τ)
+M (M τ)
+f
+2
+f
+f
+f
+f
+f
+l
+l
+c
+f
+⊥
+⊥
+x1
+τ
+a
+x2
+L τ
+L (M a)
+(1)
+f
+⊥
+⊥
+x2
+τ
+L (M a)
+x1
+a
+a
+f
+⊥
+⊥
+x1
+a
+a
+l
+M (M τ)
+M (M a)
+x2
+L (M τ)
+L (M a)
+(2)
+f
+a
+x1
+a
+l
+M a
+c
+M a
+x2
+L (M a)
+(3)
+Fig. 3. Three iterations of abstraction refinement: ATNs (above) and corresponding solutions (below). Some
+irrelevant transitions are omitted from the ATNs for clarity. Solutions 1 and 2 are spurious, solution 3 is valid.
+Each solution is annotated with its concrete typing (in red); each spurious solution is additionally annotated
+with its proof of untypeability (in blue). These blue types are added to the ATN in the next iteration.
+refined using the information from the type errors found in spurious solutions. Next, we illustrate
+TYGAR using the running example from Fig. 3.
+Iteration 1. We start with the coarsest possible abstraction, where all types are abstracted to
+τ, yielding the ATN in Fig. 3 (1). The shortest valid path is just [f], which corresponds to two
+programs: f x1 x2 and f x2 x1. Next, we type-check these programs to determine whether they
+are valid or spurious. During type checking, we compute the principal type of each sub-term and
+propagate this information bottom-up through the AST; the resulting concrete typing is shown in
+red at the bottom of Fig. 3 (1). Since both candidate programs are ill-typed (as indicated by the
+annotation ⊥at the root of either AST), the current path is spurious. Although we could simply
+enumerate more valid paths until we find a well-typed program, such brute-force enumeration
+does not scale with the number of components. Instead, we refine the abstraction so that this path
+(and hopefully many similar ones) becomes invalid.
+Our refinement uses the type error information obtained while type-checking the spurious
+programs. Consider f x1 x2: the program is ill-typed because the concrete type of x2, L (M a),
+does not unify with the second argument of f, M α. To avoid making this type error in the future,
+we need to make sure that the abstraction of L (M a) also fails to unify with M α. To this end,
+we need to extend our ATN with new abstract types, that suffice to reject the program f x1 x2.
+These new types will update the ATN with new places that will reroute the transitions so that the
+path that led to the term f x1 x2 is no longer feasible. We call this set of abstract types a proof of
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:7
+untypeability of the program. We could use x2’s concrete type L (M a) as the proof, but we want
+the proof to be as general as possible, so that it can reject more programs. To compute a better
+proof, the TYGAR algorithm generalizes the concrete typing of the spurious program, repeatedly
+weakening concrete types with fresh variables while still preserving untypeability. In our example,
+the generalization step yields τ and L τ (see blue annotations in Fig. 3). This general proof also
+rejects other programs that use a list as the second argument to f, such as f x1 (c x2). Adding the
+types from the untypeability proofs of both spurious programs to the ATN results in a refined net
+shown in Fig. 3 (2).
+Iteration 2. The new ATN in Fig. 3 (2) has no valid paths of length one, but has the (highlighted)
+path [l, f] of length two, which corresponds to a single program f x1 (l x2) (since the two tokens
+never cross paths). This program is ill-typed, so we refine the abstraction based on its untypeability,
+as depicted at the bottom of Fig. 3 (2). To compute the proof of untypeability, we start as before, by
+generalizing the concrete types of f’s arguments as much as possible as long as the application
+remains ill-typed, arriving at the types a and M (M τ). Generalization then propagates top-down
+through the AST: in the next step, we compute the most general abstraction for the type of x2
+such that l x2 has type M (M τ). The generalization process stops at the leaves of the AST (or
+alternatively when the type of some node cannot be generalized). Adding the types M (M τ) and
+L (M τ) from the untypeability proof to the ATN leads to the net in Fig. 3 (3).
+Iteration 3. The shortest valid path in the third ATN is [c, l, f], which corresponds to a well-typed
+program f x1 (l (c x2)) (see the bottom of Fig. 3 (3)), which we return as the solution.
+2.3
+Pruning Irrelevant Solutions via Demand Analysis
+Using a query type as the sole input to synthesis has its pros and cons. On the one hand, types
+are programmer-friendly: unlike input-output examples, which often become verbose and cumber-
+some for data other than lists, types are concise and versatile, and their popularity with Haskell
+programmers is time-tested by the Hoogle API search engine. On the other hand, a query type
+only partially captures the programmer’s intent; in other words, not all well-typed programs are
+equally desirable. In our running example, the program \x1 x2 →x1 has the right type, but it is
+clearly uninteresting. Hence, the important challenge for H+ is: how do we filter out uninteresting
+solutions without requiring additional input from the user?
+Relevant Typing. SyPet offers an interesting approach to this problem: they observe that a
+programmer is unlikely to include an argument in a query if this argument is not required for
+the solution. To leverage this observation, they propose to use a relevant type system [Pierce
+2004], which requires each variable to be used at least once, making programs like \x1 x2 →x1
+ill-typed. TTNs naturally enforce relevancy during search: in fact, TTN reachability as described
+so far encodes a stricter linear type system, where all arguments must be used exactly once. This
+requirement can be relaxed by adding special “copy” transitions that consume one token from a
+place and produce two token in the same place.
+Demand Analysis. Unfortunately, with expressive polymorphic components the synthesizer
+discovers ingenious ways to circumvent the relevancy requirement. For example, the terms
+fst (x1, x2), const x1 x2, and fromLeft x1 (Right x2) are all functionally equivalent to x1, even
+though they satisfy the letter of relevant typing. To filter out solutions like these, we use GHC’s
+demand analysis [Sergey et al. 2017] to post-process solutions returned by the ATN and filter out
+those with unused variables. Demand analysis is a whole-program analysis that peeks inside the
+component implementation, and hence is able to infer in all three cases above that the variable x2
+is unused. As we show in Sec. 6, demand analysis significantly improves the quality of solutions.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:8
+Z. Guo et al.
+-- | Function application
+($) :: (α →β) →α →β
+-- | List with n copies of a value
+replicate :: Int →α →[α]
+-- | Fold a list
+foldr :: (α →β →β) →β →[α] →β
+-- | Value stored in the option
+fromJust :: Maybe α →α
+-- | Lookup element by key
+lookup :: Eq α => α →[(α, β)] →Maybe β
+Int
+a
+F τ τ
+L τ
+foldr
+rep
+'$
+$
+a
+L (P a b)
+EqD a
+M b
+b
+l
+fJ
+Fig. 4. (left) A library with higher-order functions and type-class constraints. (center) Fragment of an ATN for
+the query (a →a) →a →Int →a. (right) Fragment of an ATN for the query Eq a => [(a,b)] →a →b.
+2.4
+Higher-Order Functions
+Next we illustrate how ATNs scale up to account for higher-order functions and type classes, using
+the component library in Fig. 4 (left), which uses both of these features.
+Example: Iteration. Suppose the user poses a query (a →a) →a →Int →a, with the in-
+tention to apply a function д to an initial value x some number of times n. Perhaps surpris-
+ingly, this query can be solved using components in Fig. 4 by creating a list with n copies of
+д, and then folding function application over that list with the seed x – that is, via the term
+\g x n →foldr ($) x (replicate n g).
+Can we generate this solution using an ATN? As described so far, ATNs only assign places to
+base (non-arrow) types, and hence cannot synthesize terms that use higher-order components,
+such as the application of foldr to the function ($) above. Initially, we feared that supporting
+higher-order components would require generating lambda terms within the Petri net (to serve as
+their arguments) which would be beyond the scope of this work. However, in common cases like
+our example, the higher-order argument can be written as a single variable (or component). Hence,
+the full power of lambda terms is not required.
+HOF Arguments via Nullary Components. We support the common use case — where higher-
+order arguments are just components or applications of components — simply by desugaring a
+higher-order library into a first-order library supported by ATN-based synthesis. To this end, we
+(1) introduce a binary type constructor F α β to represent arrow types as if they were base types;
+and (2) for each component c :: B1 →... →Bn →B in the original library, we add a nullary
+component 'c :: F B1 (... F Bn B). Intuitively, an ATN distinguishes between functions it calls
+(represented as transitions) and functions it uses as arguments to other functions (represented as
+tokens in corresponding F places).
+Fig. 4 (center) depicts a fragment of an ATN for our example. Note that the ($) component gives
+rise both to a binary transition $, which we would take if we were to apply this component, and
+a nullary transition '$, which is actually taken by our solution, since ($) is used as an argument
+to foldr. Since F is just an ordinary type constructor as far as the ATN is concerned, all existing
+abstraction and refinement mechanisms apply to it unchanged: for example, in Fig. 4 both a →a
+and (a →a) →a →a are abstracted into the same place F τ τ.
+Completeness via Point-Free Style. While our method was inspired by the common use case
+where the higher-order arguments were themselves components, note that with a sufficiently rich
+component library, e.g. one that has representations of the S, K and I combinators, our method
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:9
+is complete as every term that would have required an explicit lambda-subterm for a function
+argument, can now be written in a point-free style, only using variables, components and their
+applications.
+2.5
+Type classes
+Type classes are widely used in Haskell to support ad-hoc polymorphism [Wadler and Blott 1989].
+For example, consider the type of component lookup in Fig. 4: this function takes as input a key k
+of typeα and a list of key-value pairs of type [(α, β)], and returns the value that corresponds to k,
+if one exists. In order to look up k, the function has to compare keys for equality; to this end, its
+signature imposes a bound Eq α on the type of keys, enforcing that any concrete key type be an
+instance of the type class Eq and therefore be equipped with a definition of equality.
+Type classes are implemented by a translation to parametric polymorphism called dictionary
+passing, where each class is translated into a record whose fields implement the different functions
+supported by the type class. Happily, H+ can use dictionary passing to desugar synthesis with type
+classes into a synthesis problem supported by ATNs. For example, the type of lookup is desugared
+into an unbounded type with an extra argument: EqD α →α →[(α,β)] →β. Here EqD α, is a
+dictionary: a record datatype that stores the implementation of equality on α; the exact definition
+of this datatype is unimportant, we only care whether EqD α for a given α is inhabited.
+Example: Key-Value Lookup. As a concrete example, suppose the user wants to perform a lookup
+in a key-value list assuming the key is present, and poses a query Eq a => [(a,b)] →a →b. The
+intended solution to this query is \xs k →fromJust (lookup k xs), i.e. look up the key and then
+extract the value from the option, assuming it is nonempty. A fragment of an ATN for this query is
+shown in Fig. 4 (right). Note that the transition l—the instance of lookup with α 7→a, β 7→b—has
+EqD a as one of its incoming edges. This corresponds to our intuition about type classes: in order
+to fire l, the ATN first has to prove that a satisfies Eq, or in other words, that EqD a is inhabited.
+In this case, the proof is trivial: because the query type is also desugared in the same way, the
+initial marking contains a token in EqD a4. A welcome side-effect of relevant typing is that any
+solution must use the token in EqD a, which matches our intuition that the user would not specify
+the bound Eq a if they did not mean to compare keys for equality. This example illustrates that the
+combination of (bounded) polymorphism and relevant typing gives users a surprisingly powerful
+mechanism to disambiguate their intent. Given the query above (and a library of 291 components),
+H+ returns the intended solution as the first result. In contrast, given a monomorphic variant of
+this query [(Int, b)] →Int →b (where the key type is just an Int) H+ produces a flurry of
+irrelevant results, such as \xs k →snd (xs !! k), which uses k as an index into the list, and not
+as a key as we intended.
+3
+ABSTRACT TYPE CHECKING
+Next, we formally define the syntax of our target language λH and its type system, and use the
+framework of abstract interpretation to develop an algorithmic abstract type system for λH. This
+framework allows us to parameterize the checker by the desired level of detail, crucially enabling
+our novel TYGAR synthesis algorithm formalized in Sec. 4.
+3.1
+The λH Language
+λH is a simple first-order language with a prenex-polymorphic type system, whose syntax and
+typing rules are shown in Fig. 5. We stratify the terms into application terms which comprise
+4As we explain in Sec. 5.1, dictionaries can also be inhabited via instances and functional dependencies.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:10
+Z. Guo et al.
+Syntax
+e
+::= x | c | e e
+Application Terms
+E
+::= e | λx.E
+Normal-Form Terms
+b
+::= C b
+Ground Base Types
+t
+::= b | b →t
+Ground Types
+B
+::= τ | C B
+Base Types
+T
+::= B | B →T
+Types
+P
+::= ∀τ.T
+Polytypes
+Γ
+::= · | x : b, Γ
+Environments
+σ
+::= [τ 7→B]
+Substitutions
+Typing
+Λ; Γ ⊢E :: t
+T-Var
+Γ(x) = b
+Λ; Γ ⊢x :: b
+T-Comp
+Λ(c) = ∀τ.T
+Λ; Γ ⊢c :: σT
+T-App
+Λ; Γ ⊢e1 :: b →t
+Λ; Γ ⊢e2 :: b
+Λ; Γ ⊢e1 e2 :: t
+T-Fun
+Λ; Γ,x : b ⊢E :: t
+Λ; Γ ⊢λx.E :: b →t
+Fig. 5. λH : syntax and declarative type system.
+variables x, library components c and applications; and normal-form terms which are lambda-
+abstractions over application terms.
+The base types B include type variables τ, as well as applications of a type constructor to zero
+or more base types C B. We write X to denote zero or more occurrences of a syntactic element X.
+Types T include base types and first-order function types (with base-typed arguments). Syntactic
+categories b and t are the ground counterparts to B and T (i.e. they contain no type variables). A
+component library Λ is a finite map from a set of components c to the components’ poly-types.
+A typing environment Γ is a map from variables x to their ground base types. A substitution
+σ = [τ1 7→B1, . . . ,τn 7→Bn] is a mapping from type variables to base types that maps each τi to
+Bi and is identity elsewhere. We write σT to denote the application of σ to type T, which is defined
+in a standard way.
+A typing judgment Λ; Γ ⊢E :: t is only defined for ground types t. Polymorphic components are
+instantiated into ground monotypes by the Comp rule, which angelically picks ground base types
+to substitute for all the universally-quantified type variables in the component signature (the rule
+implicitly requires that σT be ground).
+3.2
+Type Checking as Abstract Interpretation
+Type subsumption lattice. We say that typeT ′ is more specific than typeT (or alternatively, thatT
+is more general than or subsumesT ′) writtenT ′ ⊑T, iff there exists σ such thatT ′ = σT. The relation
+⊑is a partial order on types. For example, in a library with two nullary type constructors A and B,
+and a binary type constructor P, we have P A B ⊑P α B ⊑P α β ⊑τ. This partial order induces an
+equivalence relation T1 ≡T2 ≜T1 ⊑T2 ∧T2 ⊑T1 (equivalence up to variable renaming). The order
+(and equivalence) relation extends to substitutions in a standard way: σ ′ ⊑σ ≜∃ρ.∀τ.σ ′τ = ρστ.
+We augment the set of types with a special bottom type ⊥that is strictly more specific than every
+other base type; we also consider a bottom substitution σ⊥and define σ⊥B = ⊥for any B. A unifier
+of B1 and B2 is a substitution σ such that σB1 = σB2; note that σ⊥is a unifier for any two types.
+The most general unifier (MGU) is unique up to ≡, and so, by slight abuse of notation, we write it as
+a function mgu(B1, B2). We write mgu(B1, B2) for the MGU of a sequence of type pairs, where the
+MGU of an empty sequence is the identity substitution (mgu(·) = []). The meet of two base types
+is defined as B1 ⊓B2 = σB1(= σB2), where σ = mgu(B1, B2). For example, P α B ⊓P A β = P A B
+while P α B ⊓P β A = ⊥. The join of two base types can be defined as their anti-unifier, but we
+elide a detailed discussion as joins are not required for our purposes.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:11
+(Abstract) Type Inference
+Λ; Γ ⊢A e =⇒B
+I-Var
+Γ(x) = b
+Λ; Γ ⊢A x =⇒αA(b)
+I-App
+Λ; Γ ⊢A ei =⇒Bi
+Λ; Γ ⊢A c ei =⇒αA
+
+JcK(Bi)
+
+(Abstract) Type Checking
+Λ; Γ ⊢A E ⇐= t
+C-Fun
+Λ; Γ,x : b ⊢A E ⇐= t
+Λ; Γ ⊢A λx.E ⇐= b →t
+C-Base
+Λ; Γ ⊢A e =⇒B
+b ⊑B
+Λ; Γ ⊢A e ⇐= b
+Fig. 6. Abstract type checking for λH . Treating αA as the identity function yields concrete type checking.
+We write B⊥= B ∪{⊥} for the set of base types augmented with ⊥. Note that ⟨B⊥, ⊑, ⊔, ⊓⟩is a
+lattice with bottom element ⊥and top element τ and is isomorphic to Plotkin [1970]’s subsumption
+lattice on first-order logic terms.
+Type Transformers. A component signature can be interpreted as a partial function that maps (tu-
+ples of) ground types to ground types. For example, intuitively, a component l :: ∀β.L β →M β
+maps L A to M A, L (M A) to M (M A), and A to ⊥. This gives rise to type transformer semantics
+for components, which is similar to predicate transformer semantics in predicate abstraction and
+SYNGAR [Wang et al. 2018], but instead of being designed by a domain expert can be derived
+automatically from the component signatures.
+More formally, we define a fresh instance of a polytype fresh(∀τ.T) ≜[τ 7→τ ′]T, where τ ′ are
+fresh type variables. Let c be a component and fresh(Λ(c)) = B′
+i →B′; then a type transformer for
+c is a function JcKΛ : B⊥→B⊥defined as follows:
+JcKΛ(Bi) = σB′
+where σ = mgu(Bi, B′
+i)
+We omit the subscript Λ where the library is clear from the context. For example, for the component
+l above: JlK(L (M τ)) = M (M τ), JlK(τ) = M τ1 (where τ1 is a fresh type variable), and JlK(A) = ⊥
+(because mgu(L τ2, A) = σ⊥). We can show that this type transformer is monotone: applying it to
+more specific types yield a more specific type. The transformer is also sound in the sense that in
+any concrete type derivation where the argument to l is more specific than some B, its result is
+guaranteed to be more specific than JlK(B).
+Lemma 3.1 (Trans. Monotonicity). If B1
+i ⊑B2
+i then JcK(B1
+i ) ⊑JcK(B2
+i ).
+Lemma 3.2 (Trans. Soundness). If fresh(Λ(c)) = Bi →B and σBi ⊑B′
+i then σB ⊑JcK(B′
+i).
+The proofs of these and following results can be found in Appendix A.
+Bidirectional Typing. We can use type transformers to define algorithmic type checking for λH , as
+shown in Fig. 6. For now, ignore the parts of the rules highlighted in red, or, in other words, assume
+that αA is the identity function; the true meaning of this function is explained in the next section.
+As is standard in bidirectional type checking [Pierce and Turner 2000], the type system is defined
+using two judgments: the inference judgment Λ; Γ ⊢e =⇒B generates the (base) type B from the
+term e, while the checking judgment Λ; Γ ⊢E ⇐= t checks E against a known (ground) type t.
+Algorithmic typing assumes that the term is in η-long form, i.e. there are no partial applications.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:12
+Z. Guo et al.
+During type checking, the outer λ-abstractions are handled by the checking rule C-Fun, and then
+the type of inner application term is inferred and compared with the given type b in C-Base.
+The only interesting case is the inference rule I-App, which handles (uncurried) component
+applications using their corresponding type transformers. Nullary components are handled by the
+same rule (note that in this case JcK = fresh(Λ(c))). This type system is algorithmic, because we
+have eliminated the angelic choice of polymorphic component instantiations (recall the T-Comp
+rule in the declarative type system). Moreover, type inference for application terms can be thought
+of as abstract interpretation, where the abstract domain is the type subsumption lattice: for any
+application term e, the inference computes its “abstract value” B (known in type inference literature
+as its principal type). We can show that the algorithmic system is sound and complete with respect
+to the declarative one.
+Theorem 3.3 (Type Checking is Sound and Complete). Λ; · ⊢E :: t iff Λ; · ⊢E ⇐= t.
+3.3
+Abstract Typing
+The algorithmic typing presented so far is just a simplified version of Hindley-Milner type inference.
+However, casting type inference as abstract interpretation gives us the flexibility to tune the precision
+of the type system by restricting the abstract domain to a sub-lattice of the full type subsumption
+lattice. This is similar to predicate abstraction, where precision is tuned by restricting the abstract
+domain to boolean combinations of a finite set of predicates.
+Abstract Cover. An abstract cover A = {A1, . . . ,An} is a set of base types Ai ∈B⊥that contains τ
+and ⊥, and is a sub-lattice of the type subsumption lattice (importantly, it is closed under ⊓). For
+example, in a library with a nullary constructor A and two unary constructors L and M, A0 = {τ, ⊥},
+A1 = {τ, A, L τ, ⊥}, and A2 = {τ, A, L τ, L (M τ), M (M τ), ⊥} are abstract covers. Note that in a
+cover, the scope of a type variable is each individual base type, so the different instances of τ above
+are unrelated. We say that an abstract cover A′ refines a cover A (A′ ⪯A) if A is a sub-lattice of
+A′. In the example above, A2 ⪯A1 ⪯A0.
+Abstraction function. Given an abstract cover A, the abstraction αA : B⊥→B⊥of a base type B
+is defined as the most specific type in A that subsumes B:
+αA(B) = A ∈A such that B ⊑A and ∀A′ ∈A.B ⊑A′ ⇒A ⊑A′
+We can show that αA(B) is unique, because A is closed under meet. In abstract interpretation, it is
+customary to define a dual concretization function. In our case, the abstract domain A is a sub-lattice
+of the concrete domain B⊥, and hence our concretization function is the identity function id. It is
+easy to show that αA and id form a Galois insertion, because B ⊑id(αA(B)) and A = αA(id(A))
+both hold by definition of αA.
+Abstract Type Checking. Armed with the definition of abstraction function, let us now revisit
+Fig. 6 and consider the highlighted parts we omitted previously. The two abstract typing judgments—
+for checking and inference—are parameterized by the abstract cover. The only interesting changes
+are in the abstract type inference judgment Λ; Γ ⊢A e =⇒B, which applies the abstraction function
+to the inferred type at every step. For example, recall the covers A1 and A2 defined above, and
+consider a term l xs where Λ(l) = ∀β.L β →M β and Γ(xs) = L (M A). Then in A1 we infer
+Λ; Γ ⊢A1
+l xs =⇒τ, since αA1(L (M A)) = L τ and JlK(L τ) = M τ, but M τ is abstracted to
+τ. However, in A2 we infer Λ; Γ ⊢A2
+l xs =⇒M (M τ), since αA2(L (M A)) = L (M τ), and
+JlK(L (M τ)) = M (M τ), which is abstracted to itself.
+We can show that abstraction preserves typing: i.e. E has type t in an abstraction A whenever it
+has type t in a more refined abstraction A′ ⪯A:
+Theorem 3.4 (Typing Preservation). If A′ ⪯A and Λ; Γ ⊢A′ E ⇐= t then Λ; Γ ⊢A E ⇐= t.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:13
+As B⊥⪯A for any A, the above Theorem 3.4 implies that abstract typing conservatively
+over-approximates concrete typing:
+Corollary 3.5. If Λ; · ⊢E ⇐= t then Λ; · ⊢A E ⇐= t.
+4
+SYNTHESIS
+Next, we formalize the concrete and abstract synthesis problems, and use the notion of abstract
+type checking from Sec. 3 to develop the TYGAR synthesis algorithm, which solves the (concrete)
+synthesis problem by solving a sequence of abstract synthesis problems with increasing detail.
+Synthesis Problem. A synthesis problem (Λ,t) is a pair of a component library and query type. A
+solution to the synthesis problem is a normal-form term E such that Λ; · ⊢E :: t. Note that the
+normal-form requirement does not restrict the solution space: λH has no higher-order functions
+or recursion, hence any well-typed program has an equivalent η-long β-normal form. We treat
+the query type as a monotype without loss of generality: any query polytype ∀τ.T is equivalent
+to [τ 7→C]T where C are fresh nullary type constructors. The synthesis problem in λH is semi-
+decidable: if a solution E exists, it can be found by enumerating programs of increasing size.
+Undecidability follows from a reduction from Post’s Correspondence Problem (see Appendix A).
+Abstract Synthesis Problem. An abstract synthesis problem (Λ,t, A) is a triple of a component
+library, query type, and abstract cover. A solution to the abstract synthesis problem is a program
+term E such that Λ; · ⊢A E ⇐= t. We can use Theorem 3.5 and Theorem 3.3, to show that any
+solution to a concrete synthesis problem is also a solution to any of its abstractions:
+Theorem 4.1. If E is a solution to (Λ,t), then E is also a solution to (Λ,t, A).
+4.1
+Abstract Transition Nets
+Next we discuss how to construct an abstract transition net (ATN) for a given abstract synthesis
+problem (Λ,t, A), and use ATN reachability to find a solution to this synthesis problem.
+Petri Nets. A Petri net N is a triple (P,T, E), where P is a set of places, T is a set of transitions,
+E : (P × T) ∪(T × P) →N is a matrix of edge multiplicities (absence of an edge is represented
+by a zero entry). A marking of a Petri net is a mapping M : P →N that assigns a non-negative
+number of tokens to every place. A transition firing is a triple M1
+t−→M2, such that for all places
+p: M1(p) ≥E(p,t) ∧M2(p) = M1(p) −E(p,t) + E(t,p). A sequence of transitions t1, . . . ,tn is a path
+between M and M′ if M
+t1−→M1 . . . Mn−1
+tn
+−→M′ is a sequence of transition firings.
+ATN Construction. Consider an abstract synthesis problem (Λ,t, A), where t = b1 →. . . →
+bn →b. An abstract transition net N(Λ,t, A) is a 5-tuple (P,T, E, I, F), where (P,T, E) is a Petri
+net, I : P →N is a multiset of initial places and F ⊆P is a set of final places defined as follows:
+(1) the set of places P = A \ {⊥};
+(2) initial places are abstractions of query arguments: for every i ∈[1,n], add 1 to I(αA(bi));
+(3) final places are all places that subsume the query result: F = {A ∈P | b ⊑A}.
+(4) for each component c ∈Λ and for each tuple A,A1, . . . ,Am ∈P, where m is the arity of c,
+add a transition t to T iff αA (JcK(A1, . . . ,Am)) ≡A; set E(t,A) = 1 and add 1 to E(Aj,t) for
+every j ∈[1,m];
+(5) for each initial place {p ∈P | I(p) > 0}, add a self-loop copy transition κ to T, setting
+E(p,κ) = 1 and E(κ,p) = 2, and a self-loop delete transition δ to T, setting E(p,δ) = 1 and
+E(δ,p) = 0.
+Given an ATN N = (P,T, E, I, F), MF is a valid final marking if it assigns exactly one token to some
+final place: ∃f ∈F.MF (f ) = 1 ∧∀p ∈P.p , f ⇒MF (p) = 0. A path π = [t1, . . . ,tn] is a valid path
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:14
+Z. Guo et al.
+Input: Abstract synthesis problem (Λ,t, A)
+Output: Solution e or ⊥if no solution
+1: function SynAbstract(Λ,t, A)
+2:
+N ←N(Λ,t, A)
+3:
+π ←ShortestValidPath(N)
+4:
+if π = ⊥then
+5:
+return ⊥
+6:
+else
+7:
+for E ∈terms(π) do
+8:
+if Λ; · ⊢A E ⇐= t then
+9:
+return E
+Input: Synthesis problem (Λ,t), initial cover A0
+Output: Solution E or ⊥if no solution
+1: function Synthesize(Λ,t, A0)
+2:
+A ←A0
+3:
+while true do
+4:
+E ←SynAbstract(Λ,t, A)
+5:
+if E = ⊥then
+6:
+return ⊥
+7:
+else if Λ; · ⊢E ⇐= t then
+8:
+return E
+9:
+else
+10:
+A ←Refine(A, E,t)
+Fig. 7. (left) Algorithm for the abstract synthesis problem. (right) The TYGAR algorithm.
+of the ATN (π |= N), if it is a path in the Petri net (P,T, E) from the marking I to some valid final
+marking MF .
+From Paths to Programs. Any valid path π corresponds to a set of normal-form terms terms(π).
+The mapping from paths to programs has been defined in prior work on SyPet, so we do not
+formalize it here. Intuitively, multiple programs arise because a path does not distinguish between
+different tokens in one place and has no notion of order of incoming edges of a transition.
+Guarantees. ATN reachability is both sound and complete with respect to (abstract) typing:
+Theorem 4.2 (ATN Completeness). If Λ; · ⊢A E ⇐= t and E ∈terms(π) then π |= N(Λ,t, A).
+Theorem 4.3 (ATN Soundness). If π |= N(Λ,t, A), then ∃E ∈terms(π) s.t. Λ; · ⊢A E ⇐= t.
+Abstract Synthesis Algorithm. Fig. 7 (left) presents an algorithm for solving an abstract synthesis
+problem (Λ,t, A). The algorithm first constructs the ATN N(Λ,t, A). Next, the function Short-
+estValidPath uses a constraint solver to find a shortest valid path π |= N5. From Theorem 4.2, we
+know that if no valid path exists (no final marking is reachable from any initial marking), then the
+abstract synthesis problem has no solution, so the algorithm returns ⊥. Otherwise, it enumerates all
+programs E ∈terms(π) and type-checks them abstractly, until it encounters an E that is abstractly
+well-typed (such an E must exists per Theorem 4.3).
+ATN versus TTN. Our ATN construction is inspired by but different from the TTN construction in
+SyPet [Wang et al. 2018]. In the monomorphic setting of SyPet, it suffices to add a single transition
+per component. To account for our polymorphic components, we need a transition for every abstract
+instance of the component’s polytype. To compute the set of abstract instances, we consider all
+possible m-tuples of places, and for each, we compute the result of the abstract type transformer
+αA (JcK(A1, . . . ,Am)). This result is either ⊥, in which case no transition is added, or some A ∈P,
+in which case we add a transition from A1, . . . ,Am to A.
+Due to abstraction, unlike SyPet, where the final marking contains a single token in the result
+type b, we must allow for several possible final markings. Specifically, we allow the token to end
+up in any place A that subsumes b, not just in its most precise abstraction αA(b). This is because,
+like any abstract interpretation, abstract type inference might lose precision, and so requiring that
+it infer the most precise type αA(b) for the solution would lead to incompleteness.
+5Sec. 5.3 details our encoding of ATN reachability into constraints.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:15
+Enforcing Relevance. Finally, consider copy transitions κ and delete transitions δ: in this section,
+we describe an ATN that implements a simple, structural type system, where each function argument
+can be used zero or more times. Hence we allow the ATN to duplicate tokens in the initial marking I
+using κ transitions and discard them using δ transitions. We can easily adapt the ATN definition to
+implement a relevant type system by eliminating the δ transitions (this is what our implementation
+does, see Sec. 5.3); a linear type system can be supported by eliminating both.
+4.2
+The TYGAR Algorithm
+The abstract synthesis algorithm from Fig. 7 either returns ⊥, indicating that there is no solution
+to the synthesis problem, or a term E that is abstractly well-typed. However, this term may not
+be (concretely) well-typed, and hence, may not be a solution to the synthesis problem. We now
+turn to the core of our technique: the type-guided abstraction refinement (TYGAR) algorithm which
+iteratively refines an abstract cover A (starting with some A0) until it is specific enough that a
+solution to an abstract synthesis problem is also well-typed in the concrete type system.
+Fig. 7 (right) describes the pseudocode for the TYGAR procedure which takes as input a (concrete)
+synthesis problem (Λ,t) and an initial abstract cover A0, and either returns a solution E to the
+synthesis problem or ⊥if t cannot be inhabited using the components in Λ. In every iteration,
+TYGAR first solves the abstract synthesis problem at the current level of abstraction A, using the
+previously defined algorithm SynAbstract. If the abstract problem has no solution, then neither
+does the concrete one (by Theorem 4.1), so the algorithm returns ⊥. Otherwise, the algorithm
+type-checks the term E against the concrete query type. If it is well-typed, then E is a solution to
+the synthesis problem (Λ,t); otherwise E is spurious.
+Refinement. The key step in the TYGAR algorithm is the procedure Refine, which takes as input
+the current cover A and a spurious program E and returns a refinement A′ of the current cover
+(A′ ⪯A) such that E is abstractly ill-typed in A′ (Λ; · ⊬A′ E ⇐= t). Procedure Refine is detailed
+in Sec. 4.3, but the declarative description above suffices to see how it helps the synthesis algorithm
+make progress: in the next iteration, SynAbstract cannot return the same spurious program E,
+as it no longer type-checks abstractly. Moreover, the intuition is that along with E the refinement
+rules out many other spurious programs that are ill-typed “for a similar reason”.
+Initial Cover. The choice of initial cover A0 has no influence on the correctness of the algorithm.
+A natural choice is the most general cover A⊤= {τ, ⊥}. In our experiments (Sec. 6) we found that
+synthesis is more efficient if we pick the initial cover AQ(bi →b) = close({τ,bi,b, ⊥})6, which
+represents the query type t = bi →b concretely. Intuitively, the reason is that the distinctions
+between the types in t are very likely to be important for solving the synthesis problem, so there is
+no need to make the algorithm re-discover them from scratch.
+Soundness and Completeness. Synthesize is a semi-algorithm for the synthesis problem in λH.
+Theorem 4.4 (Soundness). If Synthesize(Λ,t, A0) returns E then Λ; · ⊢E :: t.
+Proof Sketch. This follows trivially from the type check in line 7 of the algorithm.
+□
+Theorem 4.5 (Completeness). If ∃E. Λ; · ⊢E :: t then Synthesize(Λ,t, A0) returns some E′ , ⊥.
+Proof Sketch. Let E0 be some shortest solution to (Λ,t) and let k be the number of all syn-
+tactically valid programs of the same or smaller size than E0 (here, the size of the program is the
+number of component applications). Line 4 cannot return ⊥or a program E that is larger than E0,
+since E0 is abstractly well-typed at any A by Theorem 3.5, and SynAbstract always returns a
+shortest abstractly well-typed program, when one exists by Theorem 4.2. Line 4 also cannot return
+6Here close(A) closes the cover under meet, as required by the definition of sublattice.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:16
+Z. Guo et al.
+Input: A, E,t s.t. Λ; · ⊬E ⇐= t
+Output: A′ ⪯A s.t. Λ; · ⊬A′ E ⇐= t
+1: function Refine(A, λxi.ebody,bi →b)
+2:
+Λ ←Λ ∪(r :: b →b)
+3:
+e∗←r ebody
+4:
+for ej ∈subterms(e∗) do
+5:
+Λ;xi : bi ⊢ej =⇒U [ej]
+6:
+U ←Generalize(U ,e∗)
+7:
+return close(A ∪range(U ))
+Input: U,e s.t. I1 ∧I2 ∧I3
+Output: U ′ s.t. I1 ∧I2 ∧I3
+1: function Generalize(U,e)
+2:
+if e = x then
+3:
+return U
+4:
+else if e = c ej then
+5:
+Bj ←weaken U [ej] while JcK(Bj) ⊑U [e]
+6:
+U ′ ←U [ej 7→Bj]
+7:
+for ej do Generalize(U ′,ej)
+Fig. 8. Refinement algorithm.
+the same solution twice by the property of Refine. Hence the algorithm must find a solution in at
+most k iterations.
+□
+When there is no solution, our algorithm might not terminate. This is unavoidable, since the
+synthesis problem is only semi-decidable, as we discussed at the beginning of this section. In practice,
+we impose an upper bound on the length of the solution, which then guarantees termination.
+4.3
+Refining the Abstract Cover
+This section details the refinement step of the TYGAR algorithm. The pseudocode is given in Fig. 8.
+The top-level function Refine(A, E,t) takes as inputs an abstract cover A, a term E, and a goal type
+t, such that E is ill-typed concretely (Λ; · ⊬E ⇐= t), but well-typed abstractly (Λ; · ⊢A E ⇐= t). It
+produces a refinement of the cover A′ ⪯A, such that E is ill-typed abstractly in that new cover
+(Λ; · ⊬A′ E ⇐= t).
+Proof of untypeability. At a high-level, Refine works by constructing a proof of untypeability
+of E, i.e. a mapping U : e →B⊥from subterms of E to types, such that if range(U ) ⊆A′ then
+Λ; · ⊬A′ E ⇐= t (in other words, the types in U contain enough information to reject E). Once U is
+constructed, line 7 adds its range to A, and then closes the resulting set under meet.
+Let us now explain how U is constructed. Let E  λxi.ebody, t  bi →b, and Γ  xi : bi. There
+are two reasons why E might not type-check against t: either ebody on its own is ill-typed or it has a
+non-bottom type that nevertheless does not subsume b. To unify these two cases, Refine constructs
+a new application term e∗= r ebody, where r is a dedicated component of type b →b; such e∗is
+guaranteed to be ill-typed on its own: Λ; Γ ⊢e∗=⇒⊥. Lines 4–5 initialize U for each subterm of
+e∗with the result of concrete type inference. At this point U already constitutes a valid proof of
+untypeability, but it contains too much information; in line 6 the call to Generalize removes as
+much information from U as possible while maintaining enough to prove that e∗is ill-typed. More
+precisely, Generalize maintains three crucial invariants that together guarantee that U is a proof
+of untypeability:
+I1: (U subsumes concrete typing) For any e ∈subterms(e∗), if Λ; Γ ⊢e =⇒B, then B ⊑U [e];
+I2: (U abstracts type transformers) For any application subterm e = c ej, JcK(U [ej]) ⊑U [e];
+I3: (U proves untypeability) U [e∗] = ⊥.
+Lemma 4.6. If I1∧I2∧I3 thenU is a proof of untypeability: if range(U ) ⊆A′ then Λ; · ⊬A′ E ⇐= t.
+Proof Sketch. We can show by induction on the derivation that for any A′ ⊇range(U )
+and node e, Λ; Γ ⊢A′ e =⇒B ⊑U [e] (base case follows from I1, and inductive case follows
+from I2). Hence, Λ; Γ ⊢A′ e∗=⇒B ⊑U [e∗] = ⊥(by I3), so Λ; Γ ⊢A′ ebody =⇒B ̸⊑b, and
+Λ; · ⊬A′ E ⇐= t.
+□
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:17
+r
+⊥
+⊥
+f
+⊥
+⊥
+x1
+A
+A
+l
+M (M τ)
+M (M A)
+x2
+L (M τ)
+L (M A)
+Fig. 9. Refine in the second iter-
+ation of the running example.
+τ
+f
+g
+r
+⊥
+⊥
+f
+B α β
+B τ τ
+τ
+B α β
+f
+g
+g
+r
+⊥
+⊥
+g
+⊥
+⊥
+f
+B τ τ
+B τ τ
+τ
+B τ τ
+B α β
+f
+g
+g
+Fig. 10. Synthesize on an unsatisfiable problem.
+Correctness of Generalize. Now that we know that invariants I1–I3 are sufficient for correctness,
+let us turn to the inner workings of Generalize. This function starts with the initial proof U
+(concrete typing), and recursively traverses the term e∗top-down. At each application node e = c ej
+it weakens the argument labels U [ej] (lines 4–7). The weakening step performs lattice search to
+find more general values for U [ej] allowed by I2. More concretely, each new value Bj starts out as
+the initial value of U [ej]; at each step, weakening picks one Bj , ⊥and moves it upward in the
+lattice by replacing a ground subterm of Bj with a type variable; the step is accepted as long as
+JcK(Bj) ⊑U [e]. The search terminates when there is no more Bj that can be weakened. Note that
+in general there is no unique most general value for Bj, we simply pick the first value we find that
+cannot be weakened any further. The correctness of the algorithm does not depend on the choice
+of Bj, and only rests on two properties: (1) U [ej] ⊑Bj and (2) JcK(Bj) ⊑U [e].
+We can show that Generalize maintains the invariants I1–I3. I1 is maintained by property
+(1) of weakening (we start from concrete types and only move up in the lattice). I2 is maintained
+between e and its children ej by property (2) of weakening, and between each ej and its children
+because the label of ej only goes up. Finally, I3 is trivially maintained since we never update U [e∗].
+Example 1. Let us walk through the refinement step in iteration 2 of our running example from
+Sec. 2.2. As a reminder, Λ(f) = ∀α.α →M α →α and Λ(l) = ∀β.L β →M β. Consider a call to
+Refine(A, E,t), where A = {τ, A, L τ, ⊥}, E = λx1 x2.f x1 (l x2) and t = A →L (M A) →A. Let
+us denote Γ = x1 : A,x2 : L (M A). It is easy to see that E is ill-typed concretely but well-typed
+abstractly, since, as explained above, Λ; Γ ⊢A l x2 =⇒τ, and hence Λ; Γ ⊢A f x1 (l x2) =⇒A.
+Refine first constructs e∗= r ebody; the AST for this term is shown on Fig. 9 (left). It then initializes
+the mapping U with concrete inferred types, depicted as red labels; as expected U [e∗] = ⊥. The
+blue labels show U ′ obtained by calling Generalize through the following series of recursive calls:
+• In the initial call to Generalize, the term e is r ebody; although it is an application, we do not
+weaken the label for ebody since its concrete type is ⊥, which cannot be weakened.
+• We move on to ebody = f x1 l with U [x1] = A and U [l] = M (M A). The former type cannot be
+weakened: an attempt to replace A with τ causes JfK to produce M A ̸⊑⊥. The latter type can
+be weakened by replacing A with τ (since JfK(A, M (M τ)) = ⊥), but no further.
+• The first child of f, x1, is a variable so U remains unchanged.
+• For the second child of f, l = l x2, l’s signature allows us to weaken U [x2] to L (M τ) but no
+further, since JlK(L (M τ)) = M (M τ) but JlK(L τ) = M τ ̸⊑M (M τ).
+• Since x2 is a variable, Generalize terminates.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:18
+Z. Guo et al.
+Example 2. We conclude this section with an end-to-end application of TYGAR to a very small
+but illustrative example. Consider a library Λ with three type constructors, Z, U, and B (with
+arities 0, 1, and 2, respectively), and two components, f and g, such that: Λ(f) = ∀α.B α α and
+Λ(g) = ∀β.B (U β) β →Z. Consider the synthesis problem (Λ, Z), which has no solutions: the only
+way to obtain a Z is from g, which requires a B with distinct parameters, but we can only construct a
+B with equal parameters (using f). Assume that the initial abstract cover is A0 = {τ, ⊥}, as shown in
+the upper left of Fig. 10. SynAbstract(Λ, Z, A0) returns a program f, which is spurious, hence we
+invoke Refine(A0, f, Z). The results of concrete type inference are shown as red labels in Fig. 10; in
+particular, note that because f is a nullary component, JfK is simply a fresh instance of its type, here
+B τ τ, which can be generalized to B α β: the root cause of the type error is that r does not accept
+a B. In the second iteration, A0 = {τ, B α β, ⊥} and SynAbstract(Λ, Z, A1) returns g f, which is
+also spurious. In this call to Refine, however, the concrete type of f can no longer be generalized:
+the root cause of the type error is that д accepts a B with distinct parameters. Adding B τ τ to the
+cover, results in the ATN on the right, which does not have a valid path (SynAbstract returns ⊥).
+There are three interesting points to note about this example. (1) In general, even concrete type
+inference may produce non-ground types, for example: Λ; · ⊢f =⇒B τ τ. (2) Synthesize can
+sometimes detect that there is no solution, even when the space of all possible ground base types is
+infinite. (3) To prove untypeability of g f, our abstract domain must be able to express non-linear
+type-level terms (i.e. types with repeated variables, like B τ τ); we could not, for example, replace
+type variables with a single construct ?, as in gradual typing [Siek and Taha 2006].
+5
+IMPLEMENTATION
+We have implemented the TYGAR synthesis algorithm in Haskell, in a tool called H+. The tool
+relies on the Z3 SMT solver [de Moura and Bjørner 2008] to find paths in the ATN. This section
+focuses on interesting implementation details, such as desugaring Haskell libraries into first-order
+components accepted by TYGAR, an efficient and incremental algorithm for ATN construction,
+and the SMT encoding of ATN reachability.
+5.1
+Desugaring Haskell Types
+The Haskell type system is significantly more expressive than that of our core language λH, and
+many of its advanced features are not supported by H+. However, two type system features are
+ubiquitous in Haskell: higher-order functions and type classes. As we illustrated in Sec. 2.4 and
+Sec. 2.5, H+ handles both features by desugaring them into λH. Next, we give more detail on how
+H+ translates a Haskell synthesis problem ( ˜Λ, ˜t) into a λH synthesis problem (Λ,t):
+(1) Λ includes a fresh binary type constructor F α β (used to represent function types).
+(2) Every declaration of type class C τ with methodsmi :: ∀τ.Ti in ˜Λ gives rise to a type construc-
+tor CD τ (the dictionary type) and components mi :: ∀τ.CD τ →Ti in Λ. For example, a type
+class declaration class Eq α where (==) :: a →a →Bool creates a fresh type constructor
+EqD α and a component (==) :: EqD α →α →α →Bool.
+(3) Every instance declaration C B in ˜Λ produces a component that returns a dictionary CD B.
+So instance Eq Int creates a component eqInt :: EqD Int, while a subclass instance like
+instance Eq a => Eq [a] creates a component eqList :: EqD a →EqD [a]. Note that the
+exact implementation of the type class methods inside the instance is irrelevant; all we care
+about is that the instance inhabits the type class dictionary.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:19
+(4) For every component c in ˜Λ, we add a component c to Λ and define Λ(c) = desugar
+
+˜Λ(c)
+
+,
+where the translation function desugar, which eliminates type class constraints and higher-
+order types, is defined as follows:
+desugar (∀τ.(C1 τ1, . . . , Cn τn) ⇒T) = ∀τ.CD1 τ1 →. . . →CDn τn →desugar(T)
+desugar(T1 →T2) = base(T1) →desugar(T2)
+desugar(B) = B
+base(T1 →T2) = F base(T1) base(T2)
+base(B) = B
+For example, Haskell components on the left are translated into λH components on the right:
+member :: Eq α => α →[α] →Bool
+member :: EqD α →α →[α] →Bool
+any :: (α →Bool) →[α] →Bool
+any :: F α Bool →[α] →Bool
+(5) For every non-nullary component and type class method c in ˜Λ, we add a nullary component
+c′ to Λ and define Λ(c′) = base(Λ(c)). For example: any' :: F (F α Bool) (F [α] Bool).
+(6) Finally, the λH query type t is defined as desugar(˜t).
+Limitations. Firstly, in modern Haskell, type classes often constrain higher-kinded type variables;
+for example, the Monad type class in the signature return :: Monad m => a →m a is a constraint
+on type constructors rather than types. Support for higher-kinded type variables is beyond the scope
+of this paper. Secondly, in theory our encoding of higher-order functions (Sec. 2.4) is complete, as
+any program can be re-written in point-free style, i.e. without lambda terms, using an appropriate
+set of components [Barendregt 1985] including an apply component ($) :: F α β →α →β that
+enables synthesizing terms containing partially applied functions. However, in practice we found
+that adding a nullary version for every component significantly increases the size of the search
+space and is infeasible for component libraries of nontrivial size. Hence, in our evaluation we only
+generate nullary variants of a selected subset of popular components.
+5.2
+ATN Construction
+Incremental updates. Sec. 4.1 shows how to construct an ATN given an abstract synthesis problem
+(Λ,t, A). However, computing the set of ATN transitions and edges from scratch in each refinement
+iteration is expensive. We observe that each iteration only makes small changes to the abstract
+cover, which translate to small changes in the ATN.
+Let A be the old abstract cover and A′ = A ∪{Anew} be the new abstract cover (if a refinement
+step adds multiple types to A, we can consider them one by one). Let parents be the direct successors
+of Anew in the ⊑partial order; for example, in the cover {τ, P α β, P A β, P α B, P A B, ⊥}, the parents
+of P A B are {P A β, P α B}. Intuitively, adding Anew to the cover can add new transitions and re-
+route some existing transitions. A transition is re-routed if a component c returns a more precise
+type under A′ than it did under A, given the same types as arguments. Our insight is that the only
+candidates for re-routing are those transitions that return one of the types in parents. Similarly, all
+new transitions can be derived from those that take one of the types in parents as an argument.
+More precisely, starting from the old ATN, we update its transitions T and edges E as follows:
+(1) Consider a transition t ∈T that represents the abstract instance αA
+
+JcK(Ai)
+
+= A such that
+A ∈parents; if αA′
+
+JcK(Ai)
+
+= Anew, set E(t,A) = 0 and E(t,Anew) = 1.
+(2) Consider a transition t ∈T that represents the abstract instance αA
+
+JcK(Ai)
+
+= A such that at
+least one Ai ∈parents; consider A′
+i obtained from Ai by substituting at least one Ai ∈parents
+with Anew; if αA′
+
+JcK(A′
+i)
+
+= A′ , ⊥, add a new transition t ′ to T, set E(t ′,A′) = 1 and add 1
+to E(A′
+i,t ′) for each A′
+i.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:20
+Z. Guo et al.
+Transition coalescing. The ATN construction algorithm in Sec. 4.1 adds a separate transition
+for each abstract instance of each component in the library. Observe, however, that different
+components may share the same abstract instance: for example in Fig. 3 (1), both c and l have the
+type τ →τ. Our implementation coalesces equivalent transitions: an optimization known in the
+literature as observational equivalence reduction [Alur et al. 2017; Wang et al. 2018]. More precisely,
+we do not add a new transition if one already exists in the net with the same incoming and outgoing
+edges. Instead, we keep track of a mapping from each transition to a set of components. Once a
+valid path [t1, . . . ,tn] is found, where each transition ti represents a set of components, we select
+an arbitrary component from each set to construct the candidate program. In each refinement
+iteration, the transition mapping changes as follows:
+(1) new component instances are coalesced into new groups and added to the map, each new
+group is added as a new ATN transition;
+(2) if a component instance is re-routed, it is removed from the corresponding group;
+(3) transitions with empty groups are removed from the ATN.
+5.3
+SMT Encoding of ATN Reachability
+Our encoding differs slightly from that in previous work on SyPet. Most notably, we use an SMT
+(as opposed to SAT) encoding, in particular, representing transition firings as integer variables.
+This makes our encoding more compact, which is important in our setting, since, unlike SyPet, we
+cannot pre-compute the constraints for a component library and use them for all queries.
+ATN Encoding. Given a ATN N = (P,T, E, I, F), we show how to build an SMT formula ϕ that
+encodes all valid paths of a given length ℓ; the overall search will then proceed by iteratively
+increasing the length ℓ. We encode the number of tokens in each place p ∈P at each time step
+k ∈[0, ℓ] as an integer variable tokp
+k. We encode the transition firing at each time step k ∈[0, ℓ) as
+an integer variable firek so that firek = t indicates that the transition t is fired at time step k. For
+any x ∈{P ∪T }, let the pre-image of x be pre(x) = {y ∈P ∪T | E(y,x) > 0} and the post-image of
+x be post(x) = {y ∈P ∪T | E(x,y) > 0}.
+The formula ϕ is a conjunction of the following constraints:
+(1) At each time step, a valid transition is fired: Óℓ−1
+k=0 1 ≤firek ≤|T |
+(2) If a transition t is fired at time step k then all places p ∈pre(t) have sufficiently many tokens:
+Óℓ−1
+k=0
+Ó|T |
+t=1 firek = t =⇒Ó
+p ∈pre(t) tokp
+k ≥E(p,t)
+(3) If a transition t is fired at time step k then all places p ∈pre(t) ∪post(t) will have their
+markings updated at time step k + 1: Óℓ−1
+k=0
+Ó|T |
+t=1 firek = t
+=⇒Ó
+p ∈pre(t)∪post(t) tokp
+k+1 =
+tokp
+k −E(p,t) + E(t,p)
+(4) If none of the outgoing or incoming transitions of a place p are fired at time step k, then the
+marking in p does not change: Óℓ−1
+k=0
+Ó
+p ∈P(Ó
+t ∈pre(p)∪post(p) firek , t) =⇒tokp
+k+1 = tokp
+k
+(5) The initial marking is I: Ó
+p ∈P tokp
+0 = I(p).
+(6) The final marking is valid: Ô
+f ∈F
+
+tokf
+ℓ= 1 ∧Ó
+p ∈P\{f } tokp
+ℓ= 0
+
+.
+Optimizations. Although the validity of the final marking can be encoded as in (6) above, we
+found that quality of solutions improves if instead we iterate through f ∈F in the order from most
+to least precise; in each iteration we enforce tokf
+ℓ= 1 (and tokp
+ℓ= 0 for p , f ), and move to the next
+place if no solution exists. Intuitively, this works because paths that end in a more precise place
+lose less information, and hence are more likely to correspond to concretely well-typed programs.
+As we mentioned in Sec. 4, our implementation adds copy transitions but not delete transitions
+to the ATN, thereby enforcing relevant typing. We have also tried an alternative encoding of
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:21
+relevant typing, which forgoes copy transitions, and instead allows the initial marking to contain
+extra tokens in initial places: Ó
+p ∈{P |I(p)>0} tokp
+0 ≥I(p) and Ó
+p ∈{P |I(p)=0} tokp
+0 = 0. Although this
+alternative encoding often produces solutions faster (due to shorter paths), we found that the
+quality of solutions suffers. We conjecture that the original encoding works well, because it biases
+the search towards linear consumption of resources, which is common for desirable programs.
+6
+EVALUATION
+Next, we describe an empirical evaluation of two research questions of H+:
+• Efficiency: Is TYGAR able to find well-typed programs quickly?
+• Quality of Solutions: Are the synthesized code snippets interesting?
+Component library. We use the same set of 291 components in all experiments. To create this
+set, we started with all components from 12 popular Haskell library modules,7 and excluded seven
+components8 that are highly-polymorphic yet redundant (and hence slowed down the search with
+no added benefit).
+Query Selection. We collected 44 benchmark queries from three sources:
+(1) Hoogle. We started with all queries made to Hoogle between 1/2015 and 2/2019. Among the
+3.8M raw queries, 71K were syntactically unique, and only 60K could not be exactly solved by
+Hoogle. Among these, many were syntactically ill-formed (e.g. FromJSON a →Parser a →)
+or unrealizable (e.g. a →b). We wanted to discard such invalid queries, but had no way
+to identify unrealizable queries automatically. Instead we decided to reduce the number of
+queries by selecting only popular ones (those asked at least five times), leaving us with 1750
+queries, and then we pruned invalid queries manually, leaving us with 180 queries. Finally,
+out of the 180 remaining queries, only 24 were realizable with our selected component set.
+(2) StackOverflow. We first collected all Haskell-related questions from StackOverflow,
+ranked them by their view counts, and examined the first 500. Out of 15 queries with
+implementations, we selected 6 that were realizable with our component set.
+(3) Curated. Since we were unable to find many API-related Haskell questions on StackOver-
+flow, and Hoogle queries do not come with expected solutions and also tend to be easy,
+we supplemented the benchmark set with 17 queries from our own experience as Haskell
+programmers.
+The resulting benchmark set can be found in Fig. 11.
+Experiment Platform. We ran all experiments on a machine with an Intel Core i7-3770 running
+at 3.4Ghz with 32Gb of RAM. The platform ran Debian 10, GHC 8.4.3, and Z3 4.7.1.
+6.1
+Efficiency
+Setup. To evaluate the efficiency of H+, we run it on each of the 44 queries, and report the time
+to synthesize the first well-typed solution that passes the demand analyzer (Sec. 2.3). We set the
+timeout to 60 seconds and take the median time over three runs to reduce the uncertainty generated
+by using an SMT solver. To assess the importance of TYGAR, we compare five variants of H+:
+(1) Baseline: we monomorphise the component library by instantiating all type constructors with
+all types up to an unfolding depth of one and do not use refinement.
+(2) NOGAR: we build the ATN from the abstract cover AQ, which precisely represents types from
+the query (defined in Sec. 4.2). We do not use refinement, and instead enumerate solutions to
+7 Data.Maybe, Data.Either, Data.Int, Data.Bool, Data.Tuple, GHC.List, Text.Show, GHC.Char, Data.Int, Data.Function,
+Data.ByteString.Lazy, Data.ByteString.Lazy.Builder.
+8 id, const, fix, on, flip, &, (.).
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:22
+Z. Guo et al.
+N
+Name
+Query
+Time: Total
+Time: SMT Solver
+Time: Type Checking
+# Interesting / All
+QB10
+Q
+0
+NO
+QB10
+Q
+0
+NO
+QB10
+0
+NO
+H+
+H-D
+H-R
+1
+firstRight
+[Either a b] -> Either a b
+0.3
+0.3
+0.6
+0.3
+0.0
+0.0
+0.1
+0.0
+0.2
+0.2
+0.2
+2/5
+2/5
+2/5
+2
+firstKey
+[(a,b)] -> a
+3.9
+21.2
+58.4
+2.4
+17.2
+52.2
+0.8
+0.2
+0/2
+0/4
+0/3
+3
+flatten
+[[[a]]] -> [a]
+1.7
+5.5
+1.1
+0.5
+0.9
+2.5
+0.3
+0.1
+0.3
+0.2
+0.4
+5/5
+5/5
+0/5
+4
+repl-funcs
+(a->b)->Int->[a->b]
+0.4
+0.4
+0.7
+0.5
+0.0
+0.0
+0.1
+0.0
+0.3
+0.3
+0.4
+2/5
+2/5
+1/5
+5
+containsEdge
+[Int] -> (Int,Int) -> Bool
+15.4
+14.4
+19.0
+5.1
+13.2
+12.1
+15.9
+0.8
+1.8
+0.4
+4.1
+0/5
+0/5
+0/5
+6
+multiApp
+(a -> b -> c) -> (a -> b) -> a -> c
+1.2
+2.4
+1.2
+0.5
+0.4
+0.9
+0.5
+0.2
+0.3
+0.2
+0.2
+1/5
+1/5
+1/5
+7
+appendN
+Int -> [a] -> [a]
+0.3
+0.3
+0.3
+0.3
+0.0
+0.0
+0.0
+0.0
+0.2
+0.3
+0.2
+2/5
+2/5
+0/5
+8
+pipe
+[(a -> a)] -> (a -> a)
+0.7
+0.6
+2.1
+0.7
+0.1
+0.1
+0.6
+0.1
+0.2
+0.7
+0.6
+1/5
+1/5
+0/5
+9
+intToBS
+Int64 -> ByteString
+0.6
+0.6
+1.6
+0.3
+0.1
+0.1
+0.5
+0.0
+0.3
+0.3
+0.2
+3/5
+3/5
+0/5
+10
+cartProduct
+[a] -> [b] -> [[(a,b)]]
+1.5
+8.8
+1.3
+1.3
+0.6
+5.5
+0.4
+0.5
+0.3
+0.2
+0.6
+0/5
+0/5
+0/5
+11
+applyNtimes
+(a->a) -> a -> Int -> a
+6.4
+23.5
+0.6
+1.0
+4.9
+19.8
+0.2
+0.3
+1.2
+0.3
+0.6
+0/5
+0/5
+0/5
+12
+firstMatch
+[a] -> (a -> Bool) -> a
+1.5
+1.4
+2.4
+0.5
+0.7
+0.6
+1.3
+0.2
+0.2
+0.2
+0.3
+5/5
+5/5
+5/5
+13
+mbElem
+Eq a => a -> [a] -> Maybe a
+46.8
+5.6
+45.5
+4.0
+0.8
+0.3
+0/3
+0/3
+0/5
+14
+mapEither
+(a -> Either b c) -> [a] -> ([b], [c])
+2.6
+43.7
+55.4
+3.5
+1.7
+37.6
+49.8
+0.5
+0.3
+0.2
+1.7
+1/4
+1/5
+1/1
+15
+hoogle01
+(a -> b) -> [a] -> b
+0.5
+0.5
+1.1
+0.3
+0.1
+0.1
+0.3
+0.0
+0.3
+0.3
+0.2
+2/5
+2/5
+2/5
+16
+zipWithResult
+(a->b)->[a]->[(a,b)]
+11.1
+9.2
+0.7
+1/2
+1/2
+0/5
+17
+splitStr
+String -> Char -> [String]
+0.7
+0.7
+1.0
+0.4
+0.2
+0.1
+0.3
+0.1
+0.3
+0.3
+0.2
+0/5
+0/5
+0/5
+18
+lookup
+Eq a => [(a,b)] -> a -> b
+0.7
+0.7
+0.7
+0.8
+0.2
+0.2
+0.2
+0.3
+0.3
+0.3
+0.3
+1/5
+1/3
+1/4
+19
+fromFirstMaybes
+a -> [Maybe a] -> a
+1.4
+3.0
+3.4
+0.7
+0.3
+0.9
+1.2
+0.1
+0.7
+0.8
+0.5
+2/5
+2/5
+0/5
+20
+map
+(a->b)->[a]->[b]
+0.3
+0.3
+0.4
+0.4
+0.0
+0.0
+0.1
+0.0
+0.2
+0.2
+0.3
+5/5
+5/5
+0/5
+21
+maybe
+Maybe a -> a -> Maybe a
+0.3
+0.4
+0.4
+0.6
+0.1
+0.0
+0.1
+0.1
+0.2
+0.2
+0.5
+2/5
+1/5
+0/5
+22
+rights
+[Either a b] -> Either a [b]
+1.5
+31.9
+11.9
+0.8
+0.6
+20.4
+5.7
+0.1
+0.4
+0.3
+0.6
+1/2
+1/2
+1/5
+23
+mbAppFirst
+b -> (a -> b) -> [a] -> b
+2.0
+1.3
+2.0
+0.4
+1.2
+0.4
+0.9
+0.1
+0.3
+0.3
+0.3
+1/3
+1/5
+0/5
+24
+mergeEither
+Either a (Either a b) -> Either a b
+2.8
+1.0
+1.7
+0.1
+0.6
+0.7
+0/3
+0/3
+0/5
+25
+test
+Bool -> a -> Maybe a
+1.4
+8.8
+26.4
+0.7
+0.7
+7.1
+24.3
+0.3
+0.2
+0.3
+0.3
+2/5
+2/5
+0/5
+26
+multiAppPair
+(a -> b, a -> c) -> a -> (b, c)
+2.0
+1.5
+1.2
+0.3
+0.5
+1.0
+1/2
+1/4
+0/5
+27
+splitAtFirst
+a -> [a] -> ([a], [a])
+0.6
+0.6
+2.3
+0.4
+0.1
+0.1
+1.1
+0.1
+0.3
+0.3
+0.2
+2/5
+2/5
+0/5
+28
+2partApp
+(a->b)->(b->c)->[a]->[c]
+2.3
+2.2
+22.9
+1.5
+1.2
+1.2
+18.7
+0.5
+0.2
+0.3
+0.3
+1/5
+1/5
+0/5
+29
+areEq
+Eq a => a -> a -> Maybe a
+44.9
+40.3
+3.8
+0/2
+0/5
+0/5
+30
+eitherTriple
+Either a b -> Either a b -> Either a b
+5.3
+3.2
+1.9
+0.1
+2.8
+2.9
+0/5
+0/5
+0/5
+31
+mapMaybes
+(a -> Maybe b) -> [a] -> Maybe b
+0.5
+0.5
+1.1
+0.3
+0.1
+0.1
+0.3
+0.0
+0.3
+0.2
+0.2
+2/5
+2/5
+2/5
+32
+head-rest
+[a] -> (a, [a])
+1.4
+51.1
+1.0
+0.8
+0.7
+40.6
+0.3
+0.1
+0.2
+0.3
+0.6
+3/5
+3/5
+2/5
+33
+appBoth
+(a -> b) -> (a -> c) -> a -> (b, c)
+2.1
+2.8
+51.1
+1.3
+1.5
+44.3
+0.3
+0.3
+1/5
+1/5
+1/1
+34
+applyPair
+(a -> b, a) -> b
+1.2
+1.1
+3.6
+0.6
+0.4
+0.4
+1.6
+0.1
+0.2
+0.3
+0.4
+2/3
+2/5
+1/5
+35
+resolveEither
+Either a b -> (a->b) -> b
+1.0
+1.3
+1.5
+0.5
+0.4
+0.5
+0.6
+0.2
+0.2
+0.2
+0.2
+1/5
+1/2
+1/5
+36
+head-tail
+[a] -> (a,a)
+2.2
+20.2
+1.5
+0.4
+0.3
+18.8
+0/5
+0/5
+0/5
+37
+indexesOf
+([(a,Int)] -> [(a,Int)]) -> [a] -> [Int] -> [Int]
+38
+app3
+(a -> b -> c -> d) -> a -> c -> b -> d
+0.3
+0.3
+0.3
+0.3
+0.0
+0.0
+0.0
+0.0
+0.2
+0.3
+0.2
+1/5
+1/5
+1/5
+39
+both
+(a -> b) -> (a, a) -> (b, b)
+1.1
+1.3
+0.5
+0.2
+0.3
+1.0
+1/1
+1/1
+0/5
+40
+takeNdropM
+Int -> Int -> [a] -> ([a], [a])
+0.4
+0.4
+1.3
+0.4
+0.0
+0.0
+0.4
+0.0
+0.3
+0.3
+0.3
+5/5
+5/5
+0/5
+41
+firstMaybe
+[Maybe a] -> a
+1.2
+1.6
+1.4
+0.7
+0.5
+0.6
+0.4
+0.1
+0.2
+0.2
+0.5
+4/5
+4/5
+2/5
+42
+mbToEither
+Maybe a -> b -> Either a b
+47.4
+21.7
+24.2
+0/2
+0/5
+0/5
+43
+pred-match
+[a] -> (a -> Bool) -> Int
+1.1
+1.1
+3.6
+0.4
+0.4
+0.4
+2.0
+0.1
+0.3
+0.3
+0.2
+3/5
+3/5
+3/5
+44
+singleList
+Int -> [Int]
+0.3
+0.3
+0.4
+0.3
+0.0
+0.0
+0.0
+0.0
+0.2
+0.2
+0.3
+1/5
+1/5
+0/5
+Fig. 11. H+ synthesis times and solution quality on 44 benchmarks. We report the total time to first solution,
+time spend in the SMT solver, and time spent type checking (including demand analysis). ‘QB10’, ‘Q’, ‘0’,
+‘NO’ correspond to four variants of the search algorithm: TYGAR-QB [10], TYGAR-Q, TYGAR-0, and NOGAR.
+All times are in seconds. Absence indicates no solution found within the timeout of 60 seconds. Last three
+columns report the number of interesting solutions among the first five (or fewer, if fewer solutions were
+found within the timeout of 100 seconds). ‘H+’, ‘H-D‘, and ‘H-R‘ correspond, respectively, to the default
+configuration of H+, disabling the demand analyzer, and using structural typing over relevant typing.
+the abstract synthesis problem until one type checks concretely. Hence, this variant uses our
+abstract typing but does not use TYGAR.
+(3) TYGAR-0, which uses TYGAR with the initial cover A⊤= {τ, ⊥}.
+(4) TYGAR-Q, which uses TYGAR with the initial cover AQ.
+(5) TYGAR-QB [N], which is like TYGAR-Q, but the size of the abstract cover is bounded: once the
+cover reaches size N, it stops further refinement and reverts to NOGAR-style enumeration.
+Results. Fig. 11 reports total synthesis time for four out of the five variants. Baseline did not
+complete any benchmark within 60 seconds: it spent all this time creating the TTN, and is thus is
+omitted from tables and graphs. Fig. 12 plots the number of successfully completed benchmarks
+against time taken for the remaining four variants (higher and weighted to the left is better). As
+you can see, NOGAR is quite fast on easy problems, but then it plateaus, and can only solve 37 out
+of 44 queries. On the other hand, TYGAR-0 and TYGAR-Q are slower, and only manage to solve 35
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:23
+0
+10
+20
+30
+40
+50
+60
+seconds
+0
+10
+20
+30
+40
+benchmarks solved
+tygarq
+tygarqb10
+tygar0
+nogar
+Fig. 12. Queries solved over time for our initial vari-
+ants and the best refinement bound.
+0
+10
+20
+30
+40
+50
+seconds
+0
+10
+20
+30
+40
+benchmarks solved
+tygarqb5
+tygarqb10
+tygarqb15
+tygarqb20
+Fig. 13. Queries solved over time for varying refine-
+ment bounds. The variant’s number indicates the re-
+finement bound on the abstract cover.
+and 34 queries, respectively. After several refinement iterations, the ATNs grow too large, and these
+two variants spend a lot of time in the SMT solver, as shown in columns st-Q and st-0 in Fig. 11.
+Other than Baseline, no other variant spent any meaningful amount of time building the ATN.
+Bounded Refinement. We observe that NOGAR and TYGAR-Q have complimentary strengths and
+weaknesses: although NOGAR is usually faster, TYGAR-Q was able to find some solutions that
+NOGAR could not (for example, query 33: appBoth). We conclude that refinement is able to discover
+interesting abstractions, but because it is forced to make a new distinction between types in every
+iteration, after a while it is bound to start making irrelevant distinctions, and the ATN grows too
+large for the solver to efficiently navigate. To combine the strengths of the two approaches, we
+consider TYGAR-QB, which first uses refinement, and then switches to enumeration once the ATN
+reaches a certain bound on its number of places. To determine the optimal bound, we run the
+experiment with bounds 5, 10, 15, and 20.
+Fig. 13 plots the results. As you can see, for easy queries, a bound of 5 performs the best: this
+correspond to our intuition that when the solution is easily reachable, it is faster to simply enumerate
+more candidates than spend time on refinement. However, as benchmarks get harder, having more
+places at ones disposal renders searches faster: the bounds of 10 and 15 seem to offer a sweet spot.
+Our best variant—TYGAR-QB [10]—solves 43 out of 44 queries with the median synthesis time of
+1.4 seconds; in the rest of this section we use TYGAR-QB [10] as the default H+ configuration.
+TYGAR-QB [10] solves all queries that were solved by NOGAR plus six additional queries on
+which NOGAR times out. A closer look at these six queries indicates that they tend to be more
+complex. For example, recall that NOGAR times out on the query appBoth, while TYGAR-QB [10]
+finds a solution of size four in two seconds. Generally, our benchmark set is favorable for NOGAR:
+most Hoogle queries are easy, both because of programmers’ expectations of what Hoogle can
+do and also because we do not know the desired solution, and hence consider any (relevantly)
+well-typed solution correct. The benefits of refinement are more pronounced on queries with
+solution size four and higher: TYGAR-QB [10] solves 6 out of 7, while NOGAR solves only 2.
+6.2
+Quality of Solutions
+Setup. To evaluate the quality of the solutions, we ask H+ to return, for each query, at most five
+well-typed results within a timeout of 100 seconds. Complete results are available in Appendix B.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:24
+Z. Guo et al.
+We then manually inspect the solutions and for each one determine whether it is interesting, i.e.
+whether it is something a programmer might find useful, based on our own experience as Haskell
+programmers9. Fig. 11 reports for each query, the number of interesting solutions, divided by the
+number of total solutions found within the timeout. To evaluate the effects of relevant typing and
+demand analysis (Sec. 2.3), we compare three variants of H+: (1) H+ with all features enabled, based
+on TYGAR-QB, labeled H+. (2) Our tool without the demand analyzer filter, labeled H-D. (3) Our tool
+with structural typing in place of the relevant typing, labeled H-R (in this variant, the SMT solver is
+free to choose any non-negative number of tokens to assign to each query argument).
+Analysis. First of all, we observe that whenever an interesting solution was found by H-D or H-R,
+it was also found by H+, indicating that our filters are not overly conservative. We also observe
+that on easy queries—taking less than a second—demand analysis and relevant typing did little to
+help: if an interesting solution were found, then all three variants would find it and give it a high
+rank. However, on medium and hard queries—taking longer than a second—the demand analyzer
+and relevant typing helped promote interesting solutions higher in rank. Overall, 66/179 solutions
+produces by H+ were interesting (37%), compared with 65/189 for H-D (34%) and 26/199 for H-R
+(13%). As you can see, relevant typing is essential to ensure that interesting solutions even get to
+the top five, whereas demand analysis is more useful to reduce the total number of solutions the
+programmer has to sift through. This is not surprising, since relevant typing mainly filters out short
+programs while demand analysis is left to deal with longer ones. In our experience, demand analysis
+was most useful when queries involved types like Either a b, where one could produce a value of
+type a from a value of type b by constructing and destructing the Either. One final observation is
+that in benchmarks 14, 18, 33, and 35, H-R found fewer results in total that the other two versions;
+we attribute this to the SMT solver struggling with determining the appropriate token multiplicities
+for the initial marking.
+Noteworthy solutions. We presented three illustrative solutions generated by H+ as examples
+throughout Sec. 2:
+• a →[Maybe a] →a corresponds to benchmark 19 (fromFirstMaybes); the solution from
+Sec. 2 is generated at rank 18.
+• (a →a) →a →Int →a corresponds to benchmark 11 (applyNTimes); the solution from
+Sec. 2 is generated at rank 10.
+• Eq a => [(a,b)] →a →b corresponds to benchmark 18 (lookup); the solution from Sec. 2
+is generated at rank 1.
+H+ has also produced code snippets that surprised us: for example, on the query (a →b, a) →b,
+the authors’ intuition was to destruct the pair then apply the function. Instead H+ produces
+\x →uncurry ($) x or alternatively \x →uncurry id x, both of which, contrary to our intuition,
+are not only well-typed, but also are functionally equivalent to our intended solution. It was
+welcome to see a synthesis tool write more succinct code that its authors.
+7
+RELATED WORK
+Finally, we situate our work with other research into ways of synthesizing code that meets a given
+specification. For brevity, we restrict ourselves to the (considerable) literature that focuses on using
+types as specifications, and omit discussing methods that use e.g. input-output examples or tests
+[Gulwani 2011; Katayama 2012; Lee et al. 2018; Osera and Zdancewic 2015], logical specifications
+[Galenson et al. 2014; Srivastava et al. 2010] or program sketches [Solar-Lezama 2008].
+9Unfortunately, we do not have ground truth solutions for most of our queries, so we have to resort to subjective analysis.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:25
+API Search. Modern IDEs support various forms of code-completion, based on at the very least
+common prefixes of names (e.g. completing In into Integer or fo into foldl') and so on. Many tools
+use type information to only return completions that are well-typed at the point of completion.
+This approach is generalized by search based tools like Hoogle [Mitchell 2004] that search for type
+isomorphisms [Di Cosmo 1993] to find functions that “match” a given type signature (query). The
+above can be viewed as returning single-component results, as opposed to our goal of searching
+for terms that combine components in order to satisfy a given type query.
+Search using Statistical Models. Several groups have looked into using statistical methods to
+improve search-based code-completion. One approach is to analyze large code bases to precompute
+statistical models that can be used to predict the most likely sequences of method calls at a given
+point or that yield values of a given (first order) type [Raychev et al. 2014]. It is possible to generalize
+the above to train probabilistic models (grammars) that generate the most likely programs that must
+contain certain properties like method names, types, or keywords [Murali et al. 2017]. We conjecture
+that while the above methods are very useful for effectively searching for commonly occurring
+code snippets, they are less useful in functional languages, where higher-order components offer
+high degree of compositionality and lead to less code repetition.
+Type Inhabitation. The work most directly related to ours are methods based on finding terms that
+inhabit a (query) type [Urzyczyn 1997]. One approach is to use the correspondence between types
+and logics, to reduce the inhabitation question to that of validity of a logical formula (encoding the
+type). A classic example is Djinn [Augusstson 2005] which implements a decision procedure for
+intuitionistic propositional calculus [Dyckhoff and Pinto 1998] to synthesize terms that have a given
+type. Recent work by Rehof et al. extends the notion of inhabitation to support object oriented
+frameworks whose components behaviors can be specified via intersection types [Heineman
+et al. 2016]. However, both these approaches lack a relevancy requirement of its snippets, and
+hence return undesirable results. For example, when queried with a type a →[a], Djinn would
+yield a function that always returns the empty list. One way to avoid undesirable results is to
+use dependent or refinement types to capture the semantics of the desired terms more precisely.
+Synqid [Polikarpova et al. 2016] and Myth2 [Frankle et al. 2016] use different flavors of refinement
+types to synthesize recursive functions, while Agda [Norell 2008] makes heavy use of proof search
+to enable type- or hole-driven development. However, unlike H+, methods based on classical proof
+search do not scale up to large component libraries.
+Scalable Proof Search. One way to scale search is explored by [Perelman et al. 2012] which
+uses a very restricted form of inhabitation queries to synthesize local “auto-completion” terms
+corresponding to method names, parameters, field lookups and so on, but over massive component
+libraries (e.g. the .NET framework). In contrast, the InSynth system [Gvero et al. 2013] addresses
+the problem of scalability by extending proof search with a notion of succinctness that collapses
+types into equivalence classes, thereby abstracting the space over which proof search must be
+performed. Further, InSynth uses weights derived from empirical analysis of library usage to bias
+the search to more likely results. However, InSynth is limited to simple types i.e. does not support
+parametric polymorphism which is the focus of our work.
+Graph Reachability. Our approach is directly inspired by methods that reduce the synthesis
+problem to some form of reachability. Prospector [Mandelin et al. 2005] is an early exemplar
+where the components are unary functions that take a single input. Consequently, the component
+library can be represented as a directed graph of edges between input and output types, and
+synthesis is reduced to finding a path from the query’s input type to its output type. SyPet [Feng
+et al. 2017], which forms the basis of our work, is a generalization of Prospector to account for
+general first-order functions which can take multiple inputs, thereby generalizing synthesis to
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:26
+Z. Guo et al.
+reachability on Petri nets. The key contribution of our work is the notion of TYGAR that generalizes
+SyPet’s approach to polymorphic and higher-order components.
+Counterexample-Guided Abstraction Refinement. While the notion of counterexample-guided
+abstraction refinement (CEGAR) is classical at this point [Clarke et al. 2010], there are two lines of
+work in particular closely related to ours. First, [Ganty et al. 2007; Kloos et al. 2013] describe an
+iterative abstraction-refinement process for verifying Petri nets, using SMT [Esparza et al. 2014].
+However, in their setting, the refinement loop is used to perform unbounded verification of the
+(infinite-state) Petri net. In contrast, H+ performs a bounded search on each Petri net, but uses
+TYGAR to refine the net itself with new type instantiations that eliminate the construction of
+ill-typed terms. Second, Blaze [Wang et al. 2018] describes a CEGAR approach for synthesizing
+programs from input-output examples, by iteratively refining finite tree-automata whose states
+correspond to values in a predicate-abstraction domain. Programs that do not satisfy the input-
+output tests are used to iteratively refine the domain until a suitable correct program is found.
+Our approach differs in that we aim to synthesize terms of a given type. Consequently, although
+our refinement mechanism is inspired by Blaze, we develop a novel abstract domain—a finite
+sub-lattice of the type subsumption lattice—and show how to use proofs of untypeability to refine
+this domain. Moreover, we show how CEGAR can be combined with Petri nets (as opposed to tree
+automata) in order to enforce relevancy.
+Types and Abstract Interpretation. The connection between types and abstract interpretation
+(AI) was first introduced in [Cousot 1997]. The goal of their work, however, was to cast existing
+type systems in the framework of AI, while we use this framework to systematically construct new
+type systems that further abstract an existing one. More recently, [Garcia et al. 2016] used the AI
+framework to formalize gradual typing. Like that work, we use AI to derive an abstract type system
+for our language, but otherwise the goals of the two techniques are very different. Moreover, as we
+hint in Sec. 4.3, our abstract domain is subtly but crucially different from traditional gradual typing,
+because our refinement algorithm relies on non-linear terms (i.e. types with repeated variables).
+8
+CONCLUSIONS
+We have presented TYGAR, a new algorithm for synthesizing terms over polymorphic components
+that inhabit a given query type. The key challenge here is the infinite space of monomorphic
+instances arising from the polymorphic signatures. We introduced a new notion of abstract typing
+that allows us to use ideas from the framework of abstract interpretation to compute a finite
+overapproximation of this search space. We then show how spurious terms that are well-typed in
+the abstract domain but ill-typed in reality, yield proofs of untypeability which can then iteratively
+refine the abstract search space until a well-typed solution is found.
+We have implemented TYGAR in H+, and our evaluation on a suite of 44 queries demonstrates
+the benefits of counterexample-driven refinement. In particular, we show how lazily refining
+a coarse abstract domain using proofs of untypeability allows us to synthesize correct results
+faster than a naive approach that eagerly instantiates all the types from the query followed by
+a brute-force enumeration. Our experiments further demonstrate that the gains from iterative
+refinement over enumeration are even more pronounced on harder queries over more complex
+types. Our support for polymorphism also allows H+ to work with higher-order and type-class
+constrained components, which, thanks to parametricity, allows for more precise queries than
+simple monomorphic types.
+In future work it would be valuable to investigate ways to improve the quality of the results, e.g.
+by prioritizing components that are more popular, or less partial, or by extending our method to
+use other forms of specifications such as examples or refinement types.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:27
+ACKNOWLEDGMENTS
+The authors would like to thank Neil Mitchell for providing the Hoogle data and helpful feedback
+on the H+ web interface. We are also grateful to the anonymous reviewers of this and older versions
+of the paper for their careful reading and many constructive suggestions.
+REFERENCES
+Rajeev Alur, Arjun Radhakrishna, and Abhishek Udupa. 2017. Scaling Enumerative Program Synthesis via Divide and
+Conquer. In Tools and Algorithms for the Construction and Analysis of Systems - 23rd International Conference, TACAS
+2017, Held as Part of the European Joint Conferences on Theory and Practice of Software, ETAPS 2017, Uppsala, Sweden,
+April 22-29, 2017, Proceedings, Part I. 319–336. https://doi.org/10.1007/978-3-662-54577-5_18
+Lennart Augusstson. 2005. Djinn. https://github.com/augustss/djinn.
+Hendrik Pieter Barendregt. 1985. The lambda calculus - its syntax and semantics. Studies in logic and the foundations of
+mathematics, Vol. 103. North-Holland.
+Edmund M. Clarke, Robert P. Kurshan, and Helmut Veith. 2010. The Localization Reduction and Counterexample-Guided
+Abstraction Refinement. In Time for Verification, Essays in Memory of Amir Pnueli. 61–71.
+https://doi.org/10.1007/
+978-3-642-13754-9_4
+Patrick Cousot. 1997. Types As Abstract Interpretations. In Proceedings of the 24th ACM SIGPLAN-SIGACT Symposium on
+Principles of Programming Languages (POPL ’97). ACM, New York, NY, USA, 316–331. https://doi.org/10.1145/263699.
+263744
+Patrick Cousot and Radhia Cousot. 1977. Abstract Interpretation: A Unified Lattice Model for Static Analysis of Programs
+by Construction or Approximation of Fixpoints. In Proceedings of the 4th ACM SIGACT-SIGPLAN Symposium on Principles
+of Programming Languages (POPL ’77). ACM, New York, NY, USA, 238–252. https://doi.org/10.1145/512950.512973
+Leonardo Mendonça de Moura and Nikolaj Bjørner. 2008. Z3: An Efficient SMT Solver. In TACAS (LNCS), Vol. 4963. Springer,
+337–340.
+Roberto Di Cosmo. 1993. Deciding Type isomorphisms in a type assignment framework. Journal of Functional Programming
+3, 3 (1993), 485–525. https://doi.org/10.1017/S0956796800000861 Special Issue on ML.
+Roy Dyckhoff and LuÃŋs Pinto. 1998. Proof Search in Constructive Logics. In In Sets and proofs. Cambridge University
+Press, 53–65.
+Javier Esparza, Ruslán Ledesma-Garza, Rupak Majumdar, Philipp J. Meyer, and Filip Niksic. 2014. An SMT-Based Approach
+to Coverability Analysis. In Computer Aided Verification - 26th International Conference, CAV 2014, Held as Part of the
+Vienna Summer of Logic, VSL 2014, Vienna, Austria, July 18-22, 2014. Proceedings. 603–619.
+https://doi.org/10.1007/
+978-3-319-08867-9_40
+Yu Feng, Ruben Martins, Yuepeng Wang, Isil Dillig, and Thomas W. Reps. 2017. Component-based synthesis for complex
+APIs. In POPL.
+Jonathan Frankle, Peter-Michael Osera, David Walker, and Steve Zdancewic. 2016. Example-directed synthesis: a type-
+theoretic interpretation. In Proceedings of the 43rd Annual ACM SIGPLAN-SIGACT Symposium on Principles of Programming
+Languages, POPL 2016, St. Petersburg, FL, USA, January 20 - 22, 2016. 802–815. https://doi.org/10.1145/2837614.2837629
+Joel Galenson, Philip Reames, Rastislav Bodik, Björn Hartmann, and Koushik Sen. 2014. CodeHint: Dynamic and Interactive
+Synthesis of Code Snippets. In Proceedings of the 36th International Conference on Software Engineering (ICSE 2014). ACM,
+New York, NY, USA, 653–663. https://doi.org/10.1145/2568225.2568250
+Pierre Ganty, Jean-François Raskin, and Laurent Van Begin. 2007. From Many Places to Few: Automatic Abstraction
+Refinement for Petri Nets. In Petri Nets and Other Models of Concurrency - ICATPN 2007, 28th International Conference on
+Applications and Theory of Petri Nets and Other Models of Concurrency, ICATPN 2007, Siedlce, Poland, June 25-29, 2007,
+Proceedings. 124–143. https://doi.org/10.1007/978-3-540-73094-1_10
+Ronald Garcia, Alison M. Clark, and Éric Tanter. 2016. Abstracting gradual typing. In Proceedings of the 43rd Annual ACM
+SIGPLAN-SIGACT Symposium on Principles of Programming Languages, POPL 2016, St. Petersburg, FL, USA, January 20 -
+22, 2016. 429–442. https://doi.org/10.1145/2837614.2837670
+Susanne Graf and Hassen Saidi. 1997. Construction of abstract state graphs with PVS. In Computer Aided Verification. 72–83.
+Sumit Gulwani. 2011. Automating string processing in spreadsheets using input-output examples. In Proceedings of the 38th
+ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages, POPL 2011, Austin, TX, USA, January 26-28,
+2011. 317–330. https://doi.org/10.1145/1926385.1926423
+Tihomir Gvero, Viktor Kuncak, Ivan Kuraj, and Ruzica Piskac. 2013. Complete completion using types and weights. In PLDI.
+George T. Heineman, Jan Bessai, Boris Düdder, and Jakob Rehof. 2016. A Long and Winding Road Towards Modular
+Synthesis. In Leveraging Applications of Formal Methods, Verification and Validation: Foundational Techniques - 7th
+International Symposium, ISoLA 2016, Imperial, Corfu, Greece, October 10-14, 2016, Proceedings, Part I. 303–317. https:
+//doi.org/10.1007/978-3-319-47166-2_21
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:28
+Z. Guo et al.
+Susumu Katayama. 2012. An analytical inductive functional programming system that avoids unintended programs. In
+Proceedings of the ACM SIGPLAN 2012 Workshop on Partial Evaluation and Program Manipulation, PEPM 2012, Philadelphia,
+Pennsylvania, USA, January 23-24, 2012. 43–52. https://doi.org/10.1145/2103746.2103758
+Johannes Kloos, Rupak Majumdar, Filip Niksic, and Ruzica Piskac. 2013. Incremental, Inductive Coverability. In Computer
+Aided Verification - 25th International Conference, CAV 2013, Saint Petersburg, Russia, July 13-19, 2013. Proceedings. 158–173.
+https://doi.org/10.1007/978-3-642-39799-8_10
+Woosuk Lee, Kihong Heo, Rajeev Alur, and Mayur Naik. 2018. Accelerating Search-based Program Synthesis Using Learned
+Probabilistic Models. In PLDI.
+David Mandelin, Lin Xu, Rastislav Bodík, and Doug Kimelman. 2005. Jungloid Mining: Helping to Navigate the API Jungle.
+In PLDI.
+Neil Mitchell. 2004. Hoogle. https://www.haskell.org/hoogle/.
+Vijayaraghavan Murali, Swarat Chaudhuri, and Chris Jermaine. 2017. Bayesian specification learning for finding API usage
+errors. In Proceedings of the 2017 11th Joint Meeting on Foundations of Software Engineering, ESEC/FSE 2017, Paderborn,
+Germany, September 4-8, 2017. 151–162. https://doi.org/10.1145/3106237.3106284
+Ulf Norell. 2008. Dependently Typed Programming in Agda. In Advanced Functional Programming, 6th International School,
+AFP 2008, Heijen, The Netherlands, May 2008, Revised Lectures. 230–266. https://doi.org/10.1007/978-3-642-04652-0_5
+Peter-Michael Osera and Steve Zdancewic. 2015. Type-and-example-directed program synthesis. In Proceedings of the 36th
+ACM SIGPLAN Conference on Programming Language Design and Implementation, Portland, OR, USA, June 15-17, 2015.
+619–630. https://doi.org/10.1145/2737924.2738007
+Daniel Perelman, Sumit Gulwani, Thomas Ball, and Dan Grossman. 2012. Type-directed completion of partial expressions.
+In ACM SIGPLAN Conference on Programming Language Design and Implementation, PLDI ’12, Beijing, China - June 11 -
+16, 2012. 275–286. https://doi.org/10.1145/2254064.2254098
+Benjamin C. Pierce. 2004. Advanced Topics in Types and Programming Languages. The MIT Press.
+Benjamin C. Pierce and David N. Turner. 2000. Local type inference. ACM Trans. Program. Lang. Syst. 22, 1 (2000), 1–44.
+Gordon Plotkin. 1970. Lattice Theoretic Properties of Subsumption. Edinburgh University, Department of Machine Intelligence
+and Perception. https://books.google.com/books?id=2p09cgAACAAJ
+Nadia Polikarpova, Ivan Kuraj, and Armando Solar-Lezama. 2016. Program synthesis from polymorphic refinement types.
+In Proceedings of the 37th ACM SIGPLAN Conference on Programming Language Design and Implementation, PLDI 2016,
+Santa Barbara, CA, USA, June 13-17, 2016. 522–538. https://doi.org/10.1145/2908080.2908093
+Veselin Raychev, Martin Vechev, and Eran Yahav. 2014. Code Completion with Statistical Language Models. SIGPLAN Not.
+49, 6 (June 2014), 419–428. https://doi.org/10.1145/2666356.2594321
+Ilya Sergey, Dimitrios Vytiniotis, Simon L. Peyton Jones, and Joachim Breitner. 2017. Modular, higher order cardinality
+analysis in theory and practice. J. Funct. Program. 27 (2017), e11. https://doi.org/10.1017/S0956796817000016
+Kensen Shi, Jacob Steinhardt, and Percy Liang. 2019. FrAngel: Component-based Synthesis with Control Structures. Proc.
+ACM Program. Lang. 3, POPL, Article 73 (Jan. 2019), 29 pages. https://doi.org/10.1145/3290386
+Jeremy G. Siek and Walid Taha. 2006. Gradual Typing for Functional Languages. In IN SCHEME AND FUNCTIONAL
+PROGRAMMING WORKSHOP. 81–92.
+Armando Solar-Lezama. 2008. Program Synthesis by Sketching. Ph.D. Dissertation. Berkeley, CA, USA. Advisor(s) Bodik,
+Rastislav. AAI3353225.
+Saurabh Srivastava, Sumit Gulwani, and Jeffrey S. Foster. 2010. From program verification to program synthesis. In
+Proceedings of the 37th ACM SIGPLAN-SIGACT Symposium on Principles of Programming Languages, POPL 2010, Madrid,
+Spain, January 17-23, 2010. 313–326. https://doi.org/10.1145/1706299.1706337
+Pawel Urzyczyn. 1997. Inhabitation in Typed Lambda-Calculi (A Syntactic Approach). In Typed Lambda Calculi and
+Applications, Third International Conference on Typed Lambda Calculi and Applications, TLCA ’97, Nancy, France, April 2-4,
+1997, Proceedings. 373–389. https://doi.org/10.1007/3-540-62688-3_47
+Philip Wadler and Stephen Blott. 1989. How to Make ad-hoc Polymorphism Less ad-hoc. In Conference Record of the
+Sixteenth Annual ACM Symposium on Principles of Programming Languages, Austin, Texas, USA, January 11-13, 1989.
+60–76. https://doi.org/10.1145/75277.75283
+Xinyu Wang, Isil Dillig, and Rishabh Singh. 2018. Program synthesis using abstraction refinement. PACMPL 2, POPL (2018).
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:29
+Typing
+Λ; Γ ⊢E :: t
+T-Var
+Γ(x) = b
+Λ; Γ ⊢x :: b
+T-App
+Λ(c) = ∀τ.T
+σT = bi →b
+Λ; Γ ⊢ei :: bi
+Λ; Γ ⊢c ei :: b
+T-Fun
+Λ; Γ,x : b ⊢E :: t
+Λ; Γ ⊢λx.E :: b →t
+Fig. 14. Uncurried version of declarative typing.
+A
+PROOFS
+A.1
+Type Transformers
+Lemma A.1 (Monotonicity of Substitution). If σ ′ ⊑σ then σ ′B ⊑σB.
+Lemma A.2 (Monotonicity of Unification). If B1 ⊑B2 then mgu(B, B1) ⊑mgu(B, B2)
+Lemma A.3 (Monotonicity of Type Transformers). For any component c and any types B1
+i
+and B2
+i , such that B1
+i ⊑B2
+i , we have JcK(B1
+i ) ⊑JcK(B2
+i ).
+Proof. Let fresh(Λ(c)) = Bi →B. By the definition of type transformers, we have
+JcK(B1
+i ) = σ1B
+σ1 = mgu(Bi, B1
+i )
+JcK(B2
+i ) = σ2B
+σ2 = mgu(Bi, B2
+i )
+Since B1
+i ⊑B2
+i , we have σ1 ⊑σ2 by Theorem A.2, and hence σ1B ⊑σ2B by Theorem A.1.
+□
+Lemma A.4 (Soundness of Type Transformers). If fresh(Λ(c)) = Bi →B and σBi ⊑B′
+i then
+σB ⊑JcK(B′
+i).
+Proof. By Theorem A.3, since σBi ⊑B′
+i, we have JcK(σBi) ⊑JcK(B′
+i). But JcK(σBi) = σB, because
+mgu(B,σB) ≡σ. Hence σB ⊑JcK(B′
+i) as desired.
+□
+A.2
+Algorithmic Typing
+In the following, we use a version the declarative type system in Fig. 14, which is defined over
+uncurried applications, and hence more closely matches algorithmic typing. It is straightforward to
+show that for terms in η-long form, this type system is equivalent to the one in Fig. 5.
+Lemma A.5 (Soundness of inference). If Λ; Γ ⊢e =⇒B and b ⊑B, then Λ; Γ ⊢e :: b.
+Proof. By induction on the derivation of Λ; Γ ⊢e =⇒B.
+• Case I-Var: Given the conclusion Λ; Γ ⊢x =⇒b′, we get to assume Γ(x) = b′. Consequently,
+applying T-Var, we get Λ; Γ ⊢x :: b′. But since b′ is ground and b ⊑b′, we have b′ = b.
+• Case I-App: Given the conclusion Λ; Γ ⊢c ei =⇒JcK(Bi), we get to assume Λ; Γ ⊢ei =⇒Bi.
+Assume fresh(Λ(c)) = B′
+i →B′. By definition of JcK we have JcK(Bi) = σ1B′ where σ1 =
+mgu(B′
+i, Bi). By the assumption of the theorem b ⊑B = JcK(Bi), and hence there exists σ2
+such that b = σ2(JcK(Bi)) = (σ2 ◦σ1)B′.
+Let ρ be some substitution such that (ρ ◦σ2 ◦σ1)B′
+i, is ground for all for all B′
+i; we will denote
+these ground types bi. Then each bi = (ρ ◦σ2)(σ1B′
+i) = (ρ ◦σ2)(σ1Bi) (since σ1 is a unifier),
+and hence bi ⊑Bi. Then by the IH, we can show for all ei: Λ; Γ ⊢ei :: bi (1).
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:30
+Z. Guo et al.
+Finally, let us use T-App to construct the derivation of Λ; Γ ⊢c ei :: b The middle premise
+follows with σ = ρ ◦σ2 ◦σ1 (note that σB′ = ρb = b, since b is already ground). We get the
+last premise by (1).
+□
+Lemma A.6 (Completeness of Inference). If Λ; Γ ⊢e :: b, then ∃B.Λ; Γ ⊢e =⇒B and b ⊑B.
+Proof. By induction on the derivation of Λ; Γ ⊢e :: b.
+• Case T-Var: Given the conclusion Λ; Γ ⊢x :: b, we get to assume Γ(x) = b. Using I-Var we
+build the derivation Λ; Γ ⊢x =⇒b. Trivially b ⊑b by reflexivity of ⊑.
+• Case T-App: Given the conclusion Λ; Γ ⊢c ei :: b, we get to assume for each i: Λ; Γ ⊢ei :: bi,
+where bi →b = σT and T = B′
+i →B′ = fresh(Λ(c)). By IH we obtain Bi, such that Λ; Γ ⊢
+ei =⇒Bi and bi ⊑Bi, for each i. Using I-Var we build the derivation Λ; Γ ⊢c ei =⇒JcK(Bi).
+It remains to show that b ⊑JcK(Bi).
+Since bi ⊑Bi and bi = σB′
+i, we get σB′
+i ⊑Bi. Hence we can apply Theorem A.4 to conclude
+σB′ ⊑JcK(Bi), but σB′ = b, so we obtain the desired conclusion.
+• Case T-Fun: impossible since b is a base type.
+□
+Lemma A.7 (Soundness of Checking). If Λ; Γ ⊢E ⇐= t, then Λ; Γ ⊢E :: t.
+Proof. By induction on the derivation of Λ; Γ ⊢E ⇐= t.
+• Case C-Base: Given the conclusion Λ; Γ ⊢e ⇐= b, we get to assume Λ; Γ ⊢e =⇒B and
+b ⊑B. By Theorem A.5, we directly obtain Λ; Γ ⊢e :: b.
+• Case C-Fun: Given the conclusion Λ; Γ ⊢λx.E ⇐= b →t, we get to assume Λ; Γ,x : b ⊢
+E ⇐= t. By IH, we get Λ; Γ,x : b ⊢E :: t. Hence we use T-Fun to obtain Λ; Γ ⊢λx.e :: b →t.
+□
+Lemma A.8 (Completeness of Checking). If Λ; Γ ⊢E :: t then Λ; Γ ⊢E ⇐= t.
+Proof. By induction on the derivation of Λ; Γ ⊢E :: t.
+• Case T-Var, T-App: Given Λ; Γ ⊢e :: b, we use Theorem A.6 to derive Λ; Γ ⊢e =⇒B and
+b ⊑B. Hence we apply C-Base to obtain Λ; Γ ⊢e ⇐= b.
+• Case T-Fun: Given the conclusion Λ; Γ ⊢λx.E :: b →t we get to assume Λ; Γ,x : b ⊢E :: t.
+By IH Λ; Γ,x : b ⊢E ⇐= t. We apply C-Fun to obtain Λ; Γ ⊢λx.e ⇐= b →t.
+□
+Theorem A.9 (Type Checking is Sound and Complete). Λ; · ⊢E :: t iff Λ; · ⊢E ⇐= t.
+Proof. By Theorem A.7 and Theorem A.8.
+□
+A.3
+Abstract Typing
+Lemma A.10 (Refinement). If B′ ⊑B and A′ ⪯A, then αA′(B′) ⊑αA(B).
+Proof. Let A = αA(B), A′ = αA′(B′). Because A ⊆A′, we have A ∈A′. Since B′ ⊑B ⊑A, we
+have A′ ⊑A by definition of αA′.
+□
+Lemma A.11 (Inference Refinement). If A′ ⪯A and Λ; Γ ⊢A′ e =⇒B′, then Λ; Γ ⊢A e =⇒B
+and B′ ⊑B.
+Proof. By induction on the derivation of Λ; Γ ⊢A′ e =⇒B′.
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:31
+• Case I-Var: Follows by Theorem A.10.
+• Case I-App: Given the conclusion Λ; Γ ⊢A′ c ei =⇒αA′
+
+JcK(B′
+i)
+
+, we get to assume Λ; Γ ⊢A′
+ei =⇒B′
+i for all i. By IH we get Λ; Γ ⊢A ei =⇒Bi and B′
+i ⊑Bi. We use I-App to obtain
+Λ; Γ ⊢A c ei =⇒αA
+
+JcK(Bi)
+
+. Furthermore, by Theorem A.3, we get JcK(B′
+i) ⊑JcK(Bi), and
+hence by Theorem A.10, αA′
+
+JcK(B′
+i)
+
+⊑αA
+
+JcK(Bi)
+
+.
+□
+Theorem A.12 (Typing Preservation). If A′ ⪯A and Λ; Γ ⊢A′ E ⇐= t then Λ; Γ ⊢A E ⇐= t.
+Proof. By induction on the derivation of Λ; Γ ⊢A′ E ⇐= t.
+• Case C-Base: Given the conclusion Λ; Γ ⊢A′ e ⇐= b, we get to assume Λ; Γ ⊢A′ e =⇒B′
+and b ⊑B′. Then by Theorem A.11 we get Λ; Γ ⊢A e =⇒B and B′ ⊑B, hence b ⊑B. We use
+C-Base to conclude Λ; Γ ⊢A e ⇐= b.
+• Case C-Fun: Given the conclusion Λ; Γ ⊢A′ λx.E ⇐= b →t we get to assume Λ; Γ,x : b ⊢A′
+E ⇐= t. By IH we get Λ; Γ,x : b ⊢A E ⇐= t. We use C-Fun to colclude Λ; Γ ⊢A λx.E ⇐=
+b →t.
+□
+A.4
+Synthesis
+Theorem A.13. The synthesis problem in λH is undecidable.
+Proof. By reduction from the Post Correspondence Problem (PCP). Let [(a1,b1), . . . , (an,bn)] be
+an instance of the PCP, where each ai, bi are bit strings. We translate this instance into a synthesis
+problem (Λ,T) as follows.
+The set of type constructors in Λ is: two nullary constructors Start and Goal, two unary con-
+structors T and F, and a single binary constructor P. Given a bit string bs and a type T, the type
+wrap(T,bs) is defined as follows:
+wrap(T, []) = T
+wrap(T, 0 : bs) = wrap(F T,bs)
+wrap(T, 1 : bs) = wrap(T T,bs)
+Now we can define the set of components in Λ:
+• for each pair (ai,bi), there is a componentsi of type Start →P wrap(Start,ai) wrap(Start,bi);
+• for each pair (ai,bi), there is a component ni of type ∀αβ.P α β →P wrap(α,ai) wrap(β,bi);
+• a component f of type ∀α.P α α →Goal.
+The query type T is Start →Goal. The sequence of P instances in the solution to this synthesis
+problem corresponds to the solution to the PCP.
+□
+For example, a PCP instance [(1, 101), (10, 00), (011, 11)] gives rise to the following components:
+s1 :: Start →P (T Start) (T (F (T Start)))
+s2 :: Start →P (F (T Start)) (F (F Start))
+s3 :: Start →P (T (T (F Start))) (T (T Start))
+n1 :: P α β →P (T α) (T (F (T β)))
+n2 :: P α β →P (F (T α)) (F (F β))
+n3 :: P α β →P (T (T (F α))) (T (T β))
+f :: P α α →Goal
+The solution for this instance is \x →f (n3 (n2 (n3 (s1 x)))).
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:32
+Z. Guo et al.
+A.5
+Proof of Untypeability
+For a P : e →B⊥and a term e∗, define
+I1: For any e ∈subterms(e∗), if Λ; Γ ⊢e =⇒B, then B ⊑P[e];
+I2: For any e = c ej ∈subterms(e∗), JcK(P[ej]) ⊑P[e];
+I3: P[e∗] = ⊥.
+Lemma A.14 (Precision of Inference). If I1 ∧I2, range(P) ⊆A, e ∈subterms(e∗), and Λ; Γ ⊢A
+e =⇒B, then B ⊑P[e].
+Proof. By induction on the derivation of Λ; Γ ⊢A e =⇒B.
+• Case I-Var: Given the conclusion Λ; Γ ⊢A x =⇒αA(b), we get to assume Γ(x) = b, and
+hence Λ; Γ ⊢x =⇒b. By I1, we have b ⊑P[x].
+• Case I-App: Given the conclusion Λ; Γ ⊢A c ei =⇒αA(JcK(Bi)), we get to assume Λ; Γ ⊢A
+ei =⇒Bi for each i. By IH, we have Bi ⊑P[ei] for each i. Then by Theorem A.3 we have
+JcK(Bi) ⊑JcK(P[ei]), and by I2 we have JcK(P[ei]) ⊑P[e]; hence JcK(Bi) ⊑P[e]. Applying
+αA to both sides, by Theorem A.10 we have αA(JcK(Bi)) ⊑αA(P[e]). But αA(P[e]) = P[e]
+because range(P) ⊆A, hence we get αA(JcK(Bi)) ⊑P[e] as required.
+□
+Lemma A.15 (Untypeability). Let E = λxi.e, t = bi →b, e∗= r e, where Λ(r) = b →b. If
+I1 ∧I2 ∧I3 and range(P) ⊆A, then Λ; · ⊬A E ⇐= t.
+Proof. Assume the contrary: that we can derive Λ; · ⊢A E ⇐= t. Then we must be able to derive
+Λ; Γ ⊢A e ⇐= b, where Γ = xi : bi. By C-Base, if we derive Λ; Γ ⊢A e =⇒B, it must be that b ⊑B
+(note that inference result always exists and is unique).
+By Theorem A.14, Λ; Γ ⊢A e∗=⇒B∗⊑P[e∗], but by I3 we have P[e∗] = ⊥, hence B∗= ⊥. By
+I-App and considering Λ(r), we have B∗= σb, where σ = mgu(B,b). The only σ such that σb = ⊥
+is σ⊥, hence we get mgu(B,b) = σ⊥. But then it cannot be that b ⊑B, a contradiction.
+□
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:33
+B
+EVALUATION RESULTS
+appBoth: (a →b) →(a →c) →a →(b, c)
+Demand Analysis
+(,) (arg2 arg0) (arg1 arg0)
+(,) (($) arg2 arg0) (arg1 arg0)
+(,) (arg2 (fromJust Nothing)) (arg1 arg0)
+(,) (arg2 (head [])) (arg1 arg0)
+(,) (arg2 (last [])) (arg1 arg0)
+No Demand Analysis
+(,) (arg2 arg0) (arg1 arg0)
+(,) (($) arg2 arg0) (arg1 arg0)
+(,) (arg2 (fromJust Nothing)) (arg1 arg0)
+(,) (arg2 (head [])) (arg1 arg0)
+(,) (arg2 (last [])) (arg1 arg0)
+No Relevancy
+(,) (arg2 arg0) (arg1 arg0)
+countFilter: (a →Bool) →[a] →Int
+Demand Analysis
+length (map arg1 arg0)
+length (dropWhile arg1 arg0)
+length (filter arg1 arg0)
+length (takeWhile arg1 arg0)
+length (repeat (arg1 (head arg0)))
+No Demand Analysis
+length (map arg1 arg0)
+length (dropWhile arg1 arg0)
+length (filter arg1 arg0)
+length (takeWhile arg1 arg0)
+length (repeat (arg1 (head arg0)))
+No Relevancy
+length (map arg1 arg0)
+length (dropWhile arg1 arg0)
+length (filter arg1 arg0)
+length (takeWhile arg1 arg0)
+length (repeat arg1)
+mbElem: Eq a => a →[a] →Maybe a
+Demand Analysis
+lookup arg1 (zip arg0 [])
+lookup arg1 (zip [] arg0)
+lookup arg1 (zip arg0 arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:34
+Z. Guo et al.
+No Demand Analysis
+lookup arg1 (zip arg0 [])
+lookup arg1 (zip [] arg0)
+lookup arg1 (zip arg0 arg0)
+No Relevancy
+Just arg1
+listToMaybe arg0
+Nothing
+listToMaybe (cycle arg0)
+listToMaybe (init arg0)
+hoogle01: (a →b) →[a] →b
+Demand Analysis
+arg1 (head arg0)
+arg1 (last arg0)
+($) arg1 (head arg0)
+($) arg1 (last arg0)
+arg1 (head (cycle arg0))
+No Demand Analysis
+arg1 (head arg0)
+arg1 (last arg0)
+($) arg1 (head arg0)
+($) arg1 (last arg0)
+arg1 (head (cycle arg0))
+No Relevancy
+arg1 (head arg0)
+arg1 (last arg0)
+arg1 (fromJust (listToMaybe arg0))
+arg1 (fromJust Nothing)
+($) arg1 (head arg0)
+fromFirstMaybes: a →[Maybe a] →a
+Demand Analysis
+fromMaybe arg1 (head arg0)
+fromMaybe arg1 (last arg0)
+maybe arg1 id (head arg0)
+maybe arg1 id (last arg0)
+bool arg1 arg1 (null arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:35
+No Demand Analysis
+fromRight arg1 (Left arg0)
+fromLeft arg1 (Right arg0)
+fromMaybe arg1 (head arg0)
+fromMaybe arg1 (last arg0)
+fromLeft arg1 (Right (catMaybes arg0))
+No Relevancy
+fromLeft arg1 (Right arg0)
+fromRight arg1 (Left arg0)
+fromLeft arg1 (Right arg1)
+fromRight arg1 (Right arg1)
+fromLeft arg1 (Left arg1)
+mbAppFirst: b →(a →b) →[a] →b
+Demand Analysis
+maybe arg2 arg1 (listToMaybe arg0)
+fromMaybe arg2 (listToMaybe (map arg1 arg0))
+fromLeft arg2 (Right (arg1 (head arg0)))
+No Demand Analysis
+maybe arg2 arg1 (listToMaybe arg0)
+fromLeft (arg1 (head arg0)) (Right arg2)
+fromRight (arg1 (head arg0)) (Right arg2)
+fromLeft (arg1 (head arg0)) (Left arg2)
+fromRight (arg1 (head arg0)) (Left arg2)
+No Relevancy
+arg1 (head arg0)
+arg1 (last arg0)
+fromLeft arg2 (Right arg1)
+fromRight arg2 (Left arg1)
+($) arg1 (head arg0)
+appendN: Int →[a] →[a]
+Demand Analysis
+drop arg1 arg0
+take arg1 arg0
+drop arg1 (cycle arg0)
+take arg1 (cycle arg0)
+drop arg1 (init arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:36
+Z. Guo et al.
+No Demand Analysis
+drop arg1 arg0
+take arg1 arg0
+drop arg1 (cycle arg0)
+take arg1 (cycle arg0)
+drop arg1 (init arg0)
+No Relevancy
+cycle arg0
+init arg0
+reverse arg0
+tail arg0
+drop arg1 arg0
+firstMaybe: [Maybe a] →a
+Demand Analysis
+fromJust (head arg0)
+fromJust (last arg0)
+head (catMaybes arg0)
+last (catMaybes arg0)
+fromJust (head (cycle arg0))
+No Demand Analysis
+fromJust (head arg0)
+fromJust (last arg0)
+head (catMaybes arg0)
+last (catMaybes arg0)
+fromJust (head (cycle arg0))
+No Relevancy
+head []
+last []
+fromJust (head arg0)
+fromJust (last arg0)
+fromJust Nothing
+mapEither: (a →Either b c) →[a] →([b], [c])
+Demand Analysis
+partitionEithers (map arg1 arg0)
+partitionEithers (repeat (arg1 (head arg0)))
+partitionEithers (repeat (arg1 (last arg0)))
+curry (last []) arg1 arg0
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:37
+No Demand Analysis
+partitionEithers (map arg1 arg0)
+partitionEithers (repeat (arg1 (head arg0)))
+partitionEithers (repeat (arg1 (last arg0)))
+curry (head []) arg1 arg0
+curry (last []) arg1 arg0
+No Relevancy
+partitionEithers (map arg1 arg0)
+head-rest: [a] →(a, [a])
+Demand Analysis
+fromJust (uncons arg0)
+(,) (last arg0) arg0
+(,) (head arg0) arg0
+(,) (last arg0) []
+(,) (head arg0) []
+No Demand Analysis
+fromJust (uncons arg0)
+(,) (last arg0) arg0
+(,) (head arg0) arg0
+(,) (last arg0) []
+(,) (head arg0) []
+No Relevancy
+head []
+last []
+fromJust (uncons arg0)
+fromJust Nothing
+(,) (head arg0) arg0
+applyPair: (a →b, a) →b
+Demand Analysis
+uncurry ($) arg0
+uncurry id arg0
+($) (fst arg0) (snd arg0)
+No Demand Analysis
+uncurry ($) arg0
+uncurry id arg0
+($) (fst arg0) (snd arg0)
+uncurry (head []) arg0
+($) (head []) arg0
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:38
+Z. Guo et al.
+No Relevancy
+uncurry id arg0
+uncurry ($) arg0
+fromJust Nothing
+head []
+last []
+maybe: Maybe a →a →Maybe a
+Demand Analysis
+Just (fromMaybe arg0 arg1)
+Just (maybe arg0 id arg1)
+listToMaybe (repeat (fromMaybe arg0 arg1))
+curry (last []) arg1 arg0
+curry (last []) arg0 arg1
+No Demand Analysis
+Just (fromMaybe arg0 arg1)
+fromRight arg1 (Left arg0)
+fromLeft arg1 (Right arg0)
+fromRight (Just arg0) (Left arg1)
+fromLeft (Just arg0) (Left arg1)
+No Relevancy
+Just arg0
+Nothing
+fromRight arg1 (Left arg0)
+fromLeft arg1 (Right arg0)
+($) id arg1
+multiAppPair: (a →b, a →c) →a →(b, c)
+Demand Analysis
+(,) (($) (fst arg1) arg0) (($) (snd arg1) arg0)
+curry (last []) arg0 arg1
+No Demand Analysis
+(,) (($) (fst arg1) arg0) (($) (snd arg1) arg0)
+curry (fromJust Nothing) arg0 arg1
+curry (head []) arg0 arg1
+curry (last []) arg0 arg1
+No Relevancy
+fromJust Nothing
+head []
+last []
+applyNtimes: (a →a) →a →Int →a
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:39
+Demand Analysis
+arg2 ((!!) (repeat arg1) arg0)
+arg2 (head (replicate arg0 arg1))
+arg2 (last (replicate arg0 arg1))
+head (replicate arg0 (arg2 arg1))
+last (replicate arg0 (arg2 arg1))
+No Demand Analysis
+arg2 (fromRight arg1 (Left arg0))
+arg2 (fromLeft arg1 (Right arg0))
+fromRight (arg2 arg1) (Left arg0)
+fromLeft (arg2 arg1) (Right arg0)
+arg2 ((!!) (repeat arg1) arg0)
+No Relevancy
+arg2 arg1
+arg2 (arg2 arg1)
+($) arg2 arg1
+fromMaybe (arg2 arg1) (Just (arg2 arg1))
+fromMaybe (arg2 arg1) Nothing
+splitAtFirst: a →[a] →([a], [a])
+Demand Analysis
+(,) arg0 (repeat arg1)
+swap ((,) arg0 (repeat arg1))
+splitAt (length arg0) (repeat arg1)
+(,) (repeat arg1) (cycle arg0)
+(,) (repeat arg1) (init arg0)
+No Demand Analysis
+(,) arg0 (repeat arg1)
+swap ((,) arg0 (repeat arg1))
+splitAt (length arg0) (repeat arg1)
+(,) (repeat arg1) (cycle arg0)
+(,) (repeat arg1) (init arg0)
+No Relevancy
+(,) arg0 arg0
+(,) (cycle arg0) (cycle arg0)
+(,) (init arg0) (init arg0)
+(,) (reverse arg0) (reverse arg0)
+(,) (tail arg0) (tail arg0)
+eitherTriple: Either a b →Either a b →Either a b
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:40
+Z. Guo et al.
+Demand Analysis
+bool arg1 arg1 (isRight arg0)
+bool arg1 arg1 (isLeft arg0)
+fromMaybe arg1 (listToMaybe (repeat arg0))
+bool arg1 arg0 (last [])
+bool arg1 arg0 (and [])
+No Demand Analysis
+fromLeft arg1 (Left arg0)
+fromRight arg1 (Left arg0)
+bool arg1 arg0 False
+bool arg1 arg0 True
+bool arg1 arg0 otherwise
+No Relevancy
+fromMaybe arg1 Nothing
+bool arg1 arg1 False
+bool arg1 arg1 True
+bool arg1 arg1 otherwise
+fromLeft arg1 (Right arg1)
+multiApp: (a →b →c) →(a →b) →a →c
+Demand Analysis
+arg2 arg0 (arg1 arg0)
+arg2 (fromJust Nothing) (arg1 arg0)
+arg2 (head []) (arg1 arg0)
+arg2 (last []) (arg1 arg0)
+arg2 arg0 (arg1 (fromJust Nothing))
+No Demand Analysis
+arg2 arg0 (arg1 arg0)
+arg2 arg0 (($) arg1 arg0)
+arg2 (fromJust Nothing) (arg1 arg0)
+arg2 (head []) (arg1 arg0)
+arg2 (last []) (arg1 arg0)
+No Relevancy
+arg2 arg0 (arg1 arg0)
+arg2 arg0 (($) arg1 arg0)
+arg2 (snd ((,) (arg1 arg0) arg0)) (fst ((,) (arg1 arg0) arg0))
+uncurry arg2 ((,) arg0 (arg1 arg0))
+arg2 (snd ((,) arg0 arg0)) (arg1 (fst ((,) arg0 arg0)))
+mergeEither: Either a (Either a b) →Either a b
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:41
+Demand Analysis
+fromRight (fromJust Nothing) arg0
+fromRight (head []) arg0
+fromRight (last []) arg0
+No Demand Analysis
+fromRight (fromJust Nothing) arg0
+fromRight (head []) arg0
+fromRight (last []) arg0
+No Relevancy
+fromJust Nothing
+head []
+last []
+fromRight (fromJust Nothing) arg0
+fromRight (head []) arg0
+firstRight: [Either a b] →Either a b
+Demand Analysis
+head arg0
+last arg0
+head (cycle arg0)
+last (cycle arg0)
+head (init arg0)
+No Demand Analysis
+head arg0
+last arg0
+head (cycle arg0)
+last (cycle arg0)
+head (init arg0)
+No Relevancy
+head arg0
+last arg0
+head (cycle arg0)
+last (cycle arg0)
+head (init arg0)
+flatten: [[[a]]] →[a]
+Demand Analysis
+head (head arg0)
+last (head arg0)
+concat (head arg0)
+head (last arg0)
+last (last arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:42
+Z. Guo et al.
+No Demand Analysis
+head (head arg0)
+last (head arg0)
+concat (head arg0)
+head (last arg0)
+last (last arg0)
+No Relevancy
+[]
+lefts []
+rights []
+catMaybes []
+cycle []
+pipe: [(a →a)] →(a →a)
+Demand Analysis
+foldr ($) arg0 arg1
+($) (head arg1) arg0
+($) (last arg1) arg0
+foldr id arg0 arg1
+foldr id arg0 (cycle arg1)
+No Demand Analysis
+foldr ($) arg0 arg1
+fromLeft arg0 (Right arg1)
+($) (head arg1) arg0
+($) (last arg1) arg0
+foldr id arg0 arg1
+No Relevancy
+fromLeft arg0 (Right arg0)
+fromRight arg0 (Right arg0)
+fromLeft arg0 (Left arg0)
+fromRight arg0 (Left arg0)
+fromMaybe arg0 (Just arg0)
+firstKey: [(a,b)] →a
+Demand Analysis
+(!!) [] (length arg0)
+($) (last []) arg0
+No Demand Analysis
+(!!) [] (length arg0)
+($) (last []) arg0
+($) (head []) arg0
+($) (fromJust Nothing) arg0
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:43
+No Relevancy
+fromJust Nothing
+head []
+last []
+splitStr: String →Char →[String]
+Demand Analysis
+repeat (showChar arg0 arg1)
+repeat ((:) arg0 arg1)
+(:) (repeat arg0) (repeat arg1)
+repeat ((++) arg1 (repeat arg0))
+repeat (showString arg1 (repeat arg0))
+No Demand Analysis
+repeat (showChar arg0 arg1)
+repeat ((:) arg0 arg1)
+(:) (repeat arg0) (repeat arg1)
+repeat ((++) arg1 (repeat arg0))
+repeat (showString arg1 (repeat arg0))
+No Relevancy
+repeat arg1
+[]
+repeat (cycle arg1)
+repeat (init arg1)
+repeat (reverse arg1)
+areEq: Eq a => a →a →Maybe a
+Demand Analysis
+fromMaybe (Just arg1) (lookup arg0 [])
+Just (fromMaybe arg1 (lookup arg0 []))
+No Demand Analysis
+fromMaybe (Just arg1) (lookup arg0 [])
+Just (fromMaybe arg1 (lookup arg0 []))
+fromLeft (Just arg1) (Right ((,) arg0))
+fromRight (Just arg1) (Left ((,) arg0))
+fromLeft (Just arg1) (Right ((,) arg0 ))
+No Relevancy
+Just arg1
+Nothing
+listToMaybe (repeat arg1)
+lookup arg1 []
+fromJust Nothing
+lookup: Eq a => [(a,b)] →a →b
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:44
+Z. Guo et al.
+Demand Analysis
+fromJust (lookup arg0 arg1)
+head (maybeToList (lookup arg0 arg1))
+last (maybeToList (lookup arg0 arg1))
+fromJust (lookup arg0 (cycle arg1))
+fromJust (lookup arg0 (init arg1))
+No Demand Analysis
+fromJust (lookup arg0 arg1)
+head (maybeToList (lookup arg0 arg1))
+last (maybeToList (lookup arg0 arg1))
+No Relevancy
+fromJust (lookup arg0 arg1)
+fromJust Nothing
+head []
+last []
+map: (a →b) →[a] →[b]
+Demand Analysis
+map arg1 arg0
+repeat (arg1 (last arg0))
+map arg1 (cycle arg0)
+map arg1 (init arg0)
+map arg1 (reverse arg0)
+No Demand Analysis
+map arg1 arg0
+repeat (arg1 (last arg0))
+map arg1 (cycle arg0)
+map arg1 (init arg0)
+map arg1 (reverse arg0)
+No Relevancy
+map arg1 arg0
+lefts []
+rights []
+catMaybes []
+concat []
+resolveEither: Either a b →(a→b) →b
+Demand Analysis
+either arg0 id arg1
+arg0 (head (lefts (repeat arg1)))
+arg0 (last (lefts (repeat arg1)))
+either arg0 (head []) arg1
+either arg0 (last []) arg1
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:45
+No Demand Analysis
+either arg0 id arg1
+either arg0 (fromJust Nothing) arg1
+No Relevancy
+either arg0 id arg1
+arg0 (fromJust Nothing)
+arg0 (head [])
+arg0 (last [])
+fromRight (arg0 (fromJust Nothing)) arg1
+firstMatch: [a] →(a →Bool) →a
+Demand Analysis
+last (dropWhile arg0 arg1)
+head (dropWhile arg0 arg1)
+last (filter arg0 arg1)
+head (filter arg0 arg1)
+last (takeWhile arg0 arg1)
+No Demand Analysis
+last (dropWhile arg0 arg1)
+head (dropWhile arg0 arg1)
+last (filter arg0 arg1)
+head (filter arg0 arg1)
+last (takeWhile arg0 arg1)
+No Relevancy
+head (dropWhile arg0 arg1)
+last (dropWhile arg0 arg1)
+head (filter arg0 arg1)
+last (filter arg0 arg1)
+head (takeWhile arg0 arg1)
+test: Bool →a →Maybe a
+Demand Analysis
+bool (Just arg0) Nothing arg1
+bool Nothing (Just arg0) arg1
+bool (Just arg0) (Just arg0) arg1
+Just (bool arg0 arg0 arg1)
+curry (last []) arg0 arg1
+No Demand Analysis
+bool (Just arg0) Nothing arg1
+bool Nothing (Just arg0) arg1
+Just (fromLeft arg0 (Right arg1))
+Just (fromRight arg0 (Left arg1))
+bool (Just arg0) (Just arg0) arg1
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:46
+Z. Guo et al.
+No Relevancy
+Just arg0
+Nothing
+Just (bool arg0 arg0 arg1)
+listToMaybe (repeat arg0)
+listToMaybe []
+intToBS: Int64 →ByteString
+Demand Analysis
+drop arg0 empty
+take arg0 empty
+toLazyByteString (int64Dec arg0)
+toLazyByteString (int64HexFixed arg0)
+toLazyByteString (int64LE arg0)
+No Demand Analysis
+drop arg0 empty
+take arg0 empty
+toLazyByteString (int64Dec arg0)
+toLazyByteString (int64HexFixed arg0)
+toLazyByteString (int64LE arg0)
+No Relevancy
+empty
+concat []
+fromChunks []
+pack []
+drop arg0 empty
+repl-funcs: (a →b) →Int →[a →b]
+Demand Analysis
+replicate arg0 arg1
+cycle (replicate arg0 arg1)
+init (replicate arg0 arg1)
+reverse (replicate arg0 arg1)
+tail (replicate arg0 arg1)
+No Demand Analysis
+replicate arg0 arg1
+cycle (replicate arg0 arg1)
+init (replicate arg0 arg1)
+reverse (replicate arg0 arg1)
+tail (replicate arg0 arg1)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:47
+No Relevancy
+repeat arg1
+replicate arg0 arg1
+lefts []
+rights []
+catMaybes []
+mapMaybes: (a →Maybe b) →[a] →Maybe b
+Demand Analysis
+arg1 (head arg0)
+arg1 (last arg0)
+($) arg1 (head arg0)
+($) arg1 (last arg0)
+arg1 (fromJust (listToMaybe arg0))
+No Demand Analysis
+arg1 (head arg0)
+arg1 (last arg0)
+($) arg1 (head arg0)
+($) arg1 (last arg0)
+arg1 (fromJust (listToMaybe arg0))
+No Relevancy
+arg1 (head arg0)
+arg1 (last arg0)
+arg1 ((!!) arg0 (length arg0))
+arg1 (head [])
+arg1 (last [])
+takeNdropM: Int →Int →[a] →([a], [a])
+Demand Analysis
+splitAt arg2 (drop arg1 arg0)
+splitAt arg2 (take arg1 arg0)
+splitAt arg2 (take arg1 (cycle arg0))
+splitAt arg2 (drop arg1 (cycle arg0))
+splitAt arg2 (take arg1 (init arg0))
+No Demand Analysis
+splitAt arg2 (drop arg1 arg0)
+splitAt arg2 (take arg1 arg0)
+splitAt arg2 (take arg1 (cycle arg0))
+splitAt arg2 (drop arg1 (cycle arg0))
+splitAt arg2 (take arg1 (init arg0))
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:48
+Z. Guo et al.
+No Relevancy
+splitAt arg2 arg0
+(,) arg0 arg0
+(,) (cycle arg0) (cycle arg0)
+(,) (init arg0) (init arg0)
+(,) (reverse arg0) (reverse arg0)
+cartProduct: [a] →[b] →[[(a,b)]]
+Demand Analysis
+repeat (zip arg1 arg0)
+repeat (cycle (zip arg1 arg0))
+repeat (init (zip arg1 arg0))
+repeat (reverse (zip arg1 arg0))
+repeat (tail (zip arg1 arg0))
+No Demand Analysis
+repeat (zip arg1 arg0)
+repeat (cycle (zip arg1 arg0))
+repeat (init (zip arg1 arg0))
+repeat (reverse (zip arg1 arg0))
+repeat (tail (zip arg1 arg0))
+No Relevancy
+[]
+repeat (zip arg1 arg0)
+fromJust Nothing
+maybeToList Nothing
+lefts []
+hoogle02: b →(a →b) →[a] →b
+Demand Analysis
+maybe arg2 arg1 (listToMaybe arg0)
+fromMaybe arg2 (listToMaybe (map arg1 arg0))
+No Demand Analysis
+maybe arg2 arg1 (listToMaybe arg0)
+fromLeft (arg1 (head arg0)) (Right arg2)
+fromRight (arg1 (head arg0)) (Right arg2)
+fromLeft (arg1 (head arg0)) (Left arg2)
+fromRight (arg1 (head arg0)) (Left arg2)
+No Relevancy
+arg1 (head arg0)
+arg1 (last arg0)
+fromLeft arg2 (Right arg1)
+fromRight arg2 (Left arg1)
+($) arg1 (head arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:49
+containsEdge: [Int] →(Int,Int) →Bool
+Demand Analysis
+null (repeat ((,) arg0 arg1))
+null (replicate (length arg1) arg0)
+null (replicate (head arg1) arg0)
+null (replicate (last arg1) arg0)
+null (repeat ((,) arg1 arg0))
+No Demand Analysis
+null (fromLeft arg1 (Right arg0))
+null (fromRight arg1 (Left arg0))
+isLeft (Right ((,) arg0 arg1))
+isRight (Right ((,) arg0 arg1))
+isLeft (Left ((,) arg0 arg1))
+No Relevancy
+False
+True
+otherwise
+null arg1
+isJust Nothing
+app3: (a →b →c →d) →a →c →b →d
+Demand Analysis
+arg3 arg2 arg0 arg1
+fromMaybe (arg3 arg2 arg0 arg1) Nothing
+arg3 (fst ((,) arg2 arg0)) (snd ((,) arg2 arg0)) arg1
+arg3 (snd ((,) arg0 arg2)) (fst ((,) arg0 arg2)) arg1
+arg3 arg2 arg0 (fromMaybe arg1 Nothing)
+No Demand Analysis
+arg3 arg2 arg0 arg1
+fromMaybe (arg3 arg2 arg0 arg1) Nothing
+arg3 (fst ((,) arg2 arg0)) (snd ((,) arg2 arg0)) arg1
+arg3 (snd ((,) arg0 arg2)) (fst ((,) arg0 arg2)) arg1
+arg3 arg2 arg0 (fromMaybe arg1 Nothing)
+No Relevancy
+arg3 arg2 arg0 arg1
+fromMaybe (arg3 arg2 arg0 arg1) Nothing
+fromLeft (arg3 arg2 arg0 arg1) (Right arg2)
+fromRight (arg3 arg2 arg0 arg1) (Left arg2)
+fromLeft (arg3 arg2 arg0 arg1) (Right arg1)
+indexesOf: ([(a,Int)] →[(a,Int)]) →[a] →[Int] →[Int]
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:50
+Z. Guo et al.
+No Demand Analysis
+fromLeft arg0 (Right ((,) arg1 arg2))
+fromRight arg0 (Left ((,) arg1 arg2))
+fromLeft arg0 (Right ((,) arg2 arg1))
+fromRight arg0 (Left ((,) arg2 arg1))
+No Relevancy
+lefts []
+rights []
+catMaybes []
+concat []
+cycle []
+both: (a →b) →(a, a) →(b, b)
+Demand Analysis
+(,) (arg1 (snd arg0)) (arg1 (fst arg0))
+No Demand Analysis
+(,) (arg1 (snd arg0)) (arg1 (fst arg0))
+No Relevancy
+head []
+last []
+head (maybeToList Nothing)
+last (maybeToList Nothing)
+head (lefts [])
+zipWithResult: (a →b) →[a] →[(a, b)]
+Demand Analysis
+zip arg0 (map arg1 [])
+zip arg0 (map arg1 arg0)
+No Demand Analysis
+zip arg0 (map arg1 [])
+zip arg0 (map arg1 arg0)
+No Relevancy
+lefts []
+rights []
+catMaybes []
+concat []
+cycle []
+rights: [Either a b] →Either a [b]
+Demand Analysis
+Right (rights arg0)
+(!!) [] (length arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:51
+No Demand Analysis
+Right (rights arg0)
+(!!) [] (length arg0)
+No Relevancy
+head []
+last []
+Right []
+fromJust Nothing
+Right (rights arg0)
+mbToEither: Maybe a →b →Either a b
+Demand Analysis
+curry (last []) arg1 arg0
+curry (last []) arg0 arg1
+No Demand Analysis
+fromRight (Right arg0) (Left arg1)
+fromLeft (Right arg0) (Right arg1)
+Right (fromRight arg0 (Left arg1))
+Right (fromLeft arg0 (Right arg1))
+curry (fromJust Nothing) arg1 arg0
+No Relevancy
+Right arg0
+fromJust Nothing
+Left (fromJust arg1)
+head []
+last []
+singleList: Int →[Int]
+Demand Analysis
+repeat arg0
+cycle (repeat arg0)
+init (repeat arg0)
+reverse (repeat arg0)
+tail (repeat arg0)
+No Demand Analysis
+repeat arg0
+cycle (repeat arg0)
+init (repeat arg0)
+reverse (repeat arg0)
+tail (repeat arg0)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+12:52
+Z. Guo et al.
+No Relevancy
+replicate arg0 arg0
+repeat arg0
+[]
+(:) arg0 []
+iterate id arg0
+head-tail: [a] →(a,a)
+Demand Analysis
+(,) (last arg0) (last arg0)
+(,) (head arg0) (head arg0)
+last (zip [] arg0)
+head (zip [] arg0)
+($) (last []) arg0
+No Demand Analysis
+(,) (last arg0) (last arg0)
+(,) (head arg0) (head arg0)
+last (zip [] arg0)
+head (zip [] arg0)
+($) (last []) arg0
+No Relevancy
+fromJust Nothing
+head []
+last []
+head (zip arg0 arg0)
+last (zip arg0 arg0)
+2partApp: (a →b) →(b →c) →[a] →[c]
+Demand Analysis
+map arg1 (map arg2 arg0)
+repeat (arg1 (arg2 (last arg0)))
+repeat (arg1 (arg2 (head arg0)))
+iterate id (arg1 (arg2 (last arg0)))
+iterate' id (arg1 (arg2 (last arg0)))
+No Demand Analysis
+map arg1 (map arg2 arg0)
+repeat (arg1 (arg2 (last arg0)))
+repeat (arg1 (arg2 (head arg0)))
+repeat (arg1 (($) arg2 (last arg0)))
+repeat (arg1 (($) arg2 (head arg0)))
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+
+Program Synthesis by Type-Guided Abstraction Refinement
+12:53
+No Relevancy
+fromJust (fromJust Nothing)
+head (fromJust Nothing)
+last (fromJust Nothing)
+Proc. ACM Program. Lang., Vol. 4, No. POPL, Article 12. Publication date: January 2020.
+

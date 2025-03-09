@@ -1,0 +1,1753 @@
+To Believe or Not to Believe Your LLM
+Yasin Abbasi Yadkori, Ilja Kuzborskij, András György, Csaba Szepesvári
+Google DeepMind
+June 5, 2024
+Abstract
+We explore uncertainty quantification in large language models (LLMs), with the goal to identify
+when uncertainty in responses given a query is large. We simultaneously consider both epistemic
+and aleatoric uncertainties, where the former comes from the lack of knowledge about the ground
+truth (such as about facts or the language), and the latter comes from irreducible randomness (such
+as multiple possible answers). In particular, we derive an information-theoretic metric that allows
+to reliably detect when only epistemic uncertainty is large, in which case the output of the model
+is unreliable. This condition can be computed based solely on the output of the model obtained
+simply by some special iterative prompting based on the previous responses. Such quantification, for
+instance, allows to detect hallucinations (cases when epistemic uncertainty is high) in both single- and
+multi-answer responses. This is in contrast to many standard uncertainty quantification strategies
+(such as thresholding the log-likelihood of a response) where hallucinations in the multi-answer case
+cannot be detected. We conduct a series of experiments which demonstrate the advantage of our
+formulation. Further, our investigations shed some light on how the probabilities assigned to a given
+output by an LLM can be amplified by iterative prompting, which might be of independent interest.
+1
+Introduction
+Who’s talking? I asked, peering behind the mirror. Many dead spiders and a lot
+of dust were there. Then I pressed my left eye with my index finger. This was
+an old formula for detecting hallucinations, which I had read in To Believe or
+Not to Believe?, the gripping book by B. B. Bittner. It is sufficient to press on
+the eyeball, and all the real objects, in contradistinction to the hallucinated, will
+double. The mirror promptly divided into two and my worried and sleep-dulled
+face appeared in it.
+—"Monday Starts on Saturday" by A. and B. Strugatsky
+Like the protagonist of the novel, language models too occasionally suffer from hallucinations, or
+responses with low truthfulness, that do not match our own common or textbook knowledge (Bubeck
+et al., 2023; Gemini Team, Google, 2023). At the same time, since LLMs work by modeling a probability
+distribution over texts, it is natural to view the problem of truthfulness through the lens of statistical
+uncertainty. In this paper we explore uncertainty quantification in LLMs. We distinguish between two
+sources of uncertainty: epistemic and aleatoric (Wen et al., 2022; Osband et al., 2023; Johnson et al.,
+2024). Epistemic uncertainty arises from the lack of knowledge about the ground truth (e.g., facts or
+grammar in the language), stemming from various reasons such as insufficient amount of training data or
+model capacity. Aleatoric uncertainty comes from irreducible randomness in the prediction problem, such
+as multiple valid answers to the same query. Hence, truthfulness can be directly analyzed via looking at
+the epistemic uncertainty of a model in the sense that when the epistemic uncertainty is low, the model
+predictions must be close to the ground truth.
+Rigorously identifying when (either) uncertainty is small1 is notoriously hard, especially in deep
+neural networks (Blundell et al., 2015; Antorán et al., 2020). This is because we generally lack guarantees
+1For instance, by saying that predictions live in a confidence set with high probability.
+1
+arXiv:2406.02543v1  [cs.LG]  4 Jun 2024
+
+about learning the ground truth (consistency), or even a weaker guarantee about how large the variance
+of a learning algorithm is. At the same time, there exist many heuristic approaches for uncertainty
+quantification based on simply looking at the log-likelihood of responses (Kadavath et al., 2022), estimating
+entropy (Kuhn et al., 2023), ensembling (Lakshminarayanan et al., 2017b; Dwaracherla et al., 2023;
+Osband et al., 2023), or sometimes even more principled formulations, such as conformal prediction
+(Angelopoulos et al., 2023; Ravfogel et al., 2023; Yadkori et al., 2024) (which however come with strong
+assumptions).
+To the best of our knowledge, a common limitation of these approaches is that they are only meaningful
+in problems where there exists a single correct response (e.g. label) as they aim for detecting if one
+response is dominant (or multiple responses with the same meaning), that is, if there is only little
+uncertainty in the prediction. On the other hand, when multiple responses are correct, that is, there is
+aleatoric uncertainty in the ground truth, simply estimating the amount of uncertainty in the LLM’s
+output is insufficient, as the perfect (ground-truth) predictor may have large aleatoric uncertainty and no
+epistemic uncertainty, while a completely useless predictor may have large epistemic uncertainty only, but
+the total amount of uncertainty of the two predictors might be the same.
+Contributions.
+In this paper we address the above problem directly, and design methods to decouple
+epistemic and aleatoric uncertainty, allowing us to effectively deal with multi-response queries. Rather
+than trying to quantify how small epistemic uncertainty can be, we aim to identify when only the epistemic
+uncertainty is large, in which case we can suspect that the response is hallucinated.2
+As a starting point we make a simple observation: If multiple responses are obtained to the same
+query from the ground truth (the language), they should be independent from each other, that is, in
+probabilistic interpretation, the joint distribution of these multiple responses, for a fixed query, must be a
+product distribution.
+This observation can be used to measure how far the language model can be from the ground truth.
+The sequential model implemented by a language model allows us to construct a joint distribution over
+multiple responses, which is done through iterative prompting of an LLM based on its previous responses
+and the application of the chain rule of probability: first we ask the model to provide a response given a
+query, then to provide another response given the query and the first response, then a third one given
+the query and the first two responses, an so on. This is in contrast to some of the earlier works that
+approached decoupling epistemic and aleatoric uncertainty for classification problems by training the
+model with pairs (or tuples) of labels (Wen et al., 2022).
+So, if the response to a prompt containing the query and previous responses is insensitive to the
+previous responses, we have the desired independence and the LLM-derived joint distribution can be
+arbitrarily close to the ground truth. On the other hand, if the responses within the context heavily
+influence new responses from the model then, intuitively speaking, the LLM has low confidence about the
+knowledge stored in its parameters, and so the LLM-derived joint distribution cannot be close to the
+ground truth. As more responses are added to the prompt, this dependence can be made more apparent,
+allowing to detect epistemic uncertainty via our iterative prompting procedure.
+Interestingly, as we will see in Section 3, we can force an LLM to provide a desired (possibly incorrect)
+response by adding this response repeatedly to the prompt. This phenomenon is then further investigated
+from the viewpoint of a transformer LLM architecture in Section 3.1.
+The iterative prompting procedure then leads to the following main contributions:
+(i) Based on the above iterative prompting procedure, we derive an information-theoretic metric of
+epistemic uncertainty in LLMs (Section 4), which quantifies the gap between the LLM-derived distribution
+over responses and the ground truth. This gap is insensitive to aleatoric uncertainty, and therefore we
+can quantify epistemic uncertainty even in cases where there are multiple valid responses.
+(ii) We derive a computable lower bound on this metric, which turns out to be a mutual information
+(MI) of an LLM-derived joint distribution over responses,3 and propose a finite-sample estimator for it.
+We prove that this finite-sample MI estimator sometimes suffers only a negligible error even though LLMs
+and their derived joint distributions are defined over potentially infinite supports (all possible strings in a
+language).
+2In technical terms this corresponds to giving a lower bound, rather than an upper bound, on the quantity capturing the
+uncertainty.
+3Here MI is understood as a functional of a joint distribution (see Section 2).
+2
+
+(iii) We discuss an algorithm for hallucination detection based on thresholding a finite-sample MI
+estimator, where the threshold is computed automatically through a calibration procedure. We show
+experimentally on closed-book open-domain question-answering benchmarks (such as TriviaQA, AmbigQA,
+and a dataset synthesized from WordNet) that when the data is mostly composed of either single-label or
+multi-label queries, our MI-based hallucination detection method surpasses a naive baseline (which is
+based on the likelihood of the response), and achieves essentially similar performance to that of a more
+advanced baseline which is based on the entropy of the output as a proxy for uncertainty. However, on
+datasets which contain both single- and multi-label samples at the same time, our method also significantly
+outperforms the entropy-based baseline, by achieving a much higher recall rate on samples with high
+output entropy while maintaining similar error rates.
+(iv) Focusing on a single self-attention head, we identify a simple mechanistic explanation for how
+the model output can be changed through iterative prompting using previous responses, as discussed
+earlier. Suppose that the prompt is composed from a query and a repeated element (e.g., a possibly wrong
+answer). If the query lies within the space spanned by the large principal components of a key-query
+matrix product, then the output will be generated according to the knowledge extracted from the training
+data (now stored in a value matrix). On the other hand, if the query has little overlap with the large
+principal components, then the repeated element is likely to be copied from the prompt.
+Notation.
+As usual, N and R denote the sets of natural and real numbers, respectively. For any
+measurable set Z, we denote the the set of distributions supported on Z by M1(Z). For any positive
+integer k, we denote [k] = {1, . . . , k}.
+2
+Preliminaries
+In this section we present some basic definitions used throughout the paper.
+Conditional distributions and prompting.
+Let X be the space of finite text sequences, that is
+X ⊂Σ∗where Σ is a finite alphabet (and Σ∗= S∞
+n=1 Σn). Moreover, consider a family of conditional
+distributions P = {µ : X →[0, 1] | P
+x∈X µ(x | x′) = 1
+∀x′ ∈X}. In the following, we let P ∈P be the
+ground-truth conditional probability distribution over text sequences (responses) given a prompt, and we
+let Q ∈P be the learned language model. Given a fixed query x ∈X and possible responses Y1, . . . , Yt,
+we define a family of prompts F = {Ft : X →X | t ∈N}, such that Ft(x, Y1, . . . , Yt) is defined as:
+Consider the following question: Q: x
+One answer to question Q is Y1. Another answer to question Q
+is Y2.[. . .] Another answer to question Q is Yt.
+Provide an answer to the following question:
+Q: x. A:
+Information-theoretic notions.
+Let µ, µ′ be distributions supported on set Z = Z1 × · · · × Zn
+where (Zi)i is a collection of countable sets. The entropy of a distribution µ is defined as H(µ) =
+P
+z∈Z µ(z) ln(1/µ(z)).4 If µ, µ′ are such that µ′(z) = 0 only if µ(z) = 0, we have a Kullback-Leibler
+divergence between them defined as DKL(µ, µ′) = P
+z∈Z µ(z) ln(µ(z)/µ′(z)). For any z ∈Z, we denote
+z\i = (z1, . . . , zi−1, zi+1, . . . , zn), and the marginal of the ith coordinate of µ is given by µi(z) =
+P
+z\i∈Zn−1 µ(z). The product distribution of the marginals of µ is given by µ⊗(z) = Qn
+i=1 µi(z), and the
+mutual information of µ is defined as I(µ) = DKL(µ, µ⊗).
+3
+Probability amplification by iteratively prompting
+In this section we demonstrate that, as mentioned in the introduction, repeating possible responses several
+times in a prompt can have pronounced effects on the output of a language model. Consider x =“What
+4Following the usual convention, we define 0 ln 0 = 0 and a ln(a/0) = ∞for any a > 0.
+3
+
+Q: What is the capital of the UK?
+A:
+London
+(≈
+1.0)
+and
+Paris
+(1.29 × 10−10).
+Q: Who was the first US president?
+A: George Washington (0.999) and
+Abraham Lincoln (3.1 × 10−06).
+Q: Who is the author of The Grapes
+of Wrath?
+A: John Steinbeck (≈
+1.0) and Ernest Hemingway (1.34×
+10−10).
+Q: What is the largest country in
+the world? A: Russia (0.999) and
+United Kingdom (9.02 × 10−06).
+Figure 1: Single-label queries with low epistemic uncertainty: Conditional normalized probability of
+the correct completion given repetitions of an incorrect response. Each figure shows the query and the
+considered two responses with their initial probabilities, as a response for the query, in parentheses (the
+first response is the correct one).
+Q: What is the national instrument
+of Ireland?
+A: The harp (0.936)
+and Uilleann pipes (0.063).
+Q: Which actor became M in the
+Bond
+film
+Skyfall?
+A:
+Ralph
+Fiennes (0.651) and Judi Dench
+(0.348).
+Q: Which can last longer with out
+water a camel or a rat?
+A: A rat
+(0.538) and A camel (0.461).
+Q: If Monday’s child is fair of face
+what is Saturday’s child? A: Work
+hard for a living (0.093) and Full
+of grace (0.906).
+Figure 2: Single-label queries with high epistemic uncertainty: Conditional normalized probability of
+the correct completion given repetitions of an incorrect response. Each figure shows the query and the
+considered two responses with their initial probabilities, as a response for the query, in parentheses (the
+first response is the correct one).
+is the capital of the UK?” and Y1 = · · · = Yt =“Another answer to question Q is Paris.” Here we can
+repeat the sentence “Another answer to question Q is Paris.” an arbitrary number of times. Although
+the number of repetitions changes the behavior of the LLM, the correct response maintains a significant
+probability: as Figure 1 shows, the conditional normalized probability5 of the correct response, “London”,
+reduces from approximately 1 to about 96% as we increase the number of repetitions of the incorrect
+response to 100. Figure 1 shows 3 more examples where, with initially low epistemic uncertainty in the
+response to the query (the aleatoric uncertainty is also low as we consider single-response queries), the
+correct response maintains a significant or non-negligible probability even in the presence of repetitions of
+incorrect information, while the probability of predicting the latter is increased.
+Next, we consider a queries for which the model is more uncertain. For the prompt “What is the
+national instrument of Ireland?”, we observe that responses “The harp” and “Uilleann pipes” both have
+significant probabilities (the first answer is the correct one). This time, by incorporating the incorrect
+response in the prompt multiple times, the probability of the correct answer quickly collapses to near
+zero, as shown in Figure 2, together with three more examples with significant epistemic uncertainty.
+Finally, we consider multi-label queries for which the LLM confidently knows a correct answer. This
+time, by incorporating a potential response in the prompt, the probabilities of other correct answers stay
+relatively large. Figure 3 shows four such examples.
+3.1
+In-context learning vs. in-weight learning
+The sensitivity of the response of an LLM to extra in-context information, as observed above, can already
+be observed in a single attention head as explained next.
+We consider an idealized attention mechanism as follows. Let Z ∈Rn×d′ be an input matrix comprised
+of n semantic feature vectors each of dimension d′. Each row is meant to represent a complete statement
+5To obtain conditional normalized probabilities, we consider the probabilities of the two responses, and normalize them
+so that they add to 1.
+4
+
+Q:
+Name
+a
+city
+in
+the
+UK
+A:
+London
+(0.958)
+and
+Manchester
+(0.041).
+Q: Name a yellow fruit A: Banana
+(0.715) and Lemon (0.284).
+Q: Name
+an
+alcoholic
+drink,
+A:
+Wine (0.685) and Beer (0.314).
+Q: Name a ball game that is played
+by more than 5 players A: Volley-
+ball (0.542) and Soccer (0.457).
+Figure 3: Multi-label queries with aleatoric uncertainty: Conditional normalized probability of the first of
+the two provided responses, both of which are correct, given repetitions of the second response in the
+prompt. Each figure shows the query and the considered two responses with their initial probabilities, as
+a response for the query, in parentheses.
+(such as “What is the capital of the UK?” or “One answer to the question is Paris.”, etc.) rather than
+a single token. Let X⊤∈R1×d′ be the first row of Z, which represents the query of interest, such as
+“What is the capital of the UK?”. Let E⊤∈R1×d′ be a special vector indicating the end of the input. The
+matrix Z \ X, denoting the Z matrix without its first row, represents the in-context information.
+We assume the ground-truth distribution P is such that a query vector is mapped to its response, but
+a statement is simply copied. For example, for V = “What is the capital of the UK?”, P( · | V ) would be
+a distribution with support on “London” and its variations, while for V ′ = “What is the capital of the UK?
+One answer to the question is Paris.”, P( · | V ′) returns the same distribution. We assume a parameter
+matrix WV is learned such that V ⊤WV estimates P( · | V ) for vector V .
+Let WQ, WK, WV ∈Rd′×d be the query, key, and value matrices. A self-attention head with query
+X and context Z \ X is defined as
+f(Z; WQ, WK, WV) = Softmax
+ 1
+√
+d
+E⊤WQ(ZWK)⊤
+
+ZWV
+where the output of the Softmax is a row vector of length n.
+If X has appeared many times in the training data, then parameters WQ and WK could be learned
+such that E⊤WQ(WK)⊤X is large, that is, X is within the space spanned by the large principal
+components of the key-query matrix product. Then, no matter what in-context information appears in Z,
+the probability assigned to X will dominate the sotmax, and we will have
+Softmax
+ 1
+√
+d
+E⊤WQ(ZWK)⊤
+
+Z ≈X⊤,
+and therefore f(Z; WQ, WK, WV) ≈P( · | X).
+On the other hand, consider the case that X has not appeared many times in the training data, and
+vector Y is copied in many rows of Z. Then E⊤WQ(WK)⊤X could be small as X is not in the span of
+the large principal components of the key-query matrix product. Therefore f(Z; WQ, WK, WV) ≈Y
+since
+Softmax
+ 1
+√
+d
+E⊤WQ(ZWK)⊤
+
+Z ≈Y ⊤.
+Even if X is in the span, repeating Y t times in Z would give a t-times increased total weight to Y inside
+the softmax, which can dominate the weight assigned to X when t is large enough, also resulting in Y as
+the answer.
+4
+Metric of epistemic uncertainty and its estimation
+In this section we apply iterative prompting to estimate the epistemic uncertainty of a language model
+about responding to some query. The idea is to utilize the different behavior patterns observed in
+Section 3, which can be used to differentiate between two modes of high uncertainty: when the aleatoric
+uncertainty is high vs. when only the epistemic uncertainty is high. We then apply our new uncertainty
+metric to design a score-based hallucination detection algorithm.
+5
+
+Recall the family of prompts F defined in Section 2. We make the following assumption about the
+ground truth, which states that multiple responses to the same question drawn according to the ground
+truth are independent from each other:
+Assumption 4.1 (Ground truth independence assumption). The ground-truth satisfies
+P(Yt | Ft−1(x, Y1, . . . , Yt−1)) = P(Yt | x)
+for any t ∈N and any x, Y1, . . . , Yt ∈X.
+Note that the above assumption is heavily dependent on our prompt construction. Without embedding
+Y1, . . . , Yt−1 in the prompt, the independence assumption would not hold, for example, if Y1, . . . , Yt were
+partial answers, such as a step of an algorithm or a part of a story, because in such a case Yt might indeed
+depend on the previous outputs Y1, . . . , Yt−1. Roughly speaking, the assumption tells that the response
+distribution is insensitive to a query based on previously sampled responses. For example, for query
+x =“A city in the UK:”, the probability of Y2 =“Manchester” does not change if a city is Y1 =“London”.
+Now we formally introduce a notion of the joint distribution over responses given a query, derived from
+the language model:
+Definition 4.2 (Pseudo joint distribution). Given a family of prompt functions F, a conditional
+distribution µ ∈P, and n ∈N, we use notation e· to denote a pseudo joint distribution defined as
+eµ(Y1, . . . , Yn | x) = µ(Y1 | F0(x)) µ(Y2 | F1(x, Y1)) · · · µ(Yn | Fn−1(x, Y1, . . . , Yn−1)) .
+(1)
+The above is a pseudo joint distribution since the standard conditioning in the chain-rule is replaced
+with prompt functions of the conditioning variables. In the following we focus on eQ derived from the
+LLM and eP derived from the ground truth.
+Remark 4.3 (Sampling from eQ). Note that sampling from eQ can be simply done through a chain-
+rule-like procedure as can be seen from the above definition, that is, to have (Y1, . . . , Yn) ∼eQ we draw
+Y1 ∼Q(· | F0(x)), Y2 ∼Q(· | F1(x, Y1)), Y3 ∼Q(· | F2(x, Y1, Y2)), and so on.
+In the rest of the paper we drop subscripts in joint distributions and conditioning on query x (which
+is understood implicitly), for example, eP ≡ePY1···Yn|x.
+To measure epistemic uncertainty, we need to quantify how far the estimated pseudo joint distribution
+˜Q is from the ground truth ˜P. One natural choice is the following definition:
+Definition 4.4 (Epistemic uncertainty metric). Given an input x ∈X, we say that the epistemic
+uncertainty of eQ is quantified by DKL( eQ, eP).
+Figure 4: A hallucination: eQ places
+an excessive mass where the ground
+truth eP has a low mass.
+Here DKL measures how well eQ approximates eP for a given
+query x.
+Namely, this metric determines if eQ assigns a large
+probability to an event which has a small probability under eP. In
+case of LLMs, this means the LLM generates a sequence that is
+unlikely in the typical usage of the language. In Figure 4 we have
+a situation where eP is a pseudo joint distribution derived from the
+ground-truth, and eQ suffers from a high hallucination rate. Given
+an input x, we want to estimate the above hallucination metric,
+but we only have access to eQ, and so computing it explicitly is
+impossible. However, next we show that under Assumption 4.1 we
+can lower bound DKL( eQ, eP) by a quantity which only depends on
+eQ (the proof is given in Appendix B).
+Theorem 4.5. For all pseudo joint distributions eP satisfying Assumption 4.1, we have that
+DKL( eQ, eP) ≥I( eQ) .
+The lower bound in the theorem holds uniformly for all eP, and it is computable solely based on
+˜Q. This makes the bound applicable for decision making; in fact we chose to consider DKL( eQ, eP) as
+the measure of epistemic uncertainty (out of many similar distance measures) because it admits this
+property).
+6
+
+1: Input:
+µ ∈M1(X n) . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . any (pseudo-) joint distribution over X n
+k ∈N . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .sample size
+γ ≥0 . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .stabilization parameter (typically selected as
+1/k)
+2: Independently sample tuples X1, . . . , Xk ∼µ ∈M1(X n)
+3: Construct a set of indices of unique elements S =
+
+i ∈[k] : Xi ̸= Xj
+∀j < i
+	
+4: Construct empirical distributions: for all i ∈S,
+bµ(Xi) = µ(Xi)
+Z
+,
+bµ⊗(x′) =
+n
+Y
+i=1
+P
+x\i µ(x1, . . . , xi−1, x′
+i, xi+1, . . . , xn)
+Z⊗
+(for all x′ ∈X n)
+where
+Z =
+X
+j∈S
+µ(Xj) ,
+Z⊗=
+X
+j∈S
+X
+x\i
+µ(x1, . . . , xi−1, Xj,i, xi+1, . . . , xn)
+5: Compute estimate
+bIk(γ) =
+X
+i∈S
+bµ(Xi) ln
+
+bµ(Xi) + γ/Z
+bµ⊗(Xi) + γ/Z⊗
+
+Algorithm 1: MI estimator
+Also, note that we have I( eQ) = DKL( eQ, eQ⊗) , eQ⊗= Q
+i
+P
+y\i eQ(y1, . . . , yi−1, Yi, yi+1, . . . , yn). In gen-
+eral P
+y\i eQ(y1, . . . , yi−1, Yi, yi+1, . . . , yn) ̸= eQ(Yi), because the independence assumption Assumption 4.1
+does not necessarily (and, in practice, almost never) holds for Q.
+Finally, a quantity related to DKL( eQ, eP) is DKL with arguments arranged in the opposite order, that
+is DKL( eP, eQ) which is a (query) conditional excess risk of the LLM-derived pseudo joint distribution
+eQ, under the logarithmic loss. Controlling the excess risk (for instance, upper-bounding it) for various
+algorithms is one of the central questions in learning theory, however it is a much harder task than the
+one we consider here, because for the former we need to theoretically control all sources of errors (such as
+generalization, estimation, and approximation error).
+4.1
+A computable lower bound on epistemic uncertainty
+Theorem 4.5 gives a lower bound on the epistemic uncertainty by the mutual information. However,
+to compute the mutual information term, in practice we need to evaluate eQ on its entire support,
+which is potentially infinite. Practically speaking, it is impossible to observe probabilities of all strings
+under the language model and so we must rely on a finite sample. Therefore, we replace eQ with an
+empirical distribution with a finite support; in the following we show that the error induced by such
+an approximation is controlled. To estimate the MI we employ the method given in Algorithm 1; for
+generality it is presented for an arbitrary (pseudo) joint distribution µ, but we keep in mind that our case
+of interest is µ = eQ.
+Note that the estimator is constructed using only each unique element in the sample (the indices of
+these representative elements are collected in S), that is, we do not account for duplicate samples.6 Also
+note that most terms in the summations defining the product distribution bµ⊗are zero (except the ones
+which correspond to the observed data). Furthermore, adding γ/Z and γ/Z⊗in the estimator bIk(γ) is
+intended to account for the total probability of missing observations, not included while constructing bµ
+6When the Xi are responses from language models (i.e., when we consider the responses Xi = (Y1, . . . , Yn)), we usually
+consider the equality of Xi = Xj semantically, as defined by some function comparator function aiming to compare too
+responses semantically (our choices for the experiments are described in Section 6).
+7
+
+and bµ⊗, making sure the estimate is bounded. Similar ideas are well-know in probability and information
+theory, such as in universal coding (?), Laplace smoothing (Polyanskiy and Wu, 2024) and Good-Turing
+smoothing (Gale and Sampson, 1995; McAllester and Schapire, 2000).
+The bias introduced by γ in the last equation allows us to rigorously bound the error in estimating
+I(µ) via bIk(γ), which is explored next. In particular, in Theorem 4.6 we prove a high-probability lower
+bound on I(µ) in terms of bIk. The core of controlling the estimation error is in accounting for the missing
+mass, or in other words, how much of µ we miss out by only observing a finite sample. In Appendix C,
+we present a more complete discussion and the proof of the bound on the estimation error for mutual
+information. Here we adapt this result to our particular case.
+Define the missing mass as
+Uk =
+X
+x∈X n
+µ(x) I
+
+x ̸∈{X1, . . . , Xk}
+	
+.
+Using this quantity, we are ready to present a non-asymptotic bound on the estimation error, which
+depends on the estimator bIk(γ), the expected missing mass, and the sample size:
+Theorem 4.6. Suppose that bIk(γ) is given by Algorithm 1, and assume that X is finite. For γ = 1/(k |X n|),
+with probability at least 1 −δ,
+I(µ) ≥(1 −εk) bIk(γ) −
+1
+k + (1 + n ln
+ 1 + k |X|)
+
+εk
+
+where
+εk = E[Uk] +
+s
+ln( 1
+δ )
+k
+.
+Furthermore, given δsupp ∈[0, 1), let ˜
+X ⊆X n such that µ( ˜
+X) ≥1 −δsupp. Then, for γ = 1/(k | ˜
+X|), with
+probability at least 1 −δ,
+I(µ) ≥(1 −εk) bIk(γ) −
+1
+k + (1 + ln
+ 1 + k | ˜
+X|)
+
+(δsupp + εk)
+
+.
+The theorem is a corollary of Theorem C.4 shown in Appendix C. Note that in Theorem 4.6 we
+consider two bounds. The first one is pessimistic in the sense that it does not expect that the samples
+carry much information about the support, and it is most suitable in situations where we expect µ to be
+spread out (uniformly) across its entire support. The price of not having samples covering the whole
+support in this case is a factor n ln |X| appearing in the bound. For example, in case of a language model
+with 10, 000 tokens, considering all possible strings of length T tokens yields n ln |X| = n T ln(10000), and
+so
+I(µ) ≥(1 −εk) bIk(γ) −
+1
+k + (1 + n T ln
+ 1 + k ln(10000))
+
+εk
+
+.
+Arguably, in practice, such situations are rare, as in natural languages we will not encounter all possible
+strings. To this end, we consider an optimistic scenario where the effective support of µ, denoted by
+˜
+X, is small with high probability. In this case, we can replace the size of the support for strings of
+length n, |X|n, in the first bound with the effective support size | ˜
+X|, and we only pay essentially a factor
+ln(1 + k| ˜
+X|) instead of n ln(1 + k|X|). In case the effective sample size is only polynomial in n, this
+leads to an exponential reduction in n for the second term in the bounds. In fact, in Appendix C.4 we
+demonstrate some empirical evidence that on two question-answering benchmarks, | ˜
+X| rarely exceeds
+≈100 with µ( ˜
+X) ≥0.95, while sampling responses from an LLM given a query.
+Next we consider sufficient conditions for the estimator to converge to the mutual information. In
+particular, using the first bound in the theorem, we have (hiding logarithmic factors)
+I(µ) = ˜Ω
+
+(1 −E[Uk]) bIk(γ) −E[Uk]
+
+k →∞.
+This tells us that the rate of estimation error is essentially controlled by the expected missing mass E[Uk],
+which, as we will see, converges to zero as k →∞, however the decay can be very slow in general. For
+8
+
+example, it is known that for a finite support of size N, E[Uk] ≤e−k
+N when k ≤N and E[Uk] ≤N/(e k)
+otherwise (Berend and Kontorovich, 2012). For countable distributions with entropy bounded by h, one
+has E[Uk] ≤h/ ln(k) (Berend et al., 2017).7
+Despite these pessimistic bounds, in reality we expect the expected missing mass to be significantly
+smaller, especially when µ is heavy-tailed. It is well-known that natural languages (and many artificial
+ones) follow a Zipf distribution, where probability of each word (or a text piece) is proportional to
+1/freq(text)α for some exponent α > 1, where freq() is a frequency of occurrence in the corpus (Piantadosi,
+2014). Then, we expect that E[Uk] should be much smaller than in such a case, since sampling from
+the tail of Zipf distribution is a rare event. To this end, in Appendix C we show that if eQ is Zipf with
+exponent α > 1, then for any free parameter β > 0,
+E[Uk] = O
+
+k−( α−1
+α
+−β)
+.
+Hence, the rate at which the expected missing mass vanishes can be very fast (potentially matching a
+concentration rate 1/
+√
+k for α = 2).
+Finally in Appendix C.4 we present a data-dependent estimation of E[Uk] based on a concentration
+inequality for a missing mass and repetitive sampling from LLM, in the context of some Q/A datasets.
+We conclude that the expected missing mass is very small: Most of the upper bounds on the expected
+missing mass (we have one upper bound per question) are highly concentrated close to 0.
+5
+Score-based hallucination tests
+Let bIk(γ, x) ≡bIk(γ) computed as in Algorithm 1 for µ = eQ, to emphasize the explicit dependence on
+the query x. The uncertainty estimate bIk(γ, x) derived above can be used as a score indicating the
+strength of our belief that the LLM hallucinates for the given query x. Such a score can then be used
+to design abstention policies: if the response is deemed to be hallucinated, the system abstains from
+responding, while a response is provided otherwise. Score-based abstention methods usually compute a
+score chosen by the user (such as the response likelihood or the estimator bI(γ) discussed earlier), and
+declare hallucination if the score is above or below a threshold, which is determined through calibration.
+To detect hallucinations successfully, the threshold can be adjusted through calibration on a given task
+using a hold-out (ground-truth) sample, see, for instance, the paper of Yadkori et al. (2024) where this
+calibration is discussed in detail.
+Given our estimated lower bound on the epistemic uncertainty, we can define an abstention policy (a
+policy which decides when the LLM should abstain from prediction) as
+aλ(x) =
+(
+0,
+if bIk(γ, x) < λ;
+1,
+if bIk(γ, x) ≥λ;
+where λ > 0 is a threshold parameter tuned on a hold-out sample of some particular task. This policy
+abstains (aλ(x) = 1) when the epistemic uncertainty in the prediction (response) is large. When the
+policy does not abstain (aλ(x) = 0), any prediction from bQ can be served.
+In the experiments, we compare a number of scoring functions for detecting hallucinations, including
+bI(γ), the probability of the greedy (temperature zero) response, and an estimate of the entropy of the
+response distribution.
+6
+Experiments
+In this section we evaluate our abstention method derived based on the MI estimate in Section 5 on a
+variety of closed-book open-domain question-answering tasks.
+7Note that expected missing mass E[Uk] appearing here is related to the well-known Good-Turing estimator. Let
+M be the number of elements among X1, . . . , Xk which appear exactly once.
+Then, the Good-Turing estimator is
+defined as UGT
+k
+= M/k. An attractive property of the Good-Turing estimator is that it is unbiased in the sense that
+E[UGT
+k
+] −E[Uk] = E[U(1)
+k
+]/k where the random variable U(1)
+k
+is the cumulative probability of the sequences appearing
+exactly once in the data. Although we do not directly work with the Good-Turing estimator in this paper, its convergence
+properties can be analyzed using a technique similar to the one we employ here (Berend and Kontorovich, 2012).
+9
+
+Language model. We used a Gemini 1.0 Pro model (Gemini Team, Google, 2023) to generate
+outputs and scores.
+Datasets. We consider three different datasets and their combinations: As base datasets, we consider
+(i) a random subset of 50, 000 datatpoints from the TriviaQA dataset (Joshi et al., 2017), and (ii) the
+entire AmbigQA dataset (with 12038 datapoints) (Min et al., 2020). These datasets mostly contain
+single-label queries, and only contain a few multi-label ones.8 Moreover, we created a multi-label dataset
+based on the WordNet dataset (Fellbaum, 1998): We extracted all (6015) datapoints from WordNet
+at depth 4 or more of the physical_entity subtree. For each datapoint (entity, children) in
+WordNet, we constructed a query of the form “Name a type of entity.” and children are considered
+target labels.
+Comparison of responses and computing the output distributions. We use the F1 score9
+thresholded at 0.25 to decide if two text sequences match. When multiple responses are sampled, we
+approximate the output distribution of an LLM in a semantically meaningful way by collapsing matching
+responses into a single response: we sample k = 10 responses at temperature 0.9 for each query, and
+all those that match (according to the F1 score) are considered identical and their probabilities are
+aggregated. We only consider queries for which the greedy (temperature zero) and at least one of the
+random responses are shorter than 20 characters. This is because the F1 score (as a match function) and
+log-probabilities (as a measure of uncertainty) are less reliable for longer sequences. After this filtering,
+we are left with 38870 datapoints for TriviaQA, 5315 datapoints for AmbigQA, and 3296 datapoints for
+WordNet.
+Baselines. We consider abstention policies based on four scoring methods. The first three are as
+follows: (i) the probability of the greedy response (denoted by T0); (ii) the semantic-entropy method of
+Kuhn et al. (2023) whose score is the entropy of k = 10 generated samples (denoted by S.E.). To calculate
+entropy, we first aggregate probabilities of equivalent responses and normalize the probabilities so that
+they sum to 1 (as described above); and (iii) our proposed mutual information score as defined in Section 4
+(and denoted by M.I.) with the choices of k = 10, n = 2, and γ = 0 (the latter choice approximates the
+case that the number of potential responses can be very large in which case the theoretical choice of γ
+would be very small). To calculate the mutual information, we first generate k = 10 random samples.
+Then for any response Y , we calculate the probability of all generated responses given the prompt F1(x, Y ).
+We construct estimates bQ(Y ) and bQ(Y ′|Y ) by aggregating probabilities of equivalent responses, and
+normalizing the probabilities so that they sum to 1.
+Each baseline also has a default choice which is taken when the relevant score is above a threshold,
+and hence the method does not abstain. For T0, the default choice is the greedy (temperature zero)
+response. For S.E., the default choice is the response with the highest (aggregate) probability among the
+generated random responses. For the M.I. method, the default choice is the sampled response with the
+highest probability according to the marginalized pseudo joint distribution.
+We also consider a version of the self-verification method of Kadavath et al. (2022) (denoted by S.V.)
+that, for a query x, first finds Y1, the element with the largest (aggregated) probability (which is the
+default choice of S.E. method), and then calculates the probability of token “True” (normalized for the
+two tokens “True” and “False”) for the following query: “Consider the following question: Q: x. One
+answer to question Q is Y1. Is the above answer to question Q correct? Answer True or False. A:”. The
+default choice of this baseline is the same as the default choice of the S.E. method. By this design, our
+intention is to construct a score that (unlike the first-order scores10 we consider) is not sensitive to the
+size of the label set.
+In our experiments we either sweep through all abstention thresholds (Figure 5), or optimize the
+threshold on some calibration data, as explained in the description of the relevant experiment (Figure 6).
+Results. We consider the precision-recall (PR) trade-off for the various methods on the different
+8Note that the multi-label queries in these datasets typically behave as single-label ones in the sense that the LLM
+assigns overwhelming probability to a dominant response.
+9In this context, the F1 score is calculated based on token inclusion (Joshi et al., 2017; Devlin et al., 2019): for two
+sequences a = (a1, . . . , an) and b = (b1, . . . , bm), defining p = |a ∩b|/n and r = |a ∩b|/m (where |a ∩b| is the size of the
+intersection of a and b, in which for repetitions of an element y, we consider the minimum number of repetitions in a
+and b, i.e., minc∈{a,b} |{i : ci = y}|, in calculating the size of the intersection) we define F1 = 2pr/(p + r). Relating to
+the standard definition of the F1 score, p and r play the role of precision and recall, respectively, if a is thought of as a
+prediction of b.
+10The scores T0 and S.E. are first order because they only consider the marginal distribution of a single response, unlike
+our uncertainty score which is based on MI estimation by considering (pseudo) joint distributions over multiple responses.
+10
+
+(a) TriviaQA
+(b) AmbigQA
+(c) TriviaQA+WordNet
+(d) AmbigQA+WordNet
+Figure 5: PR-curve for the baseline and the proposed methods on various datasets. On the TriviaQA
+and AmbigQA datasets, M.I. and S.E. perform nearly identically, but they outperform the T0 and
+S.V. baselines. For the S.E. and M.I. methods, the responses for a large number of queries can be
+clustered into a single group, and therefore the semantic entropy and mutual information scores are zero.
+This is why the starting point of their curves is at a higher recall values. On the TriviaQA+WordNet
+and AmbigQA+WordNet datasets with a significant number of high entropy multi-label queries, M.I.
+outperforms the S.E. baseline. The methods perform nearly identical on the recall area that is not shown.
+datasets. Here, recall is the percentage of queries where the method does not abstain, and precision is
+the percentage of correct decisions among these queries.11 Figure 5ab show PR-curves for the baselines
+and the proposed method on TriviaQA and AmbigQA. As can be seen, our method is better than the
+T0 and S.V. baselines, but performs similarly to the S.E. method. This is because the TriviaQA and
+AmbigQA datasets contain mostly single-label queries, and therefore a first-order method such as S.E. is
+sufficient to detect hallucinations. The AmbigQA dataset contains a few multi-label queries, but upon
+closer inspection, we observe that the LLM has low entropy on most of these queries.12 Therefore, a
+first-order method can perform as well as our method on such queries. Our proposed method, as well as
+the baselines, make no mistakes on the WordNet dataset (as the prediction of the LLM is always correct),
+hence we omit those results. The S.V. baseline performs significantly worse than the other methods when
+the recall is not high (is below about 0.8).
+The similar performance for the S.E. and M.I. methods shown in Figure 5ab is due to the fact that the
+LLM has low entropy on most multi-label queries. However, ideally, an LLM should have higher entropy
+on multi-label queries (which would demonstrate broader knowledge, not focusing on a single possible
+answer). To include such queries, we mix the TriviaQA and AmbigQA datasets with our WordNet-based
+dataset with “truely” multi-label queries as constructed above. To enhance the intended effect, we filter
+our WordNet dataset by keeping only queries with entropy higher than 0.7 (approximately the entropy of
+the uniform distribution over two atoms). Then we have 842 remaining datapoints in WordNet. Note that
+when considered in isolation, both our proposed method and the semantic entropy method rarely make
+mistakes on this dataset. Then we create two new datasets by combining our 842 WordNet datapoints
+with 842 randomly selected datapoints from TriviaQA and AmbigQA, respectively, resulting in the
+TriviaQA+WordNet and AmbigQA+WordNet datasets. Figure 5cd show PR-curves for the S.E. and
+M.I. methods on these two combined datasets. Apart from low recall values, the performance of the S.E.
+method degrades noticeably with the addition of extra multi-label data. This precision/recall curve might
+look somewhat strange (with precision sometimes increasing with recall); this is due to the fact that
+both methods are always correct on the large number of high-entropy WordNet queries, where the LLM’s
+default predictions are correct.
+The hardness with the combined datasets is that the predominantly single-label datasets (TriviaQA,
+AmbigQA) might need a different calibration threshold than the multi-label WordNet dataset, and this
+is better handled by our proposed method than by S.E. To better illustrate the improved abstention
+properties of our method, we examine how the two methods handle when the output of the LLM is diverse
+(i.e., has high entropy). In order to do this, we perform the following experiment: We create a calibration
+dataset by adding 500 random datapoints from the WordNet dataset to 500 random datapoints from
+TriviaQA, and another such random dataset for test. We determine the abstention thresholds on the
+calibration dataset for both the S.E. and the M.E. methods,13 and measure the performance (error rate,
+11In some figures, for better illustration, we show the error rate which is one minus the precision.
+12Such a case can also be seen in the query “Name a city in the UK.” in Figure 3 where the response “London” has
+probability 0.958.
+13This is done by fixing the target loss rates of 0.05 for TriviaQA and 0.15 for AmbigQA, and finding threshold parameters
+11
+
+(a) TriviaQA+WordNet
+(b) TriviaQA+WordNet
+(c) AmbigQA+WordNet
+(d) AmbigQA+WordNet
+Figure 6: Recall and error rates (one minus precision: percentage of mistakes when not abstaining) of
+the proposed and the baseline method on TriviaQA+WordNet and AmbigQA+WordNet datasets. On
+TriviaQA+WordNet and AmbigQA+WordNet datasets, the methods are calibrated at target loss of 0.05
+and 0.15, respectively. On the x-axis, the queries are partitioned according to the entropy of the LLM’s
+output. Error bars show 2 standard deviation confidence intervals (based on 10 repetitions). While
+the first-order S.E. method has similar recall and error rates to those of the proposed M.E. method on
+low-entropy queries, its recall values are nearly zero for queries with higher entropy.
+i.e., 1 minus precision, and recall) of the resulting abstention policies on the test set. We repeat this
+process 10 times and report mean values and 95% confidence intervals with Gaussian approximation. We
+perform a similar evaluation process for mixtures of AmbigQA and WordNet datasets. Figure 6 show that
+while the S.E. method has similar recall and error rates to those of the proposed method on low-entropy
+queries, its recall values are much lower for queries with higher entropy, while the M.E. method makes
+only few mistakes on these queries.
+7
+Conclusions
+In this paper we considered epistemic uncertainty as a proxy for the truthfulness of LLMs. We proposed
+a mutual-information-based uncertainty estimator that admits a provable lower bound on the epistemic
+uncertainty of the LLM’s response to a query. That we consider joint distributions of multiple answers
+allows us to disentangle epistemic and aleatoric uncertainty, which makes it possible to better detect
+hallucination than first order methods, which can only tackle uncertainty as a whole, not epistemic
+uncertainty alone. This approach yielded an abstention method that performs significantly better on
+mixed single-label/multi-label datasets than first-order methods. While earlier methods for classification
+that aim to quantify epistemic uncertainty are usually based on a modified training method using
+response-tuples, utilizing the sequential nature of LLMs, our method does not need to change the training
+procedure, but needs to prompt the model iteratively with multiple responses generated by the LLM for
+the same query.
+References
+Anastasios N Angelopoulos, Stephen Bates, et al. Conformal prediction: A gentle introduction. Foundations
+and Trends® in Machine Learning, 16(4):494–591, 2023.
+Javier Antorán, James Allingham, and José Miguel Hernández-Lobato. Depth uncertainty in neural
+networks. Conference on Neural Information Processing Systems (NeurIPS), 2020.
+Amos Azaria and Tom Mitchell. The internal state of an LLM knows when its lying. In Conference on
+Empirical Methods in Natural Language Processing (EMNLP), 2023.
+Daniel Berend and Aryeh Kontorovich. The missing mass problem. Statistics & Probability Letters, 82(6):
+1102–1110, 2012.
+Daniel Berend and Aryeh Kontorovich. On the concentration of the missing mass. Electronic Communi-
+cations in Probability, 2013.
+that lead to these rates on the calibration set.
+12
+
+Daniel Berend, Aryeh Kontorovich, and Gil Zagdanski. The expected missing mass under an entropy
+constraint. Entropy, 19(7):315, 2017.
+Charles Blundell, Julien Cornebise, Koray Kavukcuoglu, and Daan Wierstra. Weight uncertainty in
+neural network. In International Conference on Machine Learing (ICML), 2015.
+Sébastien Bubeck, Varun Chandrasekaran, Ronen Eldan, Johannes Gehrke, Eric Horvitz, Ece Kamar,
+Peter Lee, Yin Tat Lee, Yuanzhi Li, Scott Lundberg, Harsha Nori, Hamid Palangi, Marco Tulio Ribeiro,
+and Yi Zhang. Sparks of artificial general intelligence: Early experiments with gpt-4. arXiv preprint
+arXiv:2303.12712, 2023.
+Collin Burns, Haotian Ye, Dan Klein, and Jacob Steinhardt. Discovering latent knowledge in language
+models without supervision. In International Conference on Learning Representations (ICLR), 2023.
+Chao Chen, Kai Liu, Ze Chen, Yi Gu, Yue Wu, Mingyuan Tao, Zhihang Fu, and Jieping Ye. INSIDE:
+LLMs’ internal states retain the power of hallucination detection. In International Conference on
+Learning Representations (ICLR), 2024.
+Jeremy R. Cole, Michael JQ Zhang, Daniel Gillick, Julian Martin Eisenschlos, Bhuwan Dhingra, and
+Jacob Eisenstein. Selectively answering ambiguous questions. In Conference on Empirical Methods in
+Natural Language Processing (EMNLP), 2023.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of deep
+bidirectional transformers for language understanding. arXiv preprint arXiv:1810.04805, 2019.
+Vikranth Dwaracherla, Zheng Wen, Ian Osband, Xiuyuan Lu, Seyed Mohammad Asghari, and Ben-
+jamin Van Roy. Ensembles for uncertainty estimation: Benefits of prior functions and bootstrapping.
+Transactions on Machine Learning Research (TMLR), 2023. ISSN 2835-8856.
+Christiane Fellbaum. WordNet: An electronic lexical database. MIT press, 1998.
+William A Gale and Geoffrey Sampson. Good-turing frequency estimation without tears. Journal of
+quantitative linguistics, 2(3):217–237, 1995.
+Gemini Team, Google.
+Gemini: A family of highly capable multimodal models.
+arXiv preprint
+arXiv:2312.11805, 2023. [Online; accessed 01-February-2024].
+Bairu Hou, Yujian Liu, Kaizhi Qian, Jacob Andreas, Shiyu Chang, and Yang Zhang. Decomposing
+uncertainty for large language models through input clarification ensembling. In International Conference
+on Machine Learing (ICML), 2024.
+Mingjian Jiang, Yangjun Ruan, Sicong Huang, Saifei Liao, Silviu Pitis, Roger Grosse, and Jimmy
+Ba. Calibrating language models via augmented prompt ensembles. In Workshop on Challenges in
+Deployable Generative AI at International Conference on Machine Learning, 2024.
+Daniel D. Johnson, Daniel Tarlow, David Duvenaud, and Chris J. Maddison. Experts don’t cheat:
+Learning what you don’t know by predicting pairs. arXiv preprint arXiv:2402.08733, 2024.
+Mandar Joshi, Eunsol Choi, Daniel S Weld, and Luke Zettlemoyer. TriviaQA: A large scale distantly
+supervised challenge dataset for reading comprehension.
+In Transactions of the Association for
+Computational Linguistics (ACL), pages 1601–1611, 2017.
+Saurav Kadavath, Tom Conerly, Amanda Askell, Tom Henighan, Dawn Drain, Ethan Perez, Nicholas
+Schiefer, Zac Hatfield Dodds, Nova DasSarma, Eli Tran-Johnson, and et al. Language models (mostly)
+know what they know. arXiv preprint arXiv:2207.05221, 2022.
+Nora Kassner and Hinrich Schütze. Negated and misprimed probes for pretrained language models: Birds
+can talk, but cannot fly. In Transactions of the Association for Computational Linguistics (ACL), 2020.
+Lorenz Kuhn, Yarin Gal, and Sebastian Farquhar. Semantic uncertainty: Linguistic invariances for
+uncertainty estimation in natural language generation.
+In International Conference on Learning
+Representations (ICLR), 2023.
+13
+
+Balaji Lakshminarayanan, Alexander Pritzel, and Charles Blundell. Simple and scalable predictive
+uncertainty estimation using deep ensembles. In Conference on Neural Information Processing Systems
+(NeurIPS), volume 30, 2017a.
+Balaji Lakshminarayanan, Alexander Pritzel, and Charles Blundell. Simple and scalable predictive
+uncertainty estimation using deep ensembles. Conference on Neural Information Processing Systems
+(NeurIPS), 2017b.
+Daliang Li, Ankit Singh Rawat, Manzil Zaheer, Xin Wang, Michal Lukasik, Andreas Veit, Felix Yu, and
+Sanjiv Kumar. Large language models with controllable working memory. In Transactions of the
+Association for Computational Linguistics (ACL), 2023.
+Zhen Lin, Shubhendu Trivedi, and Jimeng Sun. Generating with confidence: Uncertainty quantification
+for black-box large language models. arXiv preprint arXiv:2305.19187, 2023.
+Shayne Longpre, Kartik Perisetla, Anthony Chen, Nikhil Ramesh, Chris DuBois, and Sameer Singh.
+Entity-based knowledge conflicts in question answering. In Conference on Empirical Methods in Natural
+Language Processing (EMNLP), 2021.
+Andrey Malinin and Mark Gales. Uncertainty estimation in autoregressive structured prediction. In
+International Conference on Learning Representations (ICLR), 2020.
+Potsawee Manakul, Adian Liusie, and Mark J. F. Gales.
+SelfCheckGPT: Zero-resource black-box
+hallucination detection for generative large language models. In Conference on Empirical Methods in
+Natural Language Processing (EMNLP), 2023.
+David A McAllester and Robert E Schapire. On the convergence rate of good-turing estimators. In
+Conference on Computational Learning Theory (COLT), 2000.
+Sabrina J. Mielke, Arthur Szlam, Emily Dinan, and Y-Lan Boureau. Reducing conversational agents’
+overconfidence through linguistic calibration. In Transactions of the Association for Computational
+Linguistics (ACL), 2022.
+Sewon Min, Julian Michael, Hannaneh Hajishirzi, and Luke Zettlemoyer. AmbigQA: Answering ambiguous
+open-domain questions. In Conference on Empirical Methods in Natural Language Processing (EMNLP),
+2020.
+Ella Neeman, Roee Aharoni, Or Honovich, Leshem Choshen, Idan Szpektor, and Omri Abend. Disentqa:
+Disentangling parametric and contextual knowledge with counterfactual question answering. arXiv
+preprint arXiv:2211.05655, 2022.
+Mesrob I Ohannessian and Munther A Dahleh. Distribution-dependent performance of the good-turing
+estimator for the missing mass. In 19th International Symposium on Mathematical Theory of Networks
+and Systems, MTNS, 2010.
+Ian Osband, Charles Blundell, Alexander Pritzel, and Benjamin Van Roy. Deep exploration via boot-
+strapped dqn. In Conference on Neural Information Processing Systems (NeurIPS), volume 29, 2016.
+Ian Osband, Zheng Wen, Seyed Mohammad Asghari, Vikranth Dwaracherla, Morteza Ibrahimi, Xiuyuan
+Lu, and Benjamin Van Roy. Epistemic neural networks. In Conference on Neural Information Processing
+Systems (NeurIPS), 2023.
+Steven T Piantadosi. Zipf’s word frequency law in natural language: A critical review and future directions.
+Psychonomic bulletin & review, 21:1112–1130, 2014.
+Yury Polyanskiy and Yihong Wu. Information theory: From coding to learning. Cambridge University
+Press, 2024.
+Stephan Rabanser, Anvith Thudi, Kimia Hamidieh, Adam Dziedzic, and Nicolas Papernot. Selective
+classification via neural network training dynamics. arXiv preprint arXiv:2205.13532, 2022.
+14
+
+Shauli Ravfogel, Yoav Goldberg, and Jacob Goldberger. Conformal nucleus sampling. In Transactions
+of the Association for Computational Linguistics (ACL), pages 27–34. Association for Computational
+Linguistics, 2023.
+Robert J Tibshirani and Bradley Efron. An introduction to the bootstrap. Monographs on statistics and
+applied probability, 57(1), 1993.
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V Le, Ed H Chi, Sharan Narang, Aakanksha Chowdhery,
+and Denny Zhou.
+Self-consistency improves chain of thought reasoning in language models.
+In
+International Conference on Learning Representations (ICLR), 2022.
+Zheng Wen, Ian Osband, Chao Qin, Xiuyuan Lu, Morteza Ibrahimi, Vikranth Dwaracherla, Mohammad
+Asghari, and Benjamin Van Roy. From predictions to decisions: The importance of joint predictive
+distributions. arXiv preprint arXiv:2107.09224, 2022.
+Yasin Abbasi Yadkori, Ilja Kuzborskij, David Stutz, András György, Adam Fisch, Arnaud Doucet, Iuliya
+Beloshapka, Wei-Hung Weng, Yao-Yuan Yang, Csaba Szepesvári, Ali Taylan Cemgil, and Nenad
+Tomasev. Mitigating llm hallucinations via conformal abstention. arXiv preprint arXiv:2405.01563,
+2024.
+Gal Yona, Roee Aharoni, and Mor Geva. Narrowing the knowledge evaluation gap: Open-domain question
+answering with multi-granularity answers. arXiv preprint arXiv:2401.04695, 2024.
+Jiaxin Zhang, Zhuohang Li, Kamalika Das, Bradley Malin, and Sricharan Kumar.
+Sac3: Reliable
+hallucination detection in black-box language models via semantic-aware cross-check consistency. In
+Conference on Empirical Methods in Natural Language Processing (EMNLP), 2023.
+Yukun Zhao, Lingyong Yan, Weiwei Sun, Guoliang Xing, Chong Meng, Shuaiqiang Wang, Zhicong Cheng,
+Zhaochun Ren, and Dawei Yin. Knowing what llms do not know: A simple yet effective self-detection
+method. arXiv preprint arXiv:2310.17918, 2024.
+15
+
+A
+Related works
+In this section we present an overview of the related literature.
+A.1
+Training models with pairs of responses
+Wen et al. (2022); Osband et al. (2023); Johnson et al. (2024) show that we can distinguish between
+epistemic and aleatoric uncertainty if we train the models with paired observations.
+A.2
+Epistemic neural nets
+Ensemble methods are based on the classical idea of bootstrap for confidence estimation (Tibshirani and
+Efron, 1993), where multiple estimators for the regression function, each computed on a perturbed version
+of the data (e.g., by drawing samples from the empirical distribution over the data), are combined.
+The empirical distribution of the resulting estimates is then used to construct confidence intervals.
+While many of these methods can be interpreted as sample-based approximations to Bayesian methods,
+model-hyperparameter selection (e.g., scale of perturbations, learning) for ensemble methods is typically
+done using a validation on holdout data (a subset of the training data). Many recent papers have studied
+ensemble methods in the context of deep learning and reinforcement learning (Osband et al., 2016;
+Lakshminarayanan et al., 2017a; Malinin and Gales, 2020). In the context of LLMs, the methods require
+training multiple language models, which is very expensive. Osband et al. (2023) introduces epistemic
+neural networks (epinets), which approximate ensemble methods by training a single network with an
+artificially injected (controlled) source of randomness. Rabanser et al. (2022) proposes to use intermediate
+model checkpoints to quantify the uncertainty of the final model in its responses. While these approaches
+aim to mimic the bootstrap procedure during prediction, their validity is not justified by theoretical
+considerations, and hence remain heuristic approximations.
+A.3
+Hallucination detection using first-order methods
+First-order methods consider variance in the response distribution as a measure of hallucination (Kadavath
+et al., 2022; Cole et al., 2023; Manakul et al., 2023; Lin et al., 2023; Kuhn et al., 2023; Wang et al., 2022;
+Jiang et al., 2024; Zhang et al., 2023; Zhao et al., 2024; Yadkori et al., 2024). A common limitation of
+these approaches is that they are only applicable to prompts where there exists a single correct response,
+as they aim for detecting if one response (or multiple responses with the same meaning) is dominant.
+On the other hand, when multiple responses are correct, there is an aleatoric uncertainty in the ground
+truth: If an LLM correctly assigns non-negligible scores to multiple correct responses, most of these (if
+not all) will be declared as hallucination since, by design, only very few (typically at most one) responses
+can have scores higher than the threshold at the same time. Thus, hallucination detectors unaware of
+aleatoric uncertainty will invalidate most of the correct answers.
+Yona et al. (2024) design a method that generates multiple responses, and then aggregates them into a
+single response at a (typically higher) granularity level where no further uncertainty (contradiction) is left
+compared to the generated responses. Although not a strictly first order method, it does not differentiate
+between aleatoric and epistemic uncertainty.
+A.3.1
+Asking language models to quantify uncertainty (self-verification)
+Kadavath et al. (2022) propose to use LLM self-prompting to measure a model’s uncertainty in its
+responses. More specifically, for a given query, a number of responses are generated, and then the model is
+queried if the responses are correct. For this query, the log-probability of “True" is returned as a measure
+of uncertainty. Related approaches are studied by Mielke et al. (2022).
+A.4
+Uncertainty estimation based on sensitivity to contexts
+Kassner and Schütze (2020) show that an LLM’s responses can be influenced by irrelevant contexts.
+Longpre et al. (2021); Neeman et al. (2022) study two sources of knowledge: parametric knowledge stored
+in the network weights, and contextual knowledge retrieved from external sources. They view reliance of
+the model on its parametric knowledge and ignoring relevant contextual information as hallucination.
+16
+
+These works are mainly motivated by situations where the LLM’s knowledge is outdated and it is
+instructed to use the (new) contextual information. Accordingly, they design strategies to prioritize
+contextual information over parametric knowledge. Longpre et al. (2021) also show that larger models
+are more likely to ignore in-context information in favor of in-weight information. They propose creating
+training data with modified contextual information so that the model learns to favor the contextual
+information. Neeman et al. (2022) propose to train a model that predicts two answers: one based on
+parametric knowledge and one based on contextual information.
+Similarly to Neeman et al. (2022), Li et al. (2023) aims to design a mechanism such that the model’s
+behavior is influenced more by relevant context than by its parametric knowledge (controllability), while
+the model is robust to irrelevant contexts (robustness). They improve controllability and robustness using
+finetuning.
+Hou et al. (2024) study an approach to estimate model uncertainty due to ambiguity in a question.
+For a given question, their method generates multiple input clarification questions, and a new question is
+formed by augmenting the original question with each clarification question. The clarification questions
+are generated using an LLM with the aim of removing ambiguity in the question. This is different than
+the problem we study as the model can be uncertain about the answer even if the query itself has no
+ambiguity. For such queries, the method of Hou et al. (2024) might decide that no clarification is needed,
+and therefore there is no uncertainty.
+A.5
+Hallucination detection using internal states of LLMs
+There are a number of papers that try to extract knowledge/truthfulness by inspecting hidden-layer
+activations of LLMs (Burns et al., 2023; Azaria and Mitchell, 2023; Chen et al., 2024). Such methods
+clearly require access to the LLM’s internal states, which is not always possible, and severely limits the
+applicability of these methods.
+17
+
+B
+Omitted proofs
+Proof of Theorem 4.5. In the following we will use abbreviations
+X
+y
+=
+X
+y1,...,yn
+,
+X
+y\i
+=
+X
+y1,...,yi−1,yi+1,...,yn
+where each coordinate belongs to X. Now,
+DKL( eQ, eP) = −H( eQ) +
+X
+y
+eQ(y1, . . . , yn) ln
+1
+eP(y1, . . . , yn)
+= −H( eQ) +
+X
+y
+eQ(y1, . . . , yn) ln
+1
+Q
+i P
+ yi | Fi−1(y1, . . . , yi−1)
+
+(using Definition 4.2)
+= −H( eQ) +
+X
+y
+eQ(y1, . . . , yn) ln
+1
+Q
+i P(yi) .
+(by the independence assumption)
+Focusing on the last (cross-entropy) term
+X
+y
+eQ(y1, . . . , yn) ln
+1
+Q
+i P(yi)
+=
+X
+y
+eQ(y1, . . . , yn)
+X
+i
+ln
+1
+P(yi)
+=
+X
+i
+X
+yi
+X
+y\i
+eQ(y1, . . . , yn) ln
+1
+P(yi)
+(a)
+≥
+X
+i
+X
+yi
+X
+y\i
+eQ(y1, . . . , yn) ln
+1
+P
+y\i eQ(y1, . . . , yn)
+=
+X
+y
+eQ(y1, . . . , yn) ln
+1
+Q
+i
+P
+y\i eQ(y1, . . . , yn)
+where in (a) we used the fact that entropy is no larger than cross-entropy. Thus,
+DKL( eQ, eP) ≥
+X
+y
+eQ(y1, . . . , yn) ln
+eQ(y1, . . . , yn)
+Q
+i
+P
+y\i eQ(y1, . . . , yn)
+= I( eQ; Y1, . . . , Yn) .
+18
+
+C
+Estimation of mutual information and missing mass problem
+In this section, we discuss how to estimate the mutual information from a finite sample, which may not
+cover the full distribution. To control the estimation error, we first introduce the concept of missing mass.
+C.1
+The missing mass problem
+Let X be a countable set and suppose that X1, . . . , Xk ∼µ ∈M1(X n) independently. In the following x
+is used as an element of X n rather than the query (as in Section 4). Then, the missing mass is defined as
+the random variable
+Uk =
+X
+x∈X n
+µ(x) ξ(x) ,
+ξ(x) = I{x ̸∈{X1, . . . , Xk}} .
+Here we are primarily interested in two questions: (i) how quickly Uk approaches the expected missing
+mass EUk, where it is not hard to see that
+EUk =
+X
+x∈X n
+µ(x)(1 −µ(x))k ;
+and (ii) we are also interested in giving an estimate for EUk given µ and k. The first question is answered
+by the following theorem:
+Theorem C.1 (Concentration of a missing mass (Berend and Kontorovich, 2013)). For any t > 0, we
+have an upper-tail bound
+P (Uk > EUk + t) ≤e−tk2 ,
+and moreover for a universal constant c ≈7.6821, we have an lower-tail bound
+P (Uk < EUk −t) ≤e−ctk2 .
+Notably Uk exhibits a sub-gaussian concentration (i.e. 1/
+√
+k), which is surprisingly fast. As we will
+see next, the main bulk of the error incurred for missing a subset of the support is hidden in EUk.
+In particular, when X is finite with |X| = N, Berend and Kontorovich (2012) showed that
+EUk ≤
+(
+e−n
+N ,
+if n ≤N;
+N
+e n,
+if n > N.
+In the countably infinite X, we cannot generally have a non-trivial bound on EUk only in terms of n.
+In fact, Berend and Kontorovich (2012) show a bound that depends on µ which is expected to be finite
+for rapidly decaying atoms. Interestingly, when the entropy of µ is bounded, one has the following result
+(Berend et al., 2017):
+Theorem C.2. Let H(µ) ≤h < ∞. For all n ≥1, we have EUk ≤
+h
+Pk
+i=1 i−1 ≤
+h
+ln(n).
+Note that these estimates are very pessimistic, and in reality we expect the expected missing mass to be
+significantly smaller. Since natural (and many artificial) languages follow a Zipf distribution (Piantadosi,
+2014), we expect that E[Uk] should be much smaller than in the above cases, since sampling from the tail
+of a Zipf distribution is a rare event. In Appendix C.4 we show the following:
+Corollary C.3 (Expected missing mass of Zipf distribution). Consider distribution µ(i) = i−α/H(α, N)
+for i ∈[N], where α > 1 and H(α, N) = PN
+i=1 i−α. Then, for any β > 0,
+E[Uk] = O
+
+k−( α−1
+α
+−β)
+.
+Proof. The statement followss by combining Lemma C.7 and Proposition C.8.
+19
+
+C.2
+Estimating mutual information from the partial support
+Our goal is to estimate
+I(µ) = DKL(µ, µ⊗) =
+X
+x∈X n
+µ(x) ln
+ µ(x)
+µ⊗(x)
+
+by only having access to X1, . . . , Xk ∼µ. Note that that the sample might cover only some part of the
+support of X and therefore we are facing a missing mass problem. In the following we consider estimator
+bIk(γ) given by Algorithm 1.
+In particular in Appendix C.3 we show the following
+Theorem C.4. Fix ˜
+X ⊆X n. For any fixed γ > 0, δ ∈(0, 1), with probability at least 1 −δ,
+(1 −εk) bIk(γ) −
+
+| ˜
+X|γ + ln
+
+e + e
+γ
+ 
+µ(X n \ ˜
+X) + εk
+
+≤I(µ)
+where
+εk = EUk +
+s
+ln( 1
+δ )
+k
+.
+In particular, Theorem C.4 implies the following:
+Corollary C.5. Under conditions of Theorem C.4, there exists γ∗
+k ∈(0, 1) such that
+(1 −εk) bIk(γ∗
+k) −
+1
+k + (1 + n ln
+ 1 + k |X|)
+
+εk
+
+≤I(µ) .
+Note that, choosing any of the upper bounds on EUk discussed in Appendix C.1, we can see that
+Corollary C.5 implies asymptotic convergence in as a sense
+lim
+k→∞
+bIk(γ∗
+k) ≤I(µ) .
+C.3
+Proof of Theorem C.4
+The proof will heavily rely on the simple fact that
+1 −ξ(x) =
+(
+1,
+if x ∈{X1, . . . , Xk};
+0,
+otherwise.
+(2)
+Recalling that S =
+
+i ∈[k] : Xi ̸= Xj
+∀j < i
+	
+, this immediately implies the following connection
+between Uk and the quantities used in Algorithm 1:
+Proposition C.6. We have that
+X
+j∈S
+µ(Xj) =
+X
+x∈X n
+(1 −ξ(x)) µ(x) = 1 −Uk .
+Recall that the product distribution of µ is defined as
+µ⊗(x) =
+n
+Y
+i=1
+X
+x\i
+µ(x1, . . . , xi−1, xi, xi+1, . . . , xn) .
+Note that we use P
+x\i µ(· · · ) instead of µ(xi) since these are not necessarily equal for some µ.
+Introducing a one-dimensional version of ξ, for i ∈[n] and z ∈X, as
+ξi(z) = I{z ̸∈{X1,i, . . . , Xk,i}} ,
+20
+
+we introduce the normalization factors
+Z =
+X
+x∈X n
+(1 −ξ(x))µ(x) ,
+Z⊗=
+n
+Y
+i=1
+X
+z∈X
+(1 −ξi(z))
+X
+x\i
+µ(x1, . . . , xi−1, z, xi+1, . . . , xn) .
+We first note that by the definition of bµ⊗, for any x′ ∈X n,
+bµ⊗(x′) =
+n
+Y
+i=1
+P
+x\i µ(x1, . . . , xi−1, x′
+i, xi+1, . . . , xn)
+P
+j∈S
+P
+x\i µ(x1, . . . , xi−1, Xj,i, xi+1, . . . , xn)
+=
+n
+Y
+i=1
+P
+x\i µ(x1, . . . , xi−1, x′
+i, xi+1, . . . , xn)
+P
+z∈X (1 −ξi(z)) P
+x\i µ(x1, . . . , xi−1, z, xi+1, . . . , xn)
+= µ⊗(x′)
+Z⊗
+,
+where the second equality comes from the definition of ξi and the fact that the Xi are all different. Now,
+using the definitions of bIk and bµ,
+bIk(γ) =
+1
+P
+j∈S µ(Xj)
+X
+i∈S
+µ(Xi)
+ 
+ln
+ 
+µ(Xi)
+P
+j∈S µ(Xj) +
+γ
+P
+j∈S µ(Xj)
+!
+−ln
+
+bµ⊗(Xi) + γ
+Z⊗
+!
+= 1
+Z
+X
+i∈S
+µ(Xi)
+
+ln
+µ(Xi) + γ
+Z
+
+−ln
+µ⊗(Xi) + γ
+Z⊗
+
+(by Proposition C.6)
+= 1
+Z
+X
+x∈X n
+(1 −ξ(x)) µ(x)
+
+ln
+µ(x) + γ
+Z
+
+−ln
+µ⊗(x) + γ
+Z⊗
+
+(by Eq. (2))
+≤1
+Z
+X
+x∈X n
+(1 −ξ(x)) µ(x)
+
+ln
+ µ(x) + γ
+µ⊗(x) + γ
+
++ ln Z⊗
+Z
+= 1
+Z
+X
+x∈X n
+µ(x) ln
+ µ(x) + γ
+µ⊗(x) + γ
+
+|
+{z
+}
+(i)
++ 1
+Z
+X
+x∈X n
+ξ(x) µ(x) ln
+µ⊗(x) + γ
+µ(x) + γ
+
+|
+{z
+}
+(ii)
++ ln Z⊗
+Z
+| {z }
+(iii)
+.
+To control (i) we will first need the fact that q ln((q + γ)/p) ≤q ln(q/p) + γ for any q, p ∈[0, 1], γ > 0.
+Note that this follows since
+q ln
+q + γ
+p
+
+= q ln
+
+1 + γ
+q
+
++ q ln
+q
+p
+
+≤γ + q ln
+q
+p
+
+(3)
+using that ln(1 + a) ≤a for a > −1. Getting back to (i), and using the aforementioned inequality, we get
+(i) = 1
+Z
+X
+x∈X n
+µ(x) ln
+ µ(x) + γ
+µ⊗(x) + γ
+
+= 1
+Z
+X
+x∈˜
+X
+µ(x) ln
+ µ(x) + γ
+µ⊗(x) + γ
+
++ 1
+Z
+X
+x∈X n\ ˜
+X
+µ(x) ln
+ µ(x) + γ
+µ⊗(x) + γ
+
+≤1
+Z
+X
+x∈˜
+X
+µ(x) ln
+ µ(x) + γ
+µ⊗(x) + γ
+
++ 1
+Z ln
+1 + γ
+γ
+
+µ(X n \ ˜
+X)
+≤1
+Z
+X
+x∈˜
+X
+
+µ(x) ln
+ µ(x)
+µ⊗(x)
+
++ γ
+
++ 1
+Z ln
+
+1 + 1
+γ
+
+µ(X n \ ˜
+X)
+(by Equation (3))
+= 1
+Z
+
+DKL(µ, µ⊗) + | ˜
+X| γ
+
++ 1
+Z ln
+
+1 + 1
+γ
+
+µ(X n \ ˜
+X) .
+Furthermore,
+(ii) ≤1
+Z
+X
+x∈X n
+ξ(x) µ(x) ln
+
+1 + 1
+γ
+
+= 1 −Z
+Z
+ln
+
+1 + 1
+γ
+
+.
+21
+
+Next, observe that (iii) ≤ln(1/Z). Finally, putting all together,
+bIk(γ) ≤1
+Z
+
+DKL(µ, µ⊗) + | ˜
+X|γ
+
++ 1
+Z ln
+
+1 + 1
+γ
+ 
+µ(X n \ ˜
+X) + 1 −Z
+
++ ln(1/Z) .
+Finally, multiplying through by Z the entire inequality, and using the fact that Z ln(1/Z) ≤1 −Z, we get
+Z bIk(γ) ≤DKL(µ, µ⊗) + | ˜
+X|γ + ln
+
+1 + 1
+γ
+ 
+µ(X n \ ˜
+X) + 1 −Z
+
++ 1 −Z
+≤DKL(µ, µ⊗) + | ˜
+X|γ + ln
+
+e + e
+γ
+ 
+µ(X n \ ˜
+X) + 1 −Z
+
+To complete the proof we need to give a lower bound on Z. Note that Z = 1 −Uk by the definition of
+Z and Proposition C.6, and so by Theorem C.1
+P (1 −EUk > 1 −Uk + t) ≤e−tk2 .
+Using this concentration bound together with the choices of γ (also setting δsupp = 0 for the first inequality
+in the main statement) completes the proof of Theorem C.4.
+□
+C.4
+Expected missing mass under Zipf distribution
+We will rely on some machinery used by Ohannessian and Dahleh (2010) who established distribution-
+dependent bounds on the expected missing mass. As before let µ be supported on a countable set. The
+accrual function is defined as
+F(v) =
+X
+µ(i)≤v
+µ(i)
+(v ∈[0, 1])
+and moreover the accrual rates are defined as
+ρ = lim inf
+v→0
+ln F(v)
+ln v
+,
+ρ = lim sup
+v→0
+ln F(v)
+ln v
+We use the following result:
+Lemma C.7 (Ohannessian and Dahleh, 2010, Theorem 1). Let µ have lower and upper accrual rates
+0 < ρ ≤ρ < ∞. Then for every β > 0 there exists k0 such that for all k > k0 we have:
+k−(p+β) ≤E[Uk] ≤k−(p−β)
+or, equivalently, for every β > 0 we have that E[Uk] is both Ω(k−(p+β)) and O(k−(p−β)).
+Proposition C.8. Consider the distribution µ(v) = i−α/H(α, N) for i ∈[N] where α > 1 and
+H(α, N) = PN
+i=1 i−α. Then, ρ = Ω( α−1
+α ) as N →∞.
+Proof. The idea is to use Lemma C.7 to give an upper bound on the missing mass. Therefore, we need to
+establish a lower bound on ln F(v). For now, abbreviate
+u = (v H(α, N))−1
+α .
+First note that for some 1 ≤u ≤N
+N
+X
+i≥u
+i−α ≥
+Z N
+u
+(1 + i)−α di =
+1
+α −1
+ (1 + u)1−α −(1 + N)1−α
+.
+22
+
+On the other hand,
+N
+X
+i=1
+i−α ≤
+Z N
+1
+(1 + i)−α di ≤
+1
+α −1 (1 −N 1−α) .
+So,
+ln F(v) ≥ln
+ (1 + u)1−α −(1 + N)1−α
+−ln(1 −N 1−α)
+≥ln
+ (1 + u)1−α −(1 + N)1−α
+and then
+ln F(v) = Ω((1 −α) ln(1 + u))
+(as N →∞)
+= Ω((1 −α) ln(u))
+= Ω
+
+(1 −α) ln((v H(α, N))−1
+α )
+
+= Ω
+α −1
+α
+ln(v) + α −1
+α
+ln H(α, N)
+
+= Ω
+α −1
+α
+ln(v)
+
+.
+Data-dependent estimate of the expected missing mass
+We perform an experiment designed to
+give a data-dependent estimate of the expected missing mass E[Uk] for some specific datasets. Clearly,
+we cannot simply apply a concentration bound discussed in Appendix C.1 since the complete support of
+the pseudo joint distribution derived from the LLM is unknown. To this end, we approximate it with a
+finite support driven by the language model itself. In particular, given a query we sample responses (at
+temperature 0.9) until their total probability mass reaches 0.95 or we reach 1000 responses per query.
+In case of TriviaQA, we performed 1233 queries in total. The mean and the median number of unique
+responses per query was eventually 118.3 and 22, respectively. In case of the AmbigQA dataset, we
+performed 700 queries, while the mean and the median number of unique responses was 277 and 69,
+respectively.
+At this point, we denote the set of responses by ˜
+X and let ˜Uk be the missing mass computed on ˜
+X.
+Then, we have
+E[Uk] ≤Uk +
+s
+ln( 1
+δ )
+k
+≤˜Uk + Uk −˜Uk +
+s
+ln( 1
+δ )
+k
+≤˜Uk + 1 −P( ˜
+X) +
+s
+ln( 1
+δ )
+k
+,
+which can be computed in practice. In Figure 7 we present our results in the form of empirical distributions
+of different quantities, where each observation corresponds to a single query. We compute the bounds
+for TriviaQA and AmbigQA datasets (see Section 6 for details about these datasets). From Figure 7 we
+can conclude that the expected missing mass for both datasets is very small: Both the missing mass
+computed on ˜
+X and the resulting upper bound on E[Uk] are concentrated close to 0, while the cumulative
+probability of the approximate support ˜
+X is close to 1 most of the time, showing that our approximations
+are meaningful.
+23
+
+0.2
+0.4
+0.6
+0.8
+1.0
+Value of upper bound
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+H.p. upper bound on [Uk]
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Value of Uk
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+Uk
+0.2
+0.4
+0.6
+0.8
+1.0
+Probability
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+Total mass of sampled responses
+TriviaQA dataset
+0.2
+0.4
+0.6
+0.8
+1.0
+Value of upper bound
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+H.p. upper bound on [Uk]
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Value of Uk
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+Uk
+0.2
+0.4
+0.6
+0.8
+1.0
+Probability
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Frequency
+Total mass of sampled responses
+AmbigQA dataset
+Figure 7: Distributions of bounds on the missing mass. The left figure for each dataset presents the
+empirical distribution of the upper bounds on the missing mass E[Uk]. The middle figure presents the
+empirical distribution of ˜Uk, the missing mass computed on a finite support approximation (where the
+support is obtained by taking samples from the LLM until a cumulative probability of 95% or 1000 samples
+are achieved). The right graph shows the empirical distribution of P( ˜
+X), the cumulative probabilities of
+all responses generated by the language model. For each figure, one observation (sample) corresponds to
+a single query. The black curves represent the corresponding empirical cumulative distribution functions
+for the upper bounds on EUk and for ˜Uk, and the empirical survival function (1 minus the empirical
+distribution function) for the distribution of P( ˜
+X).
+24
+

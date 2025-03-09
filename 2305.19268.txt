@@ -1,0 +1,2532 @@
+Intriguing Properties of Quantization at Scale
+Arash Ahmadian*†
+Cohere For AI
+Saurabh Dash *
+Cohere
+Hongyu Chen *
+Cohere
+Bharat Venkitesh
+Cohere
+Stephen Gou
+Cohere
+Phil Blunsom
+Cohere
+Ahmet Üstün
+Cohere For AI
+Sara Hooker
+Cohere For AI
+{arash,saurabh,charlie,bharat,stephen,phil,ahmet,sarahooker}@cohere.com
+Abstract
+Emergent properties have been widely adopted as a term to describe behavior not present in smaller
+models but observed in larger models (Wei et al., 2022a). Recent work suggests that the trade-off
+incurred by quantization is also an emergent property, with sharp drops in performance in models
+over 6B parameters. In this work, we ask are quantization cliffs in performance solely a factor of
+scale? Against a backdrop of increased research focus on why certain emergent properties surface
+at scale, this work provides a useful counter-example. We posit that it is possible to optimize for
+a quantization friendly training recipe that suppresses large activation magnitude outliers. Here,
+we find that outlier dimensions are not an inherent product of scale, but rather sensitive to the
+optimization conditions present during pre-training. This both opens up directions for more efficient
+quantization, and poses the question of whether other emergent properties are inherent or can be
+altered and conditioned by optimization and architecture design choices. We successfully quantize
+models ranging in size from 410M to 52B with minimal degradation in performance.
+1
+Introduction
+The push for ever larger language models (LLMs) has been driven by a strong correlation between
+performance and the number of parameters (Chowdhery et al., 2022; Zhang et al., 2022; Kaplan
+et al., 2020). This has led to new breakthroughs in downstream performance, but has also posed
+new challenges in making these models accessible. Larger models incur higher memory and latency
+because of the requirement to store many more model weights and the optimizer in fixed memory
+(Dehghani et al., 2021; Treviso et al., 2022). Due to the massive size of state-of-art LLMs, inference
+often requires hosting across multiple machines which limits the practical usability of such models.
+To address this, much research has focused on compression techniques such as quantization, which
+reduces the number of bits needed to represent each learned parameter in a model (Gholami et al.,
+2021).
+Quantization techniques are widely used in smaller model regimes – quantizing weights
+stored as 32-bit or 16-bit floating-point numbers to 8-bit integers (INT8) produces large reductions
+*Equal Contribution.
+†Also affiliated with the University of Toronto & the Vector Institute for Artificial Intelligence.
+Released as a preprint on May 31, 2023
+1
+arXiv:2305.19268v1  [cs.LG]  30 May 2023
+
+in memory and latency.
+125M 350M
+1.3B
+2.7B
+6.7B
+13B
+30B
+66B
+150B
+Parameter Count
+0.3
+0.4
+0.5
+0.6
+0.7
+Mean Performance
+cohere-int8
+cohere-fp16
+opt-int8
+opt-fp16
+Figure 1: Mean zero-shot accuracy on HellaSwag,
+PIQA, LAMBADA, and WinoGrad. In contrast
+to the OPT family, our models show minimal
+degradation after simple vectorwise quantization.
+Data points for OPT models are from (Dettmers
+& Zettlemoyer, 2022).
+However, at scale simple quantization tech-
+niques have been shown to lead to a pronounced
+degradation in performance (Xiao et al., 2022).
+This trade-off has been attributed by several re-
+cent works (Dettmers et al., 2022; Zeng et al.,
+2022; Xiao et al., 2022; Bondarenko et al.,
+2021) to emergent outlier dimensions—scaling
+transformer-based architecture results in large
+activation magnitude outliers which are con-
+centrated along a few hidden dimensions.
+To
+remedy this degradation, mixed-precision solu-
+tions have been proposed that handle the outlier
+activations separately (Dettmers et al., 2022).
+While effective at preventing degradation, these
+specialized techniques pose significant latency
+overhead which negates some of the benefits to
+memory (Wu et al., 2020).
+The difficulties of quantizing at scale prompt us
+to ask: are emergent properties due to nature
+or nurture? Recent work introduces intriguing
+and somewhat contradictory answers to this question: Models like OPT-175B (Zhang et al., 2022)
+and FairSeq (Artetxe et al., 2022) exhibit pronounced sensitivity to post-training quantization and
+require complex mixed-precision decomposition quantization methods (Dettmers et al., 2022; Wei
+et al., 2022b; Bondarenko et al., 2021; Luo et al., 2020; Zeng et al., 2022). On the contrary, BLOOM-
+176B (Scao et al., 2022) is easier to quantize with a simple quantization recipe and a relatively small
+performance drop (Frantar et al., 2022; Xiao et al., 2022). Zeng et al. (2022) hypothesize that the
+observed difference in weight distribution characteristics may be due to the difference in optimization
+choices made during pre-training.
+In this work, we seek to reconcile these observations. We posit that it is possible to optimize for a
+quantization friendly training recipe that suppresses large activation magnitude outliers. This leads
+to a distribution of activations and weights that are more amenable to simple INT8 quantization
+recipes and does not necessitate the need for complex and inefficient mixed-precision computations.
+Our results show that we can introduce simple INT8 post-training quantization with negligible
+impact on performance due to choices we make during the pre-training stage. As shown in Figure 1,
+across 8 zero-shot downstream tasks, our models do not present any significant performance drop,
+having only 0.24% average degradation in a 52 billion parameter model.
+In summary, our contributions are as follows:
+• We conduct a controlled large scale study – we maintain the same architecture and vary
+key optimization choices such as weight decay, gradient clipping, dropout and precision of
+training representation.
+We present results across models varying from 410 million to 52
+billion parameters, with each experiment variant trained from random initialization. While
+2
+
+this requires a compute intensive set-up, it allows us to rigorously disentangle what factors
+actually influence sensitivity to quantization.
+• We show that reoccurring activation outliers are not a universal emergent property of LLMs
+at scale and can be avoided at scales as large as 52B given the right optimization choices. Our
+52B parameter model shows only 0.26% performance degradation across 8 tasks with INT8
+PTQ quantization of both activations and weights.
+• We contribute a fine-grained analysis of activations and weights, and show that several key
+weight and activation characteristics may explain the difference in sensitivity between our
+robust models and models like OPT which have been shown to have pronounced sensitivity to
+quantitization at scale. We hope these insights help guide future model design and pre-training
+strategies.
+2
+Background
+Quantization refers to compressing weights and activations of a neural network into lower-bit repre-
+sentations. Here, our focus is on one-shot post-training quantization (PTQ) (Xiao et al., 2022;
+Dettmers et al., 2022), which quantizes the network post-training without additional finetuning
+steps for calibration. Given the complexities of successfully training a large language model (Zhang
+et al., 2022; Rae et al., 2021), PTQ methods are extremely attractive as these techniques require
+the least modification to pre-trained parameters, compared to quantization-aware training methods
+(Zafrir et al., 2019; Krishnamoorthi, 2018) or quantization-aware finetuning (Park et al., 2022b; Yao
+et al., 2022; Frantar et al., 2022; Zhuo et al., 2022; Li et al., 2021; Hubara et al., 2020; Nagel et al.,
+2020) which both require updates to model weights. We include more detail about each of these
+broad groups of techniques in Appendix C.
+To-date PTQ techniques that quantize both the activations and weights of a language model have
+proven extremely challenging at large scale (>6B parameters) leading to pronounced drops in per-
+formance.
+Instead, less aggressive techniques have been used such as weight-only quantization
+(Gerganov, 2023; Frantar et al., 2022; Zeng et al., 2022) that leaves the activations in higher preci-
+sion or quantization with mixed-precision decomposition (Dettmers et al., 2022) which decomposes
+the matrix multiplication to compute a small fraction of elements at a higher precision (FP16) while
+the bulk of the computations is performed at low precision (INT8).
+Weight-only quantization brings speedup to inference by reducing the amount of data movement.
+However, as large language models are scaled, progressively they become compute-bound and the
+improvements due to weight-only quantization stagnate. While mixed-precision decomposition ap-
+proaches have theoretical latency benefits due to the bulk of the computation being performed at
+lower precision, in practice without specialized hardware (Dash et al., 2022; Dash & Mukhopadhyay,
+2020; Hooker, 2021), GPU kernels, or additional kernel calls to prepare the inputs and weights for
+mixed-precision computation, the projected benefits cannot be realized (Dettmers et al., 2022). To
+further realize latency gains, we need to quantize both weights and activations into 8-bit integers
+(INT8) to utilize specialized integer INT8 GEMM kernels, which are supported by a wide range of
+hardware (e.g., NVIDIA GPUs, Intel CPUs, Qualcomm DSPs, etc.) In addition, weight and acti-
+vations quantization further enables compressing key-value cache to INT8. Since key-value cache
+takes up a significant part of the GPU memory during inference (Sheng et al., 2023), weight and
+activations quantization further contributes to memory saving and high throughput inference.
+3
+
+Hence, the most challenging weights and activations setting is the focus of this work.
+More
+concretely, given a neural network that learns a function f parameterized by a set of weights
+{W0, W1, ..., Wn} with corresponding activations {X0, X1, ..., Xn}, during quantization, activa-
+tion and weight tensors denoted by X ∈Rt×h and W ∈Rh×o – where t denotes the sequence-length,
+h the input hidden units and o the output hidden units1 – are replaced with lower-bit counterparts
+WQ and XQ by scaling and rounding the original tensors to INT8 range. We focus on vector-wise
+quantization recipe (Dettmers et al., 2022) to increase quantization granularity. In vector-wise quan-
+tization, we define the row-scaling vector sx ∈Rt and column-scaling vector sw ∈Ro by calculating
+the scaling constants for each row/column through uniform symmetric mapping (Nagel et al., 2021).
+After INT8 matrix multiplication, dequantization of XQWQ back to FP16 is through element-wise
+multiplication with sx and sw:
+XW ≈sx ⊙(XQWQ) ⊙sw
+(1)
+Where ⊙denotes broadcastable matrix multiplication. The quantization and dequantization steps
+for the above do not add much memory overhead compared to quantizing with a single scaling
+constant for each weight or activation tensor, while significantly increasing the representation power
+of INT8.
+3
+Methodology and Experimental Setup
+3.1
+Methodology
+Our goal is to understand whether sensitivity to widely used quantization techniques is inherently
+an emergent property at scale or due to optimization choices made during pre-training. Recent work
+has presented seemingly contradictory empirical findings – some models such as OPT-175B show
+pronounced sensitivity at scale to post-training quantization while other models such as BLOOM-
+176B are relatively robust to post-training quantization.
+Experimental Axes
+Choices
+Weight decay
+0.001, 0.01, 0.1
+Gradient clipping
+None,
+1
+Dropout
+0, 0.1, 0.4, 0.8
+Half-precision
+bf16,
+fp16
+Table 1: Optimization choices that are ex-
+plored for pre-training in our controlled
+setup.
+These models differ in numerous ways such as ar-
+chitectural differences, pre-training data, training in-
+frastructure, and finally optimization choices,making
+it challenging to attribute differences in quantization
+performance. To rigorously isolate what choices result
+in sensitivity to quantization, we measure the impact
+of optimization choices within a tightly controlled ex-
+perimental setup – training the same large scale model
+architecture from random initialization while rigor-
+ously varying only key aspects of the optimization
+procedure. Each optimization choice is evaluated in
+two ways: we measure the resulting degradation after PTQ in zero-shot downstream performance
+and then analyze the model weights and feature activations to understand how the characteristics
+at scale impact quantization performance.
+1We omit the batch dimension for simplicity.
+4
+
+Training multiple multi-billion parameter size language models is extremely expensive – a single
+52B language model takes roughly 20 days of training with 2048 TPU cores.2. Therefore, we first
+conduct our controlled experiments on 410M and 6B models using early checkpoints and then
+validate the results at scale, by fully training 6B, 13B, and 52B parameter size models with our
+most quantization friendly training recipe. In practice, we found performance at early checkpoints
+predictive of fully trained model performance.
+We briefly describe each of the axes of variations below:
+Weight decay Weight decay is widely used to impede over-fitting by penalizing large magnitude
+weights (Goodfellow et al., 2016). We experiment with a range of weight decay values {0.001, 0.01,
+0.1}.
+Gradient clipping Gradient clipping rescales the norm of the gradient vector if it exceeds the
+threshold (Pascanu et al., 2013). It is widely used in LLMs to prevent exploding gradients and
+accelerate training convergence (Du et al., 2021; Zhang et al., 2022). We experiment with a gradient
+norm threshold of 1 as well as training without gradient clipping.
+Dropout Dropout is a widely used regularization technique that drops neurons with a probability
+of p during training (Srivastava et al., 2014)(Hinton et al., 2012). We apply dropout to the output
+of the self-attention block and the feed-forward block before the corresponding residual connection
+as described in Vaswani et al. (2017), but we do not use a dropout for the input embeddings. We
+experiment with {0, 0.1, 0.4, 0.8} dropout probabilities.
+Half-precision data type: bf16 vs fp16 Training neural networks in mixed-precision is a com-
+mon technique to reduce the memory requirement and improves training time while often achieving
+comparable performance to full-precision training (Micikevicius et al., 2017). In this technique, a
+copy of weights is stored in full-precision (fp32) whereas the forward and backward passes are done
+using half-precision in either float16 (fp16) or bfloat16 (bf16) (Kalamkar et al., 2019; Dean et al.,
+2012; Abadi et al., 2015).
+We experiment with fp16 and bf16. Furthermore, for each half-precision data type, we vary weight
+decay values of (0.1, 0.01) to observe whether the effect of the half-precision data type is exasper-
+ated with a smaller weight decay value of 0.01.
+3.2
+Experimental Setup
+Model We train autoregressive decoder-only Transformer models (Liu et al., 2018) with a standard
+language modeling objective. Given an input sequence of S = [s1, · · · , st], a language model with
+parameters θ trained to minimizes the following negative log likelihood:
+L(S) =
+X
+i
+−logP(si|s<i; θ)
+(2)
+Our language models follow the traditional GPT style architecture reported in Radford et al..
+Different from the Radford et al., we do not share the same weight matrix for input and output
+embedding layers. Instead, we learn separate input and output projections to enable higher model
+2We include more details about the hardware and training requirements in Section 3.2
+5
+
+0.4
+0.0
+0.4
+0.8
+1.2
+1.6
+Mean % PTQ Diff.
+-0.09
+-0.26
+-1.36
+Weight Decay
+wd=0.1
+wd=0.01
+wd=0.001
+(a)
+0.4
+0.0
+0.4
+0.8
+1.2
+1.6
+0.32
+0.31
+-0.27
+-0.57
+Dropout
+dropout=0.0
+dropout=0.1
+dropout=0.4
+dropout=0.8
+(b)
+0.4
+0.0
+0.4
+0.8
+1.2
+1.6
+0.41
+-1.36
+Gradient Clipping
+gc=1.0
+gc=none
+(c)
+Figure 2: Study of the PTQ performance when varying weight decay, dropout, and gradient clipping.
+In Figure 2c a control weight decay value of 0.001 is used to to minimize the effects of weight decay
+when studying gradient clipping. Otherwise, we use weight decay of 0.1, dropout of 0, gradient
+clipping threshold of 1.0, and bf16 training, as control variables.
+parallelism. We train models with parameter sizes ranging from 410 million to 52 billion. All models
+have a maximum sequence length of 2048 tokens. We use SentencePiece (Kudo & Richardson, 2018)
+tokenizer with a vocabulary of 51200 to tokenize the text.
+Training details We pre-train models using a mixture of datasets from Common Crawl and C4
+(Raffel et al., 2020) with AdamW (Loshchilov & Hutter, 2019) optimizer and a batch size of 256. We
+use a cosine learning rate scheduler with 1500 warm-up steps. We use GeLU activations (Hendrycks
+& Gimpel, 2016). All the models are trained with mixed-precision, i.e. forward and backward passes
+are computed in bf16 or fp16 half-precision format, but the model parameters are stored in fp32 in
+the distributed optimizer state (Rajbhandari et al., 2020). For half-precision fp16, we experimented
+with a variant by switching layernorm arithmetic from fp16 to fp32 for better numeric stability
+(Micikevicius et al., 2017). Without layernorm arithmetic being in fp32, the training was unable
+to converge.
+To avoid an exorbitant computational cost given each variant requires training from scratch and
+we are evaluating very large scale models, we first iterated on 410M models but observed very
+minimal degradation.
+As a result, we scaled to 6B parameters which is the scale at which we
+present our results.
+Following the analysis, we validate our findings by scaling the most PTQ
+friendly optimization choices to 13B and 52B models until convergence.
+The optimal training
+hyper-parameters for PTQ are provided in Appendix A.1.
+Infrastructure We use TPU-v4 chips (Jouppi et al., 2017) to train, and Nvidia A100 GPUs to
+evaluate our models. All models are trained using the FAX (Yoo et al., 2022) framework which
+enables efficient model and data parallelism. It takes approximately 72 hours on 128 cores to train
+a 6B parameter model for 75000 steps.
+Evaluation We evaluate each model variant on Copa (test and dev set) (Wang et al., 2019),
+HellaSwag (Zellers et al., 2019), PIQAValidation (Bisk et al., 2020), StoryCloze (Mostafazadeh
+et al., 2016), WinoGrande (Sakaguchi et al., 2019), Paralex (Fader et al., 2013), and LAMBADA
+(Paperno et al., 2016). All evaluations were done in a zero-shot setting. In total, we benchmark on 8
+tasks comprised of Multiple choice (MC) completion, MC Co-referencing, Generation, and Question
+6
+
+2.1
+1.7
+1.3
+0.9
+0.5
+0.1
+0.3
+0.7
+1.1
+Mean % PTQ Diff.
+0.32
+0.77
+-0.76
+-1.73
+dtype=bf16 (wd=0.1)
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.1)
+dtype=fp16 (wd=0.01)
+15000
+40000
+75000
+2
+1
+0
+1
+dtype=bf16 (wd=0.1)
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.1)
+dtype=fp16 (wd=0.01)
+Half-precision data type: bf16 vs fp16
+Figure 3: Study of PTQ performance when varying the precision used during training. On the left,
+the performance difference is plotted at 75000 steps whereas on the right, it is plotted over time. We
+observe that fp16 training consistently leads to models which are far more sensitive to post-training
+quantization.
+Answering (QA) types. Details of our evaluation suite are given in Appendix A.2. For each experi-
+mental variant, we report the average percent performance difference and the pre-quantization and
+post-quantization performances across tasks. The percent degradation is calculated by normalizing
+each task’s absolute degradation by the corresponding pre-quantization performance.
+4
+Results and Discussion
+For each experimental axis, we train the corresponding variants to a maximum of 75000 steps.
+Below we present a breakdown of the degradation results and analysis for each experimental axis.
+All variants with the exception of dropout=0.8, had similar pre-quantization performance. This
+is important, as we are interested in comparing optimization choices that still result in models of
+comparable quality, but differing sensitivities to post-training quantization. Refer to Appendix A.3
+for the per-task breakdown of results.
+Weight Decay As can be seen in Figure 2a, we observe that a higher level of weight decay during
+pre-training improves post-training quantization performance.
+We do not use gradient clipping
+in these experiments to isolate the impact of weight decay. A larger weight decay value (0.1 vs
+0.001) results in better post-training performance (0.09% vs 1.36% degradation). Furthermore, as
+shown in Figure 3, combining lower weight decay with fp16 can further amplify sensitivity to post-
+training quantization. A small weight decay value (0.01) can cause higher performance degradation
+in post-quantization after training (1.73%).
+Dropout and Gradient Clipping In Figure 2b we observe that higher levels of dropout corre-
+spond to sharper degradation in post-training quantization. Note that Pdropout = 0.8 unsurprisingly
+leads to a poor absolute downstream performance, however, it helps establish a clear trend given
+other data points. Figure 2c shows the relative quantization degradation for models with and with-
+out gradient clipping. When varying gradient clipping, a control weight decay value of 0.001 is used
+to minimize the impact of weight decay. As seen in the figure, gradient clipping shows a positive
+7
+
+impact on the quantization performance, improving robustness to post-training quantization. This
+suggests that gradient clipping to an extent counteracts the effects of a small weight-decay value
+which would otherwise lead to higher quantization degradation.
+Half-precision: bf16 vs fp16 Figure 3 shows the quantization degradation and absolute perfor-
+mance for fp16 and bf16 for 6B parameter models. Training with fp16 leads to higher quantization
+degradation than bf16. We relate the degradation results to the numerical stability in training. fp16
+format uses a smaller range for the exponent than bf16. While bf16 uses 8 bits for the exponent,
+fp16 only uses 5. Most floating point formats also have denormalized numbers which allow for a
+soft underflow. This can get exponentially closer to 0.0f for each additional bit in the mantissa.
+This makes underflow more of a concern for floating point formats.
+Notably, we observe that our findings provide insights into the quantization robustness of BLOOM-
+176B, which to our knowledge is the only open-source LLM (with more than 50B parameters) and
+a decoder-only block architecture, that is trained with bf16; compared to simliar sized fp16 trained
+models such as OPT-175B (Xiao et al., 2022).
+Using Early Checkpoints to Infer Converged Model Behavior Given the considerable com-
+putational cost of our experiments, it is valuable to explore whether converged model behavior can
+be inferred from checkpoints from early snapshots of training. In Figure 3, we plot the relative
+post-training quantization degradation given checkpoints trained with different levels of precision
+at different steps during pre-training. We observe that quantization degradation increases with step
+count, but the relative impact of varying the bit representation emerges early in training which con-
+firms the main trend. Interestingly, fp16 (wd=0.01) variant exhibits high quantization degradation
+in the starting phase training as early as 15000 steps.
+Scaling Insights to 52B scale To validate our experimental findings at scale and with fully trained
+models, we pre-train 410M, 6B, 13B, and 52B parameter models using the best optimization choices
+with respect to robustness in post-training quantization: weight decay of 0.1, no dropout, gradient
+clipping of 1, and bf16 as the half-precision format. Figure 1 shows mean zero-shot accuracy for
+the non-quantized and quantized model using INT8 weights and activations. Compared with OPT
+models (Zhang et al., 2022), our fully-trained models are significantly more robust to post-training
+quantization starting from 6B parameter size. Our largest scale model with 52B parameters, shows a
+0.08% improvement in average performance across the evaluation suite and only 0.01% degradation
+across LAMBADA, HellaSwag, and PIQA where OPT-66B which is the closest OPT model in terms
+of size, has an extreme drop of ∼42% as reported in Dettmers et al. (2022).
+To evaluate our models’ performance under a different quantization recipe in addition to INT8, we
+also test 4-bit integer (INT4) column-wise weight-only quantization, similar to Du et al. (2021).
+Our 52B parameter model exhibited only a 3.6% relative drop in mean zero-shot performance
+across the 8 evaluation tasks. It is worth noting that this quantization scheme does not require
+any fine-tuning or optimization and hence these results highlight the high robustness of our trained
+models. In comparison, when applying the same quantization scheme to BLOOM, BLOOM-176B
+and BLOOM-7B show 29.5% and 18.7% degradation respectively on LAMBADA (Du et al., 2021),
+while our 52B model only has 8.6% degradation.
+8
+
+0.5
+0.0
+0.5
+101
+103
+105
+107
+attn-kqv-proj
+0.5
+1.0
+1.5
+2.0
+100
+101
+102
+layernorm-1
+fp16 (wd=0.01)
+bf16 (wd=0.01)
+0.4
+0.2
+0.0
+0.2
+0.4
+101
+103
+105
+107
+attn-kqv-proj
+0.5
+1.0
+1.5
+100
+101
+102
+103
+layernorm-1
+cohere_6b
+opt_6b
+bloom_6b
+Figure 4: Weight distribution of attn-kqv-proj and layernorm gain (g) parameter in an example
+block (Block 14) for both fp16/bf16 variants and our final 6B model in comparison with OPT and
+BLOOM. Weight distributions for all blocks are shown in Appendix B.1
+5
+Weight and Activation Analysis
+Our results in Section 4 find that sensitivity to quantization at scale is not an inherent emergent
+property. Rather, it can be avoided at scales as large as 52B given the right optimization choices.
+In this section, we perform a fine-grained analysis of activations and weights to understand how
+the trained distribution of our models differs from models like OPT that are far more sensitive to
+quantization. For all the metrics proposed below, we include the complete analysis for all layers in
+Appendix B.
+Activations
+As
+a
+first
+step,
+we
+analyze
+input
+activations
+of
+the
+attention
+projection
+(attn-kqv-proj) as it is the earliest point for INT8 multiplication in a decoder block. Here, we
+measure root-mean-square error RMSE(X, ˆX) where ˆX denotes the de-quantized activations. Addi-
+tionally, we report the mean standard deviation of the input activations measured per token. While
+RMSE(X, ˆX) directly indicates the quantization error, standard deviation (STD) has been shown
+to be closely related to the expected quantization error of a normally distributed input (Kuzmin
+et al., 2022). Figure 5 compares the bf16 and fp16 variants. We observe that the RMSE and STD
+of fp16 are far higher than the bf16 variant – the RMSE for the fp16 variant is 6.9x the RMSE for
+the bf16 variant. This difference is even more pronounced if we compare our model to the OPT: the
+RMSE and STD of the OPT are 27.7x and 1.8x higher respectively relative to our model (Figure
+5; Bottom row).
+LayerNorm Since we use a pre-norm architecture, the input activations to attn-kqv-proj and
+outer-expander-mlp are both preceded by a layernorm. The layernorm gain parameter, g ∈Rh,
+directly influences the output activation tokens’ spread, and can significantly vary in distribution
+shape as seen in Figure 4. We generally observe that within our experimental axes, the standard
+deviation of the gain parameters for both the first and second layernorms are higher in a significant
+number of layers for variants with higher degradation compared to others in the same axis. In
+Figure 5, we compare the standard deviation of g for self-attention layernorm and we observe that
+STD(g) is 2x higher for the fp16 variant relative to bf16. Our findings add further support to
+previous work which suggests that the gain parameters act as an outlier amplifier and thus further
+quantization degradation through scaling (Wei et al., 2022b).
+In the bottom row of Figure 5, we also compare STD(g) of our model relative to OPT and BLOOM.
+9
+
+0.0
+0.5
+1.0
+1.5
+1e
+5
+RMSE(X, X)
+0.0
+0.5
+1.0
+1.5
+1
+t
+t
+i = 1
+std(Xi)
+0.00
+0.02
+0.04
+0.06
+std(g)
+0
+20
+40
+||W||2
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.01)
+0
+1
+2
+1e
+5
+0.00
+0.25
+0.50
+0.75
+1.00
+0.00
+0.05
+0.10
+0.15
+0.0
+2.5
+5.0
+7.5
+10.0
+cohere_6b
+bloom_7.1b
+opt_6b
+Figure 5: Average input token activation STD, preceding layernorm gain STD, and spectral norm
+of linear weights, follow trends similar to those observed in RMSE(X,ˆX). Plots correspond to the
+attn-kqv-proj layer in an example block (Block 14). Comparisons for all other blocks are given in
+Appendix B.2. Top row: Comparison of fp16 and bf16 variants. Bottom row: Our 6B model
+trained with optimal hyper-parameters compared against similar sized OPT-6B and BLOOM-7.1B
+models
+We observe that even the BLOOM model that is relatively robust to quantization has a far larger
+STD(g) than our model with a multiplier of 5x. Interestingly, we find that OPT-6B layernorm gain
+parameters are all set to 1.0 while biases varied as expected. Hence, given the gain parameters
+appear to be hardcoded, the STD(g) of the OPT model is 0.
+We were not able to find any
+mention of such design decision either in Zhang et al. (2022) or the github repository: https:
+//github.com/facebookresearch/metaseq.
+Attention Projection Weights Finally, we compare the weight distribution of attn-kqv-proj
+layers. As seen in Figure 4, the fp16 variant has a significantly wider distribution compared to
+bf16. Additionally, inspired by Lin et al. (2019), we use spectral norm to measure the maximum
+degree of noise amplification for each token activation.
+For a given weight matrix W ∈Rh×o, and input token activation noise xδ ∈Rh, the spectral norm
+∥· ∥2 is defined as
+∥W∥2 = sup
+xδ̸=0
+∥Wxδ∥2
+∥xδ∥2
+= σmax
+(3)
+where σmax is the largest singular value of W.
+As seen in Figure 5, we observe that the spectral norm of the fp16 variant is 4x higher than the
+bf16. In addition, on the bottom row of Figure 5, we observe that both BLOOM and our model
+have generally lower spectral norm than OPT 6B that is far more sensitive to quantization.
+10
+
+Discussion In addition to the metrics proposed above, we also sought to incorporate recent work
+that proposes to use the number of outlier dimensions as a proxy measure to understand sensitivity
+to quantization degradation (Dettmers et al., 2022). Activation feature dimensions are classified as
+outlier dimensions when the activation values (denoted as α) are greater than 6.0 at more than 25%
+of layers and 6% of tokens. However, we find that a threshold of 6.0 is too high to classify a feature
+dimension as an outlier for all the variants we consider. After correspondence with the authors, we
+also explored various adaptations of this outlier detection recipe presented in Dettmers et al. (2022)
+to make it generalizable. However, we did not observe a clear correlation between these measures and
+sensitivity to quantization. We refer to Appendix B.3 for detailed treatment of these replication
+efforts. Due to these observations, we hope that the metrics we proposed and evaluated in this
+Section will help further discussion about useful proxy metrics for guiding pre-training optimization
+choices to improve robustness to quantization.
+6
+Related Work
+Challenges of Quantization at Scale Recently, there have been several studies to characterize
+the emergence of outliers at scale, and relate this to the difficulties in post-training quantization
+of both weights and activations (Dettmers et al., 2022; Wei et al., 2022b; Puccetti et al., 2022).
+Dettmers et al. (2022) depict a phenomenon of emerging outliers by observing that large outlier
+dimensions systematically emerge at a certain scale (6.7B parameters) which hamper quantization
+attempts. Extreme outliers at scale was also empirically confirmed in follow-up works (Zeng et al.,
+2022; Xiao et al., 2022). The causes of outliers have also been the subject of recent work. Puccetti
+et al. (2022) observe that in Masked Language Models (MLMs) the magnitude of hidden state
+coefficients corresponding to outlier dimensions correlates with the frequency of encoded tokens in
+pre-training data. Wei et al. (2022b) observe that LayerNorm scaling (g) amplifies the outliers and
+can be suppressed using a modified LayerNorm and token-wise clipping. Wortsman et al. (2023)
+consider large-scale vision-language models and show that quantization techniques are more stable
+if the network is trained and initialized so that large feature magnitudes are discouraged.
+Most mitigation strategies to quantize in the presence of outliers has required more complex quan-
+tization techniques. For example, Dettmers et al. (2022) propose selective mixed-precision compu-
+tation by only computing the outliers at higher precision. However, such a setup proves difficult
+to map to hardware, limiting the inference speedup. Xiao et al. (2022) propose to smoothen out
+these outliers by migrating some of the activation variances into the model weights with appropriate
+scaling. Although the authors demonstrate the ability of this framework to scale to large models,
+additional rescaling is required for activations which leads to additional latency overhead without
+specialized kernels. Another limitation of Xiao et al. (2022) is that it relies on the assumption
+that outliers exist in activations, and that weights can bear additional outliers and still be easy to
+quantize.
+Our work is the first to show that outliers are not inherent to scaling large language models. Rather
+than an emerging property, they are a result of particular training methods. Compared to previous
+methods using extensive quantization schemes with custom kernels (Dettmers et al., 2022), our
+work applies PTQ using simple, one-shot linear weight and activation quantizations which can take
+advantage of NVIDIA-provided CUTLASS kernels, leading to a significant decrease in latency and
+memory footprint.
+11
+
+7
+Conclusion
+We present a rigorous study of the effect of how various optimization choices affect INT8 PTQ with
+the goal of reconciling the recent contradictory observations regarding emergent properties in Large
+Language Models. We show that regularization directly impacts PTQ performance and that higher
+levels of regularization through common techniques such as weight-decay, and gradient-clipping
+leads to lower post-training quantization degradation. We further demonstrate that the choice of
+half-precision training data type has a significant impact on PTQ performance – emergent features
+are significantly less pronounced when training with bf16.
+Broader Impact Our work serves as a useful counter-example to scholarship which has advanced
+the notion that certain properties depend only on model scale (Wei et al., 2022a). Rather, our
+results support the conclusion that optimization choices play a large role in whether emergent
+properties are present. We believe there is more work to be done here. We also hope that the
+insights gained from our work illustrate the significant impact the underlying hardware can have on
+PTQ. Currently, bf16 training is possible on TPUs and only very recently introduced to A100 &
+H100 GPUs. Finally, we belive our results present an impactful formula for training models which
+are inherently easier to quantize at scale, making these models more accessible for deploying in a
+variety of deployment environments.
+Limitations We do not vary the architectural design and training objective in our experiments
+given our goal of a controlled experimental set-up and the large computational cost of each variant.
+We leave exploring the impact of different training objectives and architecture design choices to
+future work.
+8
+Acknowledgement
+We thank João Araújo, Milad Alizadeh and other colleagues in Cohere & Cohere For AI for helpful
+feedback and support. We also thank Tim Dettmers for assisting in replicating the outlier dimension
+definition and results in int8.LLM().
+12
+
+References
+Martín Abadi, Ashish Agarwal, Paul Barham, Eugene Brevdo, Zhifeng Chen, Craig Citro, Greg S.
+Corrado, Andy Davis, Jeffrey Dean, Matthieu Devin, Sanjay Ghemawat, Ian Goodfellow, Andrew
+Harp, Geoffrey Irving, Michael Isard, Yangqing Jia, Rafal Jozefowicz, Lukasz Kaiser, Manjunath
+Kudlur, Josh Levenberg, Dandelion Mané, Rajat Monga, Sherry Moore, Derek Murray, Chris
+Olah, Mike Schuster, Jonathon Shlens, Benoit Steiner, Ilya Sutskever, Kunal Talwar, Paul Tucker,
+Vincent Vanhoucke, Vijay Vasudevan, Fernanda Viégas, Oriol Vinyals, Pete Warden, Martin
+Wattenberg, Martin Wicke, Yuan Yu, and Xiaoqiang Zheng. TensorFlow: Large-Scale Machine
+Learning on Heterogeneous Systems, January 2015.
+URL https://www.tensorflow.org/.
+Software available from tensorflow.org.
+Orevaoghene Ahia, Julia Kreutzer, and Sara Hooker. The low-resource double bind: An empirical
+study of pruning for low-resource machine translation. In Findings of the Association for Compu-
+tational Linguistics: EMNLP 2021, pp. 3316–3333, Punta Cana, Dominican Republic, November
+2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.findings-emnlp.282.
+URL https://aclanthology.org/2021.findings-emnlp.282.
+Alham Fikri Aji and Kenneth Heafield. Compressing Neural Machine Translation Models with 4-bit
+Precision. In Proceedings of the Fourth Workshop on Neural Generation and Translation, pp. 35–
+42, Online, July 2020. Association for Computational Linguistics. doi: 10.18653/v1/2020.ngt-1.4.
+URL https://www.aclweb.org/anthology/2020.ngt-1.4.
+Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam Shleifer, Xi Victoria
+Lin, Jingfei Du, Srinivasan Iyer, Ramakanth Pasunuru, Giridharan Anantharaman, Xian Li,
+Shuohui Chen, Halil Akin, Mandeep Baines, Louis Martin, Xing Zhou, Punit Singh Koura, Brian
+O’Horo, Jeffrey Wang, Luke Zettlemoyer, Mona Diab, Zornitsa Kozareva, and Veselin Stoyanov.
+Efficient large scale language modeling with mixtures of experts.
+In Proceedings of the 2022
+Conference on Empirical Methods in Natural Language Processing, pp. 11699–11732, Abu Dhabi,
+United Arab Emirates, December 2022. Association for Computational Linguistics. URL https:
+//aclanthology.org/2022.emnlp-main.804.
+Yonatan Bisk, Rowan Zellers, Ronan Le Bras, Jianfeng Gao, and Yejin Choi. Piqa: Reasoning
+about physical commonsense in natural language. In Thirty-Fourth AAAI Conference on Artificial
+Intelligence, 2020.
+Yelysei Bondarenko, Markus Nagel, and Tijmen Blankevoort. Understanding and overcoming the
+challenges of efficient transformer quantization.
+CoRR, abs/2109.12948, 2021.
+URL https:
+//arxiv.org/abs/2109.12948.
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, Parker Schuh,
+Kensen Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes, Yi Tay, Noam
+Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du, Ben Hutchinson, Reiner Pope, James
+Bradbury, Jacob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin, Toju Duke, Anselm Lev-
+skaya, Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier Garcia, Vedant Misra, Kevin
+Robinson, Liam Fedus, Denny Zhou, Daphne Ippolito, David Luan, Hyeontaek Lim, Barret Zoph,
+Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani Agrawal, Mark Omernick, Andrew M.
+Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat, Aitor Lewkowycz, Erica Moreira, Re-
+won Child, Oleksandr Polozov, Katherine Lee, Zongwei Zhou, Xuezhi Wang, Brennan Saeta,
+13
+
+Mark Diaz, Orhan Firat, Michele Catasta, Jason Wei, Kathy Meier-Hellstern, Douglas Eck, Jeff
+Dean, Slav Petrov, and Noah Fiedel. Palm: Scaling language modeling with pathways, 2022.
+URL https://arxiv.org/abs/2204.02311.
+Matthieu Courbariaux, Yoshua Bengio, and Jean-Pierre David. Training deep neural networks with
+low precision multiplications. arXiv e-prints, art. arXiv:1412.7024, Dec 2014.
+Saurabh Dash and Saibal Mukhopadhyay. Hessian-driven unequal protection of dnn parameters
+for robust inference.
+In Proceedings of the 39th International Conference on Computer-Aided
+Design, ICCAD ’20, New York, NY, USA, 2020. Association for Computing Machinery. ISBN
+9781450380263. doi: 10.1145/3400302.3415679. URL https://doi.org/10.1145/3400302.3415
+679.
+Saurabh Dash, Yandong Luo, Anni Lu, Shimeng Yu, and Saibal Mukhopadhyay. Robust processing-
+in-memory with multibit reram using hessian-driven mixed-precision computation. IEEE Trans-
+actions on Computer-Aided Design of Integrated Circuits and Systems, 41(4):1006–1019, 2022.
+doi: 10.1109/TCAD.2021.3078408.
+Jeffrey Dean, Greg Corrado, Rajat Monga, Kai Chen, Matthieu Devin, Mark Mao, Marc' aurelio
+Ranzato, Andrew Senior, Paul Tucker, Ke Yang, Quoc Le, and Andrew Ng. Large scale distributed
+deep networks. In F. Pereira, C.J. Burges, L. Bottou, and K.Q. Weinberger (eds.), Advances in
+Neural Information Processing Systems, volume 25. Curran Associates, Inc., 2012. URL https:
+//proceedings.neurips.cc/paper_files/paper/2012/file/6aca97005c68f1206823815f661
+02863-Paper.pdf.
+Mostafa Dehghani, Anurag Arnab, Lucas Beyer, Ashish Vaswani, and Yi Tay. The efficiency mis-
+nomer. CoRR, abs/2110.12894, 2021. URL https://arxiv.org/abs/2110.12894.
+Tim Dettmers and Luke Zettlemoyer. The case for 4-bit precision: k-bit inference scaling laws,
+2022. URL https://arxiv.org/abs/2212.09720.
+Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. GPT3.int8(): 8-bit matrix
+multiplication for transformers at scale.
+In Alice H. Oh, Alekh Agarwal, Danielle Belgrave,
+and Kyunghyun Cho (eds.), Advances in Neural Information Processing Systems, 2022. URL
+https://openreview.net/forum?id=dXiGWqBoxaD.
+Zhengxiao Du, Yujie Qian, Xiao Liu, Ming Ding, Jiezhong Qiu, Zhilin Yang, and Jie Tang. Glm:
+General language model pretraining with autoregressive blank infilling. In Annual Meeting of the
+Association for Computational Linguistics, 2021. URL https://arxiv.org/pdf/2103.10360.p
+df.
+Anthony Fader, Luke Zettlemoyer, and Oren Etzioni. Paraphrase-driven learning for open question
+answering. In Annual Meeting of the Association for Computational Linguistics, 2013.
+Elias Frantar and Dan Alistarh. Sparsegpt: Massive language models can be accurately pruned in
+one-shot, 2023. URL https://arxiv.org/abs/2301.00774.
+Elias Frantar, Saleh Ashkboos, Torsten Hoefler, and Dan Alistarh. Gptq: Accurate post-training
+quantization for generative pre-trained transformers, 2022. URL https://arxiv.org/abs/2210
+.17323.
+Trevor Gale, Erich Elsen, and Sara Hooker. The state of sparsity in deep neural networks, 2019.
+URL https://arxiv.org/abs/1902.09574.
+14
+
+Georgi Gerganov. llama.cpp. https://github.com/ggerganov/llama.cpp, 2023.
+Amir Gholami, Sehoon Kim, Zhen Dong, Zhewei Yao, Michael W. Mahoney, and Kurt Keutzer.
+A survey of quantization methods for efficient neural network inference, 2021.
+URL https:
+//arxiv.org/abs/2103.13630.
+Ian Goodfellow, Yoshua Bengio, Aaron Courville, and Yoshua Bengio. Deep learning, volume 1.
+MIT Press, 2016.
+Suyog Gupta, Ankur Agrawal, Kailash Gopalakrishnan, and Pritish Narayanan. Deep Learning
+with Limited Numerical Precision. CoRR, abs/1502.02551, 2015. URL http://arxiv.org/abs/
+1502.02551.
+B. Hassibi, D. G. Stork, and G. J. Wolff. Optimal Brain Surgeon and general network pruning.
+In IEEE International Conference on Neural Networks, pp. 293–299 vol.1, March 1993a. doi:
+10.1109/ICNN.1993.298572.
+Babak Hassibi, David G. Stork, and Stork Crc. Ricoh. Com. Second Order Derivatives for Network
+Pruning: Optimal Brain Surgeon. In Advances in Neural Information Processing Systems 5, pp.
+164–171. Morgan Kaufmann, 1993b.
+Dan Hendrycks and Kevin Gimpel. Gaussian error linear units (gelus), 2016. URL https://arxi
+v.org/abs/1606.08415.
+Geoffrey Hinton, Oriol Vinyals, and Jeff Dean. Distilling the Knowledge in a Neural Network. arXiv
+e-prints, art. arXiv:1503.02531, Mar 2015.
+Geoffrey E. Hinton, Nitish Srivastava, Alex Krizhevsky, Ilya Sutskever, and Ruslan R. Salakhutdi-
+nov. Improving neural networks by preventing co-adaptation of feature detectors, 2012.
+Sara Hooker. The hardware lottery. Commun. ACM, 64(12):58–65, nov 2021. ISSN 0001-0782. doi:
+10.1145/3467017. URL https://doi.org/10.1145/3467017.
+A. G. Howard, M. Zhu, B. Chen, D. Kalenichenko, W. Wang, T. Weyand, M. Andreetto, and
+H. Adam. MobileNets: Efficient Convolutional Neural Networks for Mobile Vision Applications.
+ArXiv e-prints, April 2017.
+Itay Hubara, Matthieu Courbariaux, Daniel Soudry, Ran El-Yaniv, and Yoshua Bengio. Quantized
+Neural Networks: Training Neural Networks with Low Precision Weights and Activations. CoRR,
+abs/1609.07061, 2016. URL http://arxiv.org/abs/1609.07061.
+Itay Hubara, Yury Nahshan, Yair Hanani, Ron Banner, and Daniel Soudry.
+Improving post
+training neural quantization: Layer-wise calibration and integer programming. arXiv preprint
+arXiv:2006.10518, 2020.
+F. N. Iandola, S. Han, M. W. Moskewicz, K. Ashraf, W. J. Dally, and K. Keutzer. SqueezeNet:
+AlexNet-level accuracy with 50x fewer parameters and 0.5MB model size. ArXiv e-prints, Febru-
+ary 2016.
+Benoit Jacob, Skirmantas Kligys, Bo Chen, Menglong Zhu, Matthew Tang, Andrew Howard,
+Hartwig Adam, and Dmitry Kalenichenko. Quantization and Training of Neural Networks for
+Efficient Integer-Arithmetic-Only Inference.
+2018 IEEE/CVF Conference on Computer Vi-
+sion and Pattern Recognition, Jun 2018.
+doi:
+10.1109/cvpr.2018.00286.
+URL http:
+//dx.doi.org/10.1109/CVPR.2018.00286.
+15
+
+Norman P. Jouppi, Cliff Young, Nishant Patil, David Patterson, Gaurav Agrawal, Raminder Ba-
+jwa, Sarah Bates, Suresh Bhatia, Nan Boden, Al Borchers, Rick Boyle, Pierre-luc Cantin,
+Clifford Chao, Chris Clark, Jeremy Coriell, Mike Daley, Matt Dau, Jeffrey Dean, Ben Gelb,
+Tara Vazir Ghaemmaghami, Rajendra Gottipati, William Gulland, Robert Hagmann, C. Richard
+Ho, Doug Hogberg, John Hu, Robert Hundt, Dan Hurt, Julian Ibarz, Aaron Jaffey, Alek Ja-
+worski, Alexander Kaplan, Harshit Khaitan, Daniel Killebrew, Andy Koch, Naveen Kumar,
+Steve Lacy, James Laudon, James Law, Diemthu Le, Chris Leary, Zhuyuan Liu, Kyle Lucke,
+Alan Lundin, Gordon MacKean, Adriana Maggiore, Maire Mahony, Kieran Miller, Rahul Na-
+garajan, Ravi Narayanaswami, Ray Ni, Kathy Nix, Thomas Norrie, Mark Omernick, Narayana
+Penukonda, Andy Phelps, Jonathan Ross, Matt Ross, Amir Salek, Emad Samadiani, Chris Sev-
+ern, Gregory Sizikov, Matthew Snelham, Jed Souter, Dan Steinberg, Andy Swing, Mercedes Tan,
+Gregory Thorson, Bo Tian, Horia Toma, Erick Tuttle, Vijay Vasudevan, Richard Walter, Wal-
+ter Wang, Eric Wilcox, and Doe Hyun Yoon. In-datacenter performance analysis of a tensor
+processing unit. SIGARCH Comput. Archit. News, 45(2):1–12, jun 2017. ISSN 0163-5964. doi:
+10.1145/3140659.3080246. URL https://doi.org/10.1145/3140659.3080246.
+Dhiraj Kalamkar, Dheevatsa Mudigere, Naveen Mellempudi, Dipankar Das, Kunal Banerjee,
+Sasikanth Avancha, Dharma Teja Vooturi, Nataraj Jammalamadaka, Jianyu Huang, Hector Yuen,
+Jiyan Yang, Jongsoo Park, Alexander Heinecke, Evangelos Georganas, Sudarshan Srinivasan, Ab-
+hisek Kundu, Misha Smelyanskiy, Bharat Kaul, and Pradeep Dubey. A study of bfloat16 for deep
+learning training, 2019.
+Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B. Brown, Benjamin Chess, Rewon Child,
+Scott Gray, Alec Radford, Jeffrey Wu, and Dario Amodei.
+Scaling laws for neural language
+models. CoRR, abs/2001.08361, 2020. URL https://arxiv.org/abs/2001.08361.
+Yulhwa Kim, Jaeyong Jang, Jehun Lee, Jihoon Park, Jeonghoon Kim, Byeongwook Kim, Se Jung
+Kwon, Dongsoo Lee, et al. Winning both the accuracy of floating point activation and the simplic-
+ity of integer arithmetic. In The Eleventh International Conference on Learning Representations.
+Raghuraman Krishnamoorthi. Quantizing deep convolutional networks for efficient inference: A
+whitepaper. arXiv preprint arXiv:1806.08342, 2018.
+Taku Kudo and John Richardson. SentencePiece: A simple and language independent subword
+tokenizer and detokenizer for neural text processing. In Proceedings of the 2018 Conference on
+Empirical Methods in Natural Language Processing: System Demonstrations, pp. 66–71, Brussels,
+Belgium, November 2018. Association for Computational Linguistics. doi: 10.18653/v1/D18-2012.
+URL https://aclanthology.org/D18-2012.
+Ashish Kumar, Saurabh Goyal, and Manik Varma. Resource-efficient Machine Learning in 2 KB
+RAM for the Internet of Things. In Doina Precup and Yee Whye Teh (eds.), Proceedings of
+the 34th International Conference on Machine Learning, volume 70 of Proceedings of Machine
+Learning Research, pp. 1935–1944, International Convention Centre, Sydney, Australia, 06–11
+Aug 2017. PMLR. URL http://proceedings.mlr.press/v70/kumar17a.html.
+Andrey Kuzmin, Mart Van Baalen, Yuwei Ren, Markus Nagel, Jorn Peters, and Tijmen Blankevoort.
+Fp8 quantization: The power of the exponent, 2022.
+Yann LeCun, John S. Denker, and Sara A. Solla. Optimal Brain Damage. In Advances in Neural
+Information Processing Systems, pp. 598–605. Morgan Kaufmann, 1990.
+16
+
+Yuhang Li, Ruihao Gong, Xu Tan, Yang Yang, Peng Hu, Qi Zhang, Fengwei Yu, Wei Wang, and
+Shi Gu. Brecq: Pushing the limit of post-training quantization by block reconstruction, 2021.
+URL https://arxiv.org/abs/2102.05426.
+Ji Lin, Chuang Gan, and Song Han. Defensive quantization: When efficiency meets robustness,
+2019.
+Peter J. Liu, Mohammad Saleh, Etienne Pot, Ben Goodrich, Ryan Sepassi, Lukasz Kaiser, and
+Noam M. Shazeer. Generating wikipedia by summarizing long sequences. ICLR, abs/1801.10198,
+2018.
+Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International Confer-
+ence on Learning Representations, 2019. URL https://openreview.net/forum?id=Bkg6RiCqY7.
+C. Louizos, M. Welling, and D. P. Kingma. Learning Sparse Neural Networks through L_0 Regu-
+larization. ArXiv e-prints, December 2017.
+Ziyang Luo, Artur Kulmizev, and Xiao-Xi Mao. Positional artefacts propagate through masked
+language model embeddings. In Annual Meeting of the Association for Computational Linguistics,
+2020.
+Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia,
+Boris Ginsburg, Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, and Hao Wu. Mixed
+Precision Training, 2017.
+Nasrin Mostafazadeh, Nathanael Chambers, Xiaodong He, Devi Parikh, Dhruv Batra, Lucy Van-
+derwende, Pushmeet Kohli, and James Allen. A corpus and cloze evaluation for deeper under-
+standing of commonsense stories. In Proceedings of the 2016 Conference of the North Ameri-
+can Chapter of the Association for Computational Linguistics: Human Language Technologies,
+pp. 839–849, San Diego, California, June 2016. Association for Computational Linguistics. doi:
+10.18653/v1/N16-1098. URL https://aclanthology.org/N16-1098.
+Markus Nagel, Rana Ali Amjad, Mart Van Baalen, Christos Louizos, and Tijmen Blankevoort.
+Up or down? adaptive rounding for post-training quantization. In International Conference on
+Machine Learning, pp. 7197–7206. PMLR, 2020.
+Markus Nagel, Marios Fournarakis, Rana Ali Amjad, Yelysei Bondarenko, Mart Van Baalen,
+and Tijmen Blankevoort.
+A white paper on neural network quantization.
+arXiv preprint
+arXiv:2106.08295, 2021.
+Sharan Narang, Erich Elsen, Gregory Diamos, and Shubho Sengupta. Exploring Sparsity in Recur-
+rent Neural Networks. arXiv e-prints, art. arXiv:1704.05119, Apr 2017.
+Nvidia. Nvidia a100. URL https://resources.nvidia.com/en-us-genomics-ep/ampere-archi
+tecture-white-paper?xs=169656#page=1.
+Kelechi Ogueji, Orevaoghene Ahia, Gbemileke Onilude, Sebastian Gehrmann, Sara Hooker, and
+Julia Kreutzer. Intriguing properties of compression on multilingual models. 2022. doi: 10.48550
+/ARXIV.2211.02738. URL https://arxiv.org/abs/2211.02738.
+Denis Paperno, Germán Kruszewski, Angeliki Lazaridou, Ngoc Quan Pham, Raffaella Bernardi,
+Sandro Pezzelle, Marco Baroni, Gemma Boleda, and Raquel Fernández. The LAMBADA dataset:
+17
+
+Word prediction requiring a broad discourse context. In Proceedings of the 54th Annual Meeting of
+the Association for Computational Linguistics (Volume 1: Long Papers), pp. 1525–1534, Berlin,
+Germany, August 2016. Association for Computational Linguistics. doi: 10.18653/v1/P16-1144.
+URL https://aclanthology.org/P16-1144.
+Gunho Park, Baeseong Park, Sungjae Lee, Minsub Kim, Byeongwook Kim, Se Jung Kwon, Youngjoo
+Lee, and Dongsoo Lee. nuqmm: Quantized matmul for efficient inference of large-scale generative
+language models, 2022a. URL https://arxiv.org/abs/2206.09557.
+Minseop Park, Jaeseong You, Markus Nagel, and Simyung Chang. Quadapter: Adapter for gpt-2
+quantization. arXiv preprint arXiv:2211.16912, 2022b.
+Razvan Pascanu, Tomas Mikolov, and Yoshua Bengio. On the difficulty of training recurrent neural
+networks. In Sanjoy Dasgupta and David McAllester (eds.), Proceedings of the 30th International
+Conference on Machine Learning, volume 28 of Proceedings of Machine Learning Research, pp.
+1310–1318, Atlanta, Georgia, USA, 17–19 Jun 2013. PMLR. URL https://proceedings.mlr.
+press/v28/pascanu13.html.
+Giovanni Puccetti, Anna Rogers, Aleksandr Drozd, and Felice Dell’Orletta. Outliers dimensions that
+disrupt transformers are driven by frequency, 2022. URL https://arxiv.org/abs/2205.11380.
+Jerry Quinn and Miguel Ballesteros. Pieces of Eight: 8-bit Neural Machine Translation. In Pro-
+ceedings of the 2018 Conference of the North American Chapter of the Association for Com-
+putational Linguistics: Human Language Technologies, Volume 3 (Industry Papers), pp. 114–
+120, New Orleans - Louisiana, June 2018. Association for Computational Linguistics.
+doi:
+10.18653/v1/N18-3014. URL https://aclanthology.org/N18-3014.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+models are unsupervised multitask learners.
+Jack W. Rae, Sebastian Borgeaud, Trevor Cai, Katie Millican, Jordan Hoffmann, Francis Song, John
+Aslanides, Sarah Henderson, Roman Ring, Susannah Young, Eliza Rutherford, Tom Hennigan,
+Jacob Menick, Albin Cassirer, Richard Powell, George van den Driessche, Lisa Anne Hendricks,
+Maribeth Rauh, Po-Sen Huang, Amelia Glaese, Johannes Welbl, Sumanth Dathathri, Saffron
+Huang, Jonathan Uesato, John Mellor, Irina Higgins, Antonia Creswell, Nat McAleese, Amy Wu,
+Erich Elsen, Siddhant Jayakumar, Elena Buchatskaya, David Budden, Esme Sutherland, Karen
+Simonyan, Michela Paganini, Laurent Sifre, Lena Martens, Xiang Lorraine Li, Adhiguna Kuncoro,
+Aida Nematzadeh, Elena Gribovskaya, Domenic Donato, Angeliki Lazaridou, Arthur Mensch,
+Jean-Baptiste Lespiau, Maria Tsimpoukelli, Nikolai Grigorev, Doug Fritz, Thibault Sottiaux,
+Mantas Pajarskas, Toby Pohlen, Zhitao Gong, Daniel Toyama, Cyprien de Masson d’Autume,
+Yujia Li, Tayfun Terzi, Vladimir Mikulik, Igor Babuschkin, Aidan Clark, Diego de Las Casas,
+Aurelia Guy, Chris Jones, James Bradbury, Matthew Johnson, Blake Hechtman, Laura Weidinger,
+Iason Gabriel, William Isaac, Ed Lockhart, Simon Osindero, Laura Rimell, Chris Dyer, Oriol
+Vinyals, Kareem Ayoub, Jeff Stanway, Lorrayne Bennett, Demis Hassabis, Koray Kavukcuoglu,
+and Geoffrey Irving. Scaling language models: Methods, analysis & insights from training gopher,
+2021. URL https://arxiv.org/abs/2112.11446.
+Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi
+Zhou, Wei Li, and Peter J. Liu. Exploring the Limits of Transfer Learning with a Unified Text-
+to-Text Transformer, 2020.
+18
+
+Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations
+toward training trillion parameter models. In Proceedings of the International Conference for
+High Performance Computing, Networking, Storage and Analysis, SC ’20. IEEE Press, 2020.
+ISBN 9781728199986.
+Keisuke Sakaguchi, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi. Winogrande: An ad-
+versarial winograd schema challenge at scale. arXiv preprint arXiv:1907.10641, 2019.
+Victor Sanh, Thomas Wolf, and Alexander M. Rush. Movement Pruning: Adaptive Sparsity by
+Fine-Tuning, 2020.
+Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ilić, Daniel Hesslow, Roman
+Castagné, Alexandra Sasha Luccioni, François Yvon, Matthias Gallé, et al. Bloom: A 176b-
+parameter open-access multilingual language model. arXiv preprint arXiv:2211.05100, 2022.
+Abigail See, Minh-Thang Luong, and Christopher D. Manning. Compression of Neural Machine
+Translation Models via Pruning. arXiv e-prints, art. arXiv:1606.09274, Jun 2016.
+Ying Sheng, Lianmin Zheng, Binhang Yuan, Zhuohan Li, Max Ryabinin, Daniel Y Fu, Zhiqiang
+Xie, Beidi Chen, Clark Barrett, Joseph E Gonzalez, et al. High-throughput generative inference
+of large language models with a single gpu. arXiv preprint arXiv:2303.06865, 2023.
+Nitish Srivastava, Geoffrey E. Hinton, Alex Krizhevsky, Ilya Sutskever, and Ruslan Salakhutdinov.
+Dropout: a simple way to prevent neural networks from overfitting. Journal of Machine Learning
+Research, 15(1):1929–1958, 2014.
+Nikko Ström. Sparse Connection And Pruning In Large Dynamic Artificial Neural Networks, 1997.
+Marcos Treviso, Tianchu Ji, Ji-Ung Lee, Betty van Aken, Qingqing Cao, Manuel R. Ciosici, Michael
+Hassid, Kenneth Heafield, Sara Hooker, Pedro H. Martins, André F. T. Martins, Peter Milder,
+Colin Raffel, Edwin Simpson, Noam Slonim, Niranjan Balasubramanian, Leon Derczynski, and
+Roy Schwartz. Efficient methods for natural language processing: A survey, 2022. URL https:
+//arxiv.org/abs/2209.00099.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+Kaiser, and Illia Polosukhin.
+Attention is all you need.
+In Advances in neural information
+processing systems, pp. 5998–6008, 2017.
+Alex Wang, Yada Pruksachatkun, Nikita Nangia, Amanpreet Singh, Julian Michael, Felix Hill,
+Omer Levy, and Samuel Bowman. Superglue: A stickier benchmark for general-purpose language
+understanding systems. In H. Wallach, H. Larochelle, A. Beygelzimer, F. d'Alché-Buc, E. Fox,
+and R. Garnett (eds.), Advances in Neural Information Processing Systems, volume 32. Curran
+Associates, Inc., 2019. URL https://proceedings.neurips.cc/paper_files/paper/2019/fi
+le/4496bf24afe7fab6f046bf4923da8de6-Paper.pdf.
+Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel, Barret Zoph, Sebastian Borgeaud, Dani Yo-
+gatama, Maarten Bosma, Denny Zhou, Donald Metzler, Ed H. Chi, Tatsunori Hashimoto, Oriol
+Vinyals, Percy Liang, Jeff Dean, and William Fedus. Emergent abilities of large language models,
+2022a.
+Xiuying Wei, Yunchen Zhang, Xiangguo Zhang, Ruihao Gong, Shanghang Zhang, Qi Zhang, Fengwei
+Yu, and Xianglong Liu. Outlier suppression: Pushing the limit of low-bit transformer language
+models. arXiv preprint arXiv:2209.13325, 2022b.
+19
+
+W. Wen, C. Wu, Y. Wang, Y. Chen, and H. Li. Learning Structured Sparsity in Deep Neural
+Networks. ArXiv e-prints, August 2016.
+Mitchell Wortsman, Tim Dettmers, Luke Zettlemoyer, Ari Morcos, Ali Farhadi, and Ludwig
+Schmidt. Stable and low-precision training for large-scale vision-language models, 2023.
+Hao Wu, Patrick Judd, Xiaojie Zhang, Mikhail Isaev, and Paulius Micikevicius. Integer quantization
+for deep learning inference: Principles and empirical evaluation. arXiv preprint arXiv:2004.09602,
+2020.
+Guangxuan Xiao, Ji Lin, Mickael Seznec, Julien Demouth, and Song Han. Smoothquant: Accurate
+and efficient post-training quantization for large language models, 2022. URL https://arxiv.
+org/abs/2211.10438.
+Zhewei Yao, Reza Yazdani Aminabadi, Minjia Zhang, Xiaoxia Wu, Conglong Li, and Yuxiong
+He. Zeroquant: Efficient and affordable post-training quantization for large-scale transformers.
+Advances in Neural Information Processing Systems, 35:27168–27183, 2022.
+Zhewei Yao, Cheng Li, Xiaoxia Wu, Stephen Youn, and Yuxiong He. A comprehensive study on
+post-training quantization for large language models, 2023.
+Joanna Yoo, Kuba Perlin, Siddhartha Rao Kamalakara, and João G. M. Araújo. Scalable training
+of language models using jax pjit and tpuv4, 2022. URL https://arxiv.org/abs/2204.06514.
+Ofir Zafrir, Guy Boudoukh, Peter Izsak, and Moshe Wasserblat. Q8bert: Quantized 8bit bert. In
+2019 Fifth Workshop on Energy Efficient Machine Learning and Cognitive Computing-NeurIPS
+Edition (EMC2-NIPS), pp. 36–39. IEEE, 2019.
+Rowan Zellers, Ari Holtzman, Yonatan Bisk, Ali Farhadi, and Yejin Choi. Hellaswag: Can a machine
+really finish your sentence? In Annual Meeting of the Association for Computational Linguistics,
+2019.
+Aohan Zeng, Xiao Liu, Zhengxiao Du, Zihan Wang, Hanyu Lai, Ming Ding, Zhuoyi Yang, Yifan
+Xu, Wendi Zheng, Xiao Xia, Weng Lam Tam, Zixuan Ma, Yufei Xue, Jidong Zhai, Wenguang
+Chen, Peng Zhang, Yuxiao Dong, and Jie Tang. Glm-130b: An open bilingual pre-trained model,
+2022. URL https://arxiv.org/abs/2210.02414.
+Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher
+Dewan, Mona Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer, Kurt
+Shuster, Daniel Simig, Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke Zettlemoyer.
+Opt: Open pre-trained transformer language models, 2022. URL https://arxiv.org/abs/2205
+.01068.
+Shaojie Zhuo, Hongyu Chen, Ramchalam Kinattinkara Ramakrishnan, Tommy Chen, Chen Feng,
+Yicheng Lin, Parker Zhang, and Liang Shen. An empirical study of low precision quantization
+for tinyml. arXiv preprint arXiv:2203.05492, 2022.
+20
+
+Appendix
+A
+Extended Results & Architecture Details
+A.1
+Optimal Hyper-parameters
+Weight decay
+Gradient clipping
+Dropout
+Half-precision datatype
+0.1
+1.0
+0
+bf16
+Table 2: Optimal hyper-parameters for PTQ based on results in Section 4
+A.2
+Evaluation Suite
+Below is a detailed breakdown of the evaluation suite we evaluate our models with.
+Benchmark
+Task Type
+Evaluation Metric
+Copa (test set)(Wang et al., 2019)
+MC Completion
+MC Accuracy
+Copa100 (dev set) (Wang et al., 2019)
+MC Completion
+MC Accuracy
+HellaSwag (Zellers et al., 2019)
+MC Completion
+MC Accuracy
+PIQAValidation (Bisk et al., 2020)
+MC Completion
+MC Accuracy
+StoryCloze (Mostafazadeh et al., 2016)
+MC Completion
+MC Accuracy
+WinoGrande (Sakaguchi et al., 2019)
+MC Co-referencing
+MC Accuracy
+Paralex (Fader et al., 2013)
+Generation
+Likelihood (bytes)
+LAMBADA (Paperno et al., 2016)
+QA
+Exact String Match Accuracy
+Table 3: An Overview of the 8 tasks we benchmark the zero-shot downstream performance of trained
+models. QA and MC denotes Question Answering, and Multiple-choice respectively.
+21
+
+A.3
+Task Result Breakdown
+Model Size
+Data type
+PIQA
+HellaSwag
+WinoGrande
+LAMBADA
+Copa
+Copa100
+StoryCloze
+Paralex
+Average
+52B
+FP16
+83.19
+82.48
+70.01
+75.47
+79.40
+81.00
+85.87
+61.05
+77.31
+W8A8
+83.20
+82.40
+70.00
+75.50
+79.40
+82.00
+85.50
+61.10
+77.39
+W4
+80.20
+72.22
+66.30
+66.85
+78.20
+83.00
+82.56
+60.43
+73.72
+13B
+FP16
+79.54
+75.26
+62.27
+70.81
+76.00
+76.00
+82.11
+60.68
+72.83
+W8A8
+79.20
+74.60
+62.90
+69.90
+76.00
+75.00
+82.20
+60.90
+72.59
+W4
+76.66
+60.59
+57.30
+46.05
+73.60
+76.00
+77.40
+59.74
+65.92
+6B
+FP16
+79.50
+74.20
+61.20
+70.50
+75.40
+79.00
+81.50
+60.10
+72.67
+W8A8
+79.50
+73.70
+61.40
+70.00
+74.60
+77.00
+81.00
+60.20
+72.18
+W4
+76.93
+62.92
+56.43
+55.40
+74.00
+72.00
+77.21
+59.01
+66.74
+410M
+FP16
+70.40
+46.90
+50.80
+48.80
+65.40
+65.00
+70.50
+57.10
+59.36
+W8A8
+70.00
+46.80
+51.50
+47.80
+64.00
+64.00
+69.70
+57.00
+58.85
+W4
+67.19
+43.08
+50.59
+37.71
+62.80
+64.00
+67.47
+54.60
+55.93
+Table 4: Our fully trained models with hyper-parameters outlined in Table 2 show minimal PTQ
+degradation.
+22
+
+Data type
+PIQA
+HellaSwag
+WinoGrande
+LAMBADA
+Copa
+Copa100
+StoryCloze
+Paralex
+Average
+Average % Diff
+wd=0.1 (gc=none)
+FP16
+75.35
+60.58
+55.41
+56.59
+73.20
+71.00
+77.02
+58.75
+65.99
+-0.09
+INT8
+75.35
+60.36
+55.25
+57.69
+73.20
+70.00
+76.70
+58.62
+65.90
+wd=0.01 (gc=none)
+FP16
+75.03
+60.55
+55.25
+59.01
+72.00
+69.00
+77.53
+58.99
+65.92
+-0.26
+INT8
+74.48
+60.10
+55.49
+60.14
+72.40
+67.00
+77.21
+58.87
+65.71
+wd=0.001 (gc=none)
+FP16
+75.90
+60.71
+55.80
+58.16
+73.00
+71.00
+76.64
+58.50
+66.21
+-1.36
+INT8
+75.63
+60.52
+54.78
+55.15
+71.80
+70.00
+77.21
+57.96
+65.38
+dtype=bf16 (wd=0.1)
+FP16
+75.68
+60.92
+55.96
+57.60
+71.40
+71.00
+75.81
+59.05
+65.93
+0.32
+INT8
+75.95
+60.70
+56.83
+58.32
+71.40
+71.00
+75.62
+59.06
+66.11
+dtype=fp16 (wd=0.1)
+FP16
+73.83
+59.96
+55.96
+56.14
+72.00
+67.00
+75.94
+58.33
+64.89
+-0.76
+INT8
+74.16
+59.75
+55.64
+56.05
+71.60
+64.00
+75.88
+58.12
+64.40
+dtype=bf16 (wd=0.01)
+FP16
+74.97
+60.79
+55.49
+57.52
+72.00
+68.00
+75.88
+58.74
+65.42
+0.77
+INT8
+75.08
+60.51
+55.88
+59.31
+72.60
+69.00
+76.00
+58.84
+65.90
+dtype=fp16 (wd=0.01)
+FP16
+74.81
+58.11
+54.93
+57.31
+70.20
+71.00
+74.67
+58.25
+64.91
+-1.73
+INT8
+73.61
+56.90
+54.22
+53.02
+71.60
+69.00
+74.67
+57.92
+63.87
+gc=1.0 (wd=0.001)
+FP16
+74.65
+60.03
+54.78
+59.01
+71.60
+67.00
+76.96
+58.92
+65.37
+0.41
+INT8
+74.92
+59.91
+54.62
+59.69
+72.20
+68.00
+76.96
+58.90
+65.65
+gc=none (wd=0.001)
+FP16
+75.90
+60.71
+55.80
+58.16
+73.00
+71.00
+76.64
+58.50
+66.21
+-1.36
+INT8
+75.63
+60.52
+54.78
+55.15
+71.80
+70.00
+77.21
+57.96
+65.38
+dropout=0.0
+FP16
+75.68
+60.92
+55.96
+57.60
+71.40
+71.00
+75.81
+59.05
+65.93
+0.32
+INT8
+75.95
+60.70
+56.83
+58.32
+71.40
+71.00
+75.62
+59.06
+66.11
+dropout=0.1
+FP16
+74.76
+58.87
+54.38
+57.23
+71.60
+68.00
+76.45
+58.36
+64.96
+0.31
+INT8
+74.27
+58.70
+54.85
+58.35
+71.80
+68.00
+76.96
+58.18
+65.14
+dropout=0.4
+FP16
+74.92
+55.80
+54.70
+58.98
+71.00
+66.00
+74.03
+57.91
+64.17
+-0.27
+INT8
+74.76
+55.77
+54.14
+59.69
+69.40
+66.00
+74.09
+57.95
+63.98
+dropout=0.8
+FP16
+67.79
+30.87
+50.51
+37.12
+67.00
+65.00
+61.94
+29.16
+51.17
+-0.57
+INT8
+67.79
+30.75
+50.12
+36.52
+66.60
+65.00
+61.74
+28.91
+50.93
+23
+
+B
+Extended Weight & Activation Analysis
+B.1
+Weight Distributions
+0.5
+0.0
+0.5
+102
+105
+block:0
+0.5 0.0
+0.5
+102
+105
+block:1
+0.5
+0.0
+0.5
+102
+105
+block:2
+0.5
+0.0
+0.5
+102
+105
+block:3
+0.5
+0.0
+0.5
+102
+105
+block:4
+0.5
+0.0
+0.5
+102
+105
+block:5
+0.5
+0.0
+0.5
+102
+105
+block:6
+0.5 0.0
+0.5
+102
+105
+block:7
+0
+1
+102
+105
+block:8
+0.5
+0.0
+0.5
+102
+105
+block:9
+0.5
+0.0
+0.5
+102
+105
+block:10
+0.5
+0.0
+0.5
+102
+105
+block:11
+0.5
+0.0
+0.5
+102
+105
+block:12
+0.5
+0.0
+0.5
+102
+105
+block:13
+0.5
+0.0
+0.5
+102
+105
+block:14
+0.5
+0.0
+0.5
+102
+105
+block:15
+0.5
+0.0
+0.5
+102
+105
+block:16
+0.5
+0.0
+0.5
+102
+105
+block:17
+0.5
+0.0
+0.5
+102
+105
+block:18
+0.5
+0.0
+0.5
+102
+105
+block:19
+0.5
+0.0
+0.5
+102
+105
+block:20
+0.5
+0.0
+0.5
+102
+105
+block:21
+0.5
+0.0
+0.5
+102
+105
+block:22
+0.5
+0.0
+0.5
+102
+105
+block:23
+0.5
+0.0
+0.5
+102
+105
+block:24
+0.5
+0.0
+0.5
+102
+105
+block:25
+0.5
+0.0
+0.5
+102
+105
+block:26
+0.5
+0.0
+102
+105
+block:27
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.01)
+Figure 6: Weight distributions for attn-kqv-proj layers comparing fp16 and bf16 variants.
+24
+
+0.5
+1.0
+101
+103
+block:0
+0.5
+1.0
+1.5
+100
+101
+102
+block:1
+0.5
+1.0
+1.5
+101
+103
+block:2
+1
+2
+101
+103
+block:3
+1
+2
+101
+103
+block:4
+0.5
+1.0
+1.5
+100
+101
+102
+block:5
+0.5
+1.0
+1.5
+100
+101
+102
+block:6
+0.5
+1.0
+1.5
+101
+103
+block:7
+0.5
+1.0
+1.5
+101
+103
+block:8
+0.5
+1.0
+100
+101
+102
+block:9
+0.5
+1.0
+1.5
+100
+101
+102
+block:10
+0.5
+1.0
+1.5
+100
+101
+102
+block:11
+0.5
+1.0
+1.5
+100
+101
+102
+block:12
+1
+2
+100
+101
+102
+block:13
+1
+2
+100
+101
+102
+block:14
+1
+2
+100
+101
+102
+block:15
+1
+2
+100
+101
+102
+block:16
+1
+2
+100
+101
+102
+block:17
+1
+2
+100
+101
+102
+block:18
+1
+2
+100
+101
+102
+block:19
+1
+2
+100
+101
+102
+block:20
+1
+2
+100
+101
+102
+block:21
+0.5
+1.0
+1.5
+100
+101
+102
+block:22
+0.5
+1.0
+1.5
+100
+101
+102
+block:23
+0.5
+1.0
+1.5
+100
+101
+102
+block:24
+0.5
+1.0
+1.5
+100
+101
+102
+block:25
+0.5
+1.0
+100
+101
+102
+block:26
+0.5
+1.0
+100
+101
+102
+block:27
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.01)
+Figure 7: Gain parameter distributions of the first layernorm comparing fp16 and bf16 variants.
+25
+
+0.5
+0.0
+0.5
+102
+105
+block:0
+0.0
+0.5
+102
+105
+block:1
+0.5
+0.0
+0.5
+102
+105
+block:2
+0.5
+0.0
+0.5
+102
+105
+block:3
+0.5
+0.0
+0.5
+102
+105
+block:4
+0.5
+0.0
+0.5
+102
+105
+block:5
+0.5
+0.0
+0.5
+102
+105
+block:6
+0.25
+0.00
+0.25
+102
+105
+block:7
+0.5
+0.0
+0.5
+102
+105
+block:8
+0.25
+0.00
+0.25
+102
+105
+block:9
+0.25 0.00
+0.25
+102
+105
+block:10
+0.25
+0.00
+0.25
+102
+105
+block:11
+0.25 0.00
+0.25
+102
+105
+block:12
+0.25 0.00 0.25
+102
+105
+block:13
+0.25 0.00 0.25
+102
+105
+block:14
+0.25 0.00
+0.25
+102
+105
+block:15
+0.250.00 0.25
+102
+105
+block:16
+0.0
+0.5
+102
+105
+block:17
+0.0
+0.5
+102
+105
+block:18
+0.250.00 0.25
+102
+105
+block:19
+0.5
+0.0
+0.5
+102
+105
+block:20
+0.0
+0.5
+102
+105
+block:21
+0.250.00 0.25
+102
+105
+block:22
+0.25 0.00 0.25
+102
+105
+block:23
+0.5
+0.0
+102
+105
+block:24
+0.25 0.00
+0.25
+102
+105
+block:25
+0.25 0.00
+0.25
+102
+105
+block:26
+0.25 0.00 0.25
+102
+105
+block:27
+cohere_6b
+bloom_7.1b
+opt_6b
+Figure 8: Weight distributions of attn-kqv-proj layers comparing our model against OPT-6B &
+BLOOM-7.1B
+26
+
+0.5
+1.0
+1.5
+101
+103
+block:0
+0.5
+1.0
+1.5
+101
+103
+block:1
+0.5
+1.0
+1.5
+101
+103
+block:2
+0.5
+1.0
+1.5
+101
+103
+block:3
+0.5
+1.0
+1.5
+101
+103
+block:4
+0.5
+1.0
+1.5
+101
+103
+block:5
+0
+1
+101
+103
+block:6
+0.5
+1.0
+1.5
+101
+103
+block:7
+0.5
+1.0
+1.5
+101
+103
+block:8
+0.5
+1.0
+1.5
+101
+103
+block:9
+0.5
+1.0
+1.5
+101
+103
+block:10
+0.5
+1.0
+1.5
+101
+103
+block:11
+0.5
+1.0
+1.5
+101
+103
+block:12
+0.5
+1.0
+1.5
+101
+103
+block:13
+0.5
+1.0
+1.5
+101
+103
+block:14
+0.5
+1.0
+1.5
+101
+103
+block:15
+0.5
+1.0
+1.5
+101
+103
+block:16
+0.5
+1.0
+1.5
+101
+103
+block:17
+0.5
+1.0
+1.5
+101
+103
+block:18
+0.5
+1.0
+1.5
+101
+103
+block:19
+0.5
+1.0
+1.5
+101
+103
+block:20
+0.5
+1.0
+1.5
+101
+103
+block:21
+0.5
+1.0
+1.5
+101
+103
+block:22
+0.5
+1.0
+1.5
+101
+103
+block:23
+0.5
+1.0
+1.5
+101
+103
+block:24
+0.5
+1.0
+1.5
+101
+103
+block:25
+0.5
+1.0
+1.5
+101
+103
+block:26
+0.5
+1.0
+1.5
+101
+103
+block:27
+cohere_6b
+bloom_7.1b
+opt_6b
+Figure 9: Gain parameter distributions of the first layernorm comparing our model against OPT-6B.
+Note that in OPT-6B, all layernorm gain parameters across the are set to 1.0.
+27
+
+B.2
+Layers Analysis
+0.0
+0.5
+1.0
+1.5
+2.0
+RMSE(X, X)
+1e
+5
+dtype=bf16 (wd=0.01)
+dtype=fp16 (wd=0.01)
+0.0
+0.5
+1.0
+1.5
+2.0
+1
+t
+t
+i = 1
+std(Xi)
+0.00
+0.02
+0.04
+0.06
+0.08
+std(g)
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+Network Depth
+0
+20
+40
+60
+||W||2
+Figure 10:
+Input activation RMSE and token STD are higher in the fp16 variant for most
+attn-kqv-proj layers in the network.
+A similar trend exists for the first layernorm gain STD
+and weight spectral norm.
+0
+1
+2
+RMSE(X, X)
+1e
+5
+cohere_6b
+bloom_7.1b
+opt_6b
+0.00
+0.25
+0.50
+0.75
+1.00
+1
+t
+t
+i = 1
+std(Xi)
+0.00
+0.05
+0.10
+0.15
+std(g)
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+Network Depth
+0
+10
+20
+||W||2
+Figure 11: In line with Figure 10, the less quantization robust OPT-6B model has significantly
+higher RMSE(X,ˆX) and average token activation STD for all attn-kqv-proj layers. Note that all
+gain parameters seem to have been hard coded to 1.0 in OPT-6B.
+28
+
+B.3
+Outlier analysis
+We classify a feature dimension as an outlier dimension if the same dimension is classified as an
+outlier across 20 random samples from the C4 validation set (Raffel et al., 2020). These samples
+are fixed when experimenting with different outlier definitions.
+As mentioned in Section 4, we
+experimented with the definition outlined in Dettmers et al. (2022) where a hidden feature dimension
+is classified as outlier dimension if the activation magnitudes (denoted as α) are greater than 6.0
+(α > 6) at more than 25% of layers and 6% of tokens. However, we find 0 outlier dimensions
+across all of our 6B variants and fully trained models using this definition. As a result, following
+the methodology outlined in Dettmers et al. (2022), we manually searched for the lowest threshold
+such that only one dimension is classified as outlier in our smallest (410M) fully trained model. As
+shown in Table 5, even classifying outlier dimensions using the searched threshold of 4.2 resulted in
+most variants having 0 outlier dimensions. We further experimented with not fixing the threshold
+and using z-score outlier detection i.e. classify a feature as a high-magnitude if α > Cσ + µ, where
+σ and µ denote sample standard deviation and mean. We were not able to establish clear trends
+with this method either as shown in Table 5.
+Table 5: Outlier statistic using different thresholding rules Top Table: constant threshold α > 4.2
+Bottom Table:
+adaptive threshold α > 4σtoken + µtoken
+Variant
+#Outliers
+%Seq Affected
+%Layers Affected
+{all other variants}
+0
+0
+0
+dtype=fp16 (wd=0.01)
+6
+68.4
+65.5
+cohere_410M
+1
+25.0
+26.3
+cohere_6B
+0
+0
+0
+dropout=0.1
+2
+44.0
+40.5
+dropout=0.4
+2
+44.9
+42.9
+dropout=0.8
+1
+19.2
+25
+wd=0.1 (gc=none)
+2
+28.0
+39.3
+wd=0.01 (gc=none)
+0
+0
+0
+wd=0.001 (gc=none)
+2
+34.3
+34.5
+dtype=bf16 (wd=0.1)
+2
+33.0
+36.9
+dtype=fp16 (wd=0.1)
+2
+41.1
+42.9
+dtype=bf16 (wd=0.01)
+0
+0
+0
+dtype=fp16 (wd=0.01)
+8
+66.2
+64.3
+cohere_410M
+55
+88.2
+86.2
+cohere_6B
+7
+65.5
+56
+C
+Extended Literature Review
+The need for compression techniques that scale to large language model settings has become increas-
+ingly urgent with larger and larger models (Treviso et al., 2022; Yao et al., 2023). There has been
+a renewed focus on efficiency techniques (Gale et al., 2019; Ogueji et al., 2022; Ahia et al., 2021).
+Quantization as a form of model compression of large language models has become increasingly
+29
+
+relevant as a way to minimize memory requirements and minimize compute intensity (Dettmers
+et al., 2022; Xiao et al., 2022; Frantar et al., 2022; Park et al., 2022a; Kim et al.).
+Model Efficiency at Inference Time Research in model compression mostly falls in the categories
+of quantization techniques (Jacob et al., 2018; Courbariaux et al., 2014; Hubara et al., 2016; Gupta
+et al., 2015), efforts to start with a network that is more compact with fewer parameters, layers or
+computations (architecture design) (Howard et al., 2017; Iandola et al., 2016; Kumar et al., 2017),
+student networks with fewer parameters that learn from a larger teacher model (model distillation)
+(Hinton et al., 2015) and finally pruning by setting a subset of weights or filters to zero (Louizos
+et al., 2017; Wen et al., 2016; LeCun et al., 1990; Hassibi et al., 1993a; Ström, 1997; Hassibi et al.,
+1993b; See et al., 2016; Narang et al., 2017; Frantar & Alistarh, 2023; Sanh et al., 2020). Often, a
+combination of compression methods might be applied. For example, pruning might be combined
+with other efficiency-improving methods, e.g. quantization or faster search algorithms.
+Quantization Techniques Quantization can be used to speed up inference and relax hardware
+requirements, as has been shown for e.g., 8-bit (Quinn & Ballesteros, 2018), 4-bit (Aji & Heafield,
+2020) and recently also below 3-bit quantization (Park et al., 2022a) of neural machine translation
+models. Park et al. (2022a) utilize non-uniform quantization to achieve high compression ratios.
+However, this method requires the use of specialized kernels for compressed (2-bit/4-bit) weights and
+floating point activations and involve finding the binary representations using expensive iterative
+search or QAT. Similar to Park et al. (2022a), Frantar et al. (2022) also demonstrate compression
+of model parameters to 3 or 4-bit precision allowing inference off a single A100 GPU. However, they
+also perform weight-only quantization limiting the speedup as the activations are kept at higher
+precision (FP16).
+Quantization reduces the number of bits needed to represent model weights which minimizes both
+the memory and latency required to serve a model.
+Often, the goal is to quantize the bit representation while preserving equivalent performance. Quan-
+tization approaches can be broadly categorized into:
+1. Quantization-aware training (QAT) (Zafrir et al., 2019; Krishnamoorthi, 2018) – Quantization-
+aware training (QAT) involves pre-training with simulated quantization, enabling parameters
+to adjust to lower precision grids. This requires estimating the derivative of non-differentiable
+quantization operators, performing full backpropagation throughout the entire model, and
+training with the entire training dataset. However, this method can be computationally ex-
+pensive, particularly for large language models.
+2. Quantization-aware finetuning (Yao et al., 2022; Frantar et al., 2022; Zhuo et al., 2022; Li
+et al., 2021; Hubara et al., 2020; Nagel et al., 2020) (QAF) is a more efficient approach that
+utilizes a pretrained model and a small subset of training data (i.e., hundreds of samples) to
+optimize performance under quantization. By simulating quantization and optimizing a small
+range of parameters at a time, no backpropagation is needed while the quantization loss can
+be reduced.
+3. One-shot post-training quantization (PTQ) (Xiao et al., 2022; Dettmers et al., 2022)
+unlike QAT and QAF, does not involve optimization. Instead, it directly maps data from a
+high precision range to a low precision range based on a hand-picked mapping function.
+30
+
+Given the complexities of successfully training a large language model (Zhang et al., 2022; Rae
+et al., 2021), post-training quantization (PTQ) methods are extremely attractive as these techniques
+require the least modification to pretrained parameters. This is the focus of our exploration in this
+work.
+C.1
+Introduction to Post-Training Integer Quantization Approaches
+Below section introduces widely used quantization methods and provides context about the differ-
+ences between these methods. The quantization strategy for weights and activations can be broadly
+classified into three categories:
+C.1.1
+Weight-only Quantization
+Weight-only quantization has proven extremely effective in making large language models accessible
+by enabling inference in a resource-constrained environment while maintaining the FP16 model
+quality (Gerganov, 2023; Frantar et al., 2022; Zeng et al., 2022). Weight-only quantization provides
+improvements in latency due to a reduction in time taken for parameter fetching from GPU global
+memory, however, the actual Matrix-Matrix multiplication (GEMM) operations are carried out at
+higher precision in FP16 - allowing modest gains on platforms without dedicated lower-precision
+GEMM operations support.
+C.1.2
+Weight and Activation Quantization
+As large language models are scaled, progressively they become compute-bound and the improve-
+ments due to weight-only quantization stagnate. However, in this regime, using efficient kernels that
+leverage specialized lower-precision cores in modern GPUs to directly perform the actual Matrix-
+Matrix multiplication operation at lower precision enables large latency gains - due to the increased
+throughput of INT8 tensor cores over FP16 Tensor Cores (Nvidia). As this quantization technique
+scales the best, this is going to be our focus in this work.
+To-date quantization of both the activations and weights of very large models (>6.7B parameters)
+has proven challenging - leading to a large drop in performance.
+C.1.3
+Quantization by Mixed-Precision Decomposition
+In the quantization strategies mentioned above, even though the various weights and activations
+might be stored in different precisions; all the computations in a single operation are carried out at
+the same precision (FP16 or INT8). In contrast, LLM.int8() (Dettmers et al., 2022) proposes to
+decompose the matrix multiplication to compute a small fraction of elements at a higher precision
+(FP16) while the bulk of the computations is performed at low precision (INT8). This approach
+has a similar footprint to that of weight-only quantization but practical latency gains are limited
+or potentially worse. While this approach has theoretical latency benefits due to the bulk of the
+computation being performed at lower precision, in practice without specialized hardware (Dash
+et al., 2022; Dash & Mukhopadhyay, 2020), the lack of specialized kernels on GPUs and additional
+kernel calls required to ready the inputs and weights for mixed-precision computation negates the
+projected benefits. In this work we focus on exploring optimization choices which mitigate quantiza-
+31
+
+tion trade-offs for both weight-only quantization and the far more challenging weight and activation
+quantization.
+32
+

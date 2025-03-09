@@ -1,0 +1,922 @@
+Improving Diﬀusion Model Eﬃciency Through Patching
+Troy Luhman∗
+troyluhman@gmail.com
+Eric Luhman∗
+ericluhman2@gmail.com
+Abstract
+Diﬀusion models are a powerful class of generative models that it-
+eratively denoise samples to produce data. While many works have
+focused on the number of iterations in this sampling procedure, few
+have focused on the cost of each iteration. We ﬁnd that adding a
+simple ViT-style patching transformation can considerably reduce a
+diﬀusion model’s sampling time and memory usage. We justify our
+approach both through an analysis of the diﬀusion model objective,
+and through empirical experiments on LSUN Church, ImageNet 2562,
+and FFHQ 10242. We provide implementations in Tensorﬂow1 and
+Pytorch2.
+1
+Introduction
+Since their introduction in [30], diﬀusion models have gained increased attention due to
+their high-ﬁdelity samples, good data coverage, and straightforward implementation [12].
+On image data, diﬀusion models were shown to surpass state-of-the-art GANs [9; 16; 1]
+in visual quality [4], and have achieved unprecedented performance on text-to-image tasks
+[24; 28]. Futhermore, pretrained diﬀusion models are well-suited for downstream tasks such
+as image inpainting [19] or stroke-to-image synthesis [20], often outperforming rival methods
+without any task-speciﬁc training.
+However, this success comes at the cost of a high computational load. At sampling time,
+they usually require hundreds-to-thousands of network evaluations to simulate the reverse
+diﬀusion process.
+In addition, their mode-covering likelihood objective requires a large
+amount of training compute for complex, high-resolution datasets like ImageNet [3]. For
+instance, training an ADM [4] on 256 × 256 ImageNet uses 914 V-100 days of compute,
+which can be costly and inaccessible.
+For image data, an eﬀective way of reducing compute costs is to model a low-dimensional
+representation of the data, which can be obtained through downsampling [22; 4; 13] or
+a latent encoder [7; 25]. However, the compressed data must be decoded using a second
+network, resulting in a complicated pipeline that changes the original diﬀusion process. This
+modiﬁcation pushes an extra layer of considerations onto practitioners looking to apply
+diﬀusion models for downstream tasks [2; 27; 23].
+∗Equal Contribution
+1https://github.com/ericl122333/PatchDiﬀusion-TF
+2https://github.com/ericl122333/PatchDiﬀusion-Pytorch
+1
+arXiv:2207.04316v1  [cs.LG]  9 Jul 2022
+
+In this work, we propose to apply diﬀusion models on a grid of image patches, where each
+patch represents a group of neighboring pixels. This “patching” operation moves pixels
+from the spatial dimension to the channel axis, leading to signiﬁcant improvements in both
+eﬃciency and memory usage.
+Furthermore, patching is simple to implement and leaves
+the diﬀusion processes statistically unchanged, making it easily applicable to any diﬀusion
+model.
+Our key contributions can be summarized as follows:
+• We present an in-depth analysis of the diﬀusion model objective, and show that high-
+resolution convolutional layers are redundant at most timesteps.
+• We present a new patched diﬀusion model (PDM), and show that it greatly reduces
+the compute requirements for generating high-resolution images. Additionally, it’s a
+sampling speed movement orthogonal to existing methods, as it concerns the function
+itself, not the number of function evaluations.
+• We study the eﬀect of the output parameterization in diﬀusion models, both with and
+without patching, and ﬁnd that data prediction is less fragile than noise prediction.
+• We propose a method for scaling PDMs to diﬃcult datasets by splitting a single
+network into multiple parts; and demonstrate high-ﬁdelity image synthesis on the
+challenging ImageNet 2562 dataset.
+2
+Patched Diﬀusion Models
+2.1
+Diﬀusion Models
+We provide a brief review of the “variance-preserving” diﬀusion models from [12]. Consider a
+forward process q, indexed by timestep t, that produces latents z1 . . . zT given data x ∈RD.
+The forward transition kernels can be written as follows:
+q(zt|zt−1) := N
+p
+1 −βtzt−1, βtI
+
+, βt ∈(0, 1)
+(1)
+q(zt|x) = N (√αtx, (1 −αt)I) , αt :=
+tY
+s=1
+(1 −βs)
+(2)
+With this, we can compare the posterior q(zt−1|zt, x) to a learned prior pθ(zt−1|zt) for
+maximum likelihood training, in a similar fashion to [17]. Since q(zt−1|zt, x) is Gaussian
+for all t, we set pθ(zt−1|zt) to be Gaussian with mean µθ(zt, t) and the same variance
+as q(zt−1|zt, x).3 This allows for closed form comparison of KL divergences between the
+two. Sampling from the generative model is straightforward, starting with a Markov chain
+initialized at p(zT ) = N(0, I), and continuing with each pθ(zt−1|zt) in succession.
+To train µθ(zt, t), one could simply predict the mean of q(zt−1|zt, x) directly. However,
+the mean of q(zt−1|zt, x) becomes very close to zt itself for large T, decreasing the model’s
+learning signal. As such, [12] found it beneﬁcial to parameterize µθ(zt, t) in terms of ϵθ(zt, t),
+which predicts the noise ϵt = (zt −√αtx)/√1 −αt. We instead choose to predict the data
+x directly, and we further discuss this choice in Section 3.2.
+3Learned variances are also possible; see Appendix C for details.
+2
+
+An evidence lower bound on log q(x) can now be written as a weighted sum of denoising
+autoencoder objectives, where the network xθ(zt, t) learns to reconstruct data at multiple
+levels of noise:
+−ELBO =
+T
+X
+t=1
+γtEq(x,zt)
+h
+∥xθ(zt, t) −x∥2
+2
+i
++ C
+(3)
+where γt is a constant related to βt, αt, and αt−1.
+In practice, optimizing Equation 3
+with the maximum-likelihood weighting of γt typically leads to lower sample quality, as
+it overemphasizes high-frequency details [12]. In our experiments, we set γt =
+q
+αt
+1−αt to
+prioritize learning of low-level features.
+2.2
+Redundancies in Existing Model Architectures
+Optimization of Equation 3 is typically done by sampling x from the dataset, perturbing it
+into noisy image zt, then training the model to predict the original x. However, a perfect
+reconstruction is an impossible task, since zt could have originated from a diﬀerent value of
+x. Indeed, any example in the dataset has the potential produce a given zt, just not with
+equal probability. As such, the best strategy for xθ(zt, t) would be to predict a weighted
+average of dataset examples, where each is weighted according to the probability that it
+generated zt.
+Expressed mathematically, the optimal value of xθ(zt, t) that minimizes Equation 3 can be
+written as:
+x
+∗(zt, t) = Eq(x)
+
+x q(zt|x)
+q(zt)
+
+(4)
+which also equals the mean of q(x|zt). See derivation in Appendix A. Despite being the
+reconstruction target that minimizes Equation 3, values of x
+∗(zt, t) actually lie on a lower-
+dimensional manifold than the data itself. Instead of resembling actual images, x
+∗(zt, t)
+looks like a blurred version, where the blurring increases with time (Figure 1a).
+This eﬀect arises from the averaging of diﬀerent x in the expectation from Equation 4.
+Because the weighting factor q(zt|x) assigns higher probability to x that are close to zt
+in pixel space, the most likely values of x will have similar low-frequency components.
+However, these values will have dissimilar high-frequency components; these high-frequency
+components then destructively interfere with each other, causing blur (see Figure 1b). As t
+increases, values of x that are far away from zt have a higher weighting in the expectation,
+increasing the blurriness of x*.
+Thus, when choosing neural network architectures for xθ(zt, t), it may be helpful to consider
+which layers are most helpful in reaching the desired minimum at x
+∗(zt, t).
+Typically,
+diﬀusion models use convolutional layers at multiple resolutions to model both low and high-
+frequency components. But since the high-frequency components in x
+∗(zt, t) are attenuated
+early in the forward process, we argue that high-frequency convolutional layers are redundant
+for most timesteps. Additionally, these layers often have the largest memory consumption
+because they operate at high spatial resolutions.
+3
+
+Figure 1a: The value of xθ(zt, t) ≈x
+∗(zt, t) as t increases.
+Figure 1b:
+Possible reconstructions sampled from noisy image zt. We approximate q(x|zt)
+using a trained ImageNet model.
+3
+Patched Diﬀusion Models
+The standard U-Net architecture for diﬀusion models takes in inputs zt with shape (H,
+W, C), where H, W and C are the height, width and number of channels of the image.
+Motivated by the discussion in Section 2.2, we propose to reshape the image into a grid
+of non-overlapping patches with shape (H/P, W/P, C × P 2) where P is the patch size.
+This eliminates potentially wasteful computation at the high noise levels, and within-patch
+dependencies can still be modeled via channel-wise operations.
+3.1
+Eﬀect of patch size
+An important consideration in using patching is how large the patch size P should be.
+Learning diﬀusion models on patches of image data enables a signiﬁcant reduction in com-
+putational resources. However, the number of output channels grows quadratically with P,
+and it might be diﬃcult to predict all the pixels in a P × P × C grid without signiﬁcantly
+increasing the network’s width.
+To test how much we can increase the patch size without signiﬁcantly reducing quality, we
+train 3 diﬀerent models on the LSUN Churches 256 × 256 dataset [37], with patch sizes
+P = 2, 4, and 8. Each model has roughly 120 million parameters and is trained for 2.5 days
+on a TPUv2-8 (approx. 5 V100 days).
+In Table 1, we report both the sample quality measured by FID [10] and the sampling
+speed. We ﬁnd that P = 4 achieves a good trade-oﬀbetween eﬃciency and quality, so we
+use this choice for our other models. We show a visual comparison for the diﬀerent models
+in Appendix E.
+We also investigate how diﬀerent choices of P aﬀect the distortion ∥x −xθ(zt, t)∥at various
+timesteps. As shown in Figure 2, the distortion is noticeably higher for larger patch sizes
+when t is low. However, for the majority of timestep values, models with P = 4, 8 have
+similar or even lower levels of distortion compared to the more computationally expensive
+P = 2 model. This result is consistent with our analysis in 2.2, as it demonstrates that
+high-resolution convolutions are not necesary when x
+∗(zt, t) itself is blurry.
+4
+
+Table 1: Eﬀect of varying the patch
+size on FID and sampling speed. Sam-
+pling speed is evaluated on a single
+TPUv2-8 with a batch size of 1024 and
+250 sampling steps.
+Patch Size
+FID ↓
+Images/sec ↑
+P = 2
+5.7
+1.7
+P = 4
+7.5
+2.4
+P = 8
+22.0
+4.4
+Figure 2: Ratio of distortion (RMSE) when
+using P = 4, 8 compared to P = 2
+3.2
+Output parameterization
+From its deﬁnition in section 2.1, the reconstruction network xθ(zt, t) was trained to predict
+the data x itself, instead of the noise ϵ that was added to it. We hypothesize that patch-
+predicting models will beneﬁt from this approach, since pixels within a patch of x will
+generally have similar values, while the same is not true for ϵ. To test this hypothesis,
+we report initial loss curves for models that output x and ϵ, as well as v [29] where v :=
+√αtϵ −√1 −αtx. We include results for both patched and un-patched models in Figure 3.
+Interestingly, while patched models indeed perform better with x-prediction compared to
+ϵ-prediction, v-prediction performs similarly well despite the larger within-patch variance.
+We hypothesize this is due to the learning signal the model receives. With ϵ-prediction,
+the model must learn a near-identity function at high timesteps; the same is true with
+x-prediction but at the low timesteps.
+However, at high timesteps, small errors in the
+prediction of ϵ induce large errors in the predicted x because of division by √α; see ﬁgure 4
+for an example. Therefore, we recommend that patched models use x or v prediction, and
+believe such parameterization may be beneﬁcial in other settings as well.
+Figure 3: Loss when using diﬀerent predic-
+tion types, both for P = 4 and P = 1.
+Figure 4: Estimates for xθ from ϵ-predicting
+(ADM) and x-predicting (PDM) networks,
+and the true x
+∗, at t = 970.
+ϵ-prediction
+produces noise artifacts in xθ. We approx-
+imated x
+∗using the empirical distribution
+for the class “goldﬁsh”.
+5
+
+4
+Scaling to more complex datasets
+In this section, we evaluate the performance of Patched Diﬀusion Models on ImageNet
+256 × 256, and on the FFHQ 1024 × 1024 dataset. Both experiments use P = 4.
+Method
+Training Time
+IS ↑
+FID ↓
+sFID ↓
+Precision ↑
+Recall ↑
+PDM (Ours), w = 1.5
+32
+142.2
+8.57
+6.50
+0.79
+0.47
+PDM (Ours), w = 2.25
+32
+244.7
+8.87
+6.84
+0.90
+0.31
+ADM-G, w = 1.0†
+962
+186.7
+4.59
+5.25
+0.82
+0.52
+ADM-G, w = 10.0†
+962
+283.92
+9.11
+10.93
+0.88
+0.32
+ADM-G-U, w = 1.0†
+349
+215.84
+3.94
+6.14
+0.83
+0.53
+LDM-8-G, w = 1.0†
+91
+190.4
+8.11
+-
+0.83
+0.36
+LDM-4-G, w = 1.5†
+271
+247.67
+3.60
+-
+0.87
+0.48
+BigGAN
+128-256
+202.65
+6.95
+7.36
+0.87
+0.28
+StyleGAN-XL
+-
+265.1
+2.30
+4.02
+0.78
+0.53
+Table 2:
+ImageNet 256 × 256 results and compute comparison. All values for comparison
+were taken from their respective works; unreported values are indicated with a “-”. Training
+time is measured in V100-days; we use the conversion 1 TPUv2-8 day = 2 V100-days.
+† indicates classiﬁer guidance. All diﬀusion models use 250 sampling steps except LDM-8-G
+which uses 100.
+4.1
+Model Splitting
+For high-resolution, multimodal datasets, previous works have beneﬁted from using two
+specialized networks for a single task. One creates a downsampled version of the data while
+the other upsamples these images [22; 4; 13]. As our models already operates on inputs
+with smaller height and width, we propose a diﬀerent approach for two-stage pipelines.
+Speciﬁcally, our “model splitting” method uses two diﬀerent models on the full-dimensional
+data, where the ﬁrst learns to denoise zt at timesteps 1 to S, while the second denoises for
+timesteps S to T.
+Similar to upsampling pipelines, model splitting implicitly divides the generative process into
+creating a “low-resolution” image, and a high-resolution image from this. In our case, the
+“low-resolution” image is created through the blurring eﬀect intrinsic to the forward process
+(as described in Section 2.2) and preserves the dimensionality of the data. To analyze these
+contrasting approaches through a diﬀerent lens, a downsampling kernel averages over regions
+of the same image, while the forward process averages images with other samples from the
+dataset.
+Compared to other two-stage approaches, partioning the problem according to the forward
+process is advantageous because of its ﬂexibility and simplicity. By avoiding external latent
+variables, it retains easy likelihood computation and can be applied to downstream tasks in
+the exact same manner as an un-split model.
+6
+
+4.2
+ImageNet Results
+To test the scalability of our approach, we conduct an experiment on the challenging Ima-
+geNet [3] dataset at the 256 × 256 resolution. We use model splitting with S = 396 (SNR
+≈0.25).
+Both models use identitical architectures, allowing us to initialize the second
+model’s weights with the ﬁrst model’s weights to warm-start the training process. Our sam-
+pling procedure uses dynamically thresholded classiﬁer-free guidance [11; 28] at weights of
+w = 1.5 and w = 2.25, and 250 sampling steps (500 function evaluations).
+Table 4 compares the performance and training costs of our approach to various other
+DDPM and GAN based approaches. Each split is trained for 500 thousand iterations on a
+batch size of 256. On a single TPUv2-8, we achieve a throughput of 183 images per second,
+or 1.4 seconds per iteration. Despite using vastly fewer computational resources, our model
+achieves competitive FID [10] with other methods. Especially surprising is our low spatial
+FID (sFID) [21]; our model performs relatively better at modeling high-level relationships
+compared to large-scale structure, even without convolutional layers at the 2562 and 1282
+resolutions. It is likely that all these metrics would improve with longer training.
+4.3
+FFHQ
+To demonstrate that patching in diﬀusion models is eﬀective at higher resolutions, we evalu-
+ate the quality of generated 10242 faces on FFHQ. As shown in Figure 5, when using P = 4,
+the model is able to create images with sharp pixel-level details.
+An important consideration when working with higher resolutions such as 10242 is memory
+usage, so we compare our FFHQ model’s memory footprint to a baseline that uses P = 1
+[32]. On a single P100 using single precision, the maximum batch size our model could ﬁt
+without running out of memory was 32, while the baseline with P = 1 could only hold a
+batch size of 8. This corresponds to a 4× decrease in memory cost, which is reasonable
+considering our model takes in inputs with a 4× smaller height and width. By increasing
+the maximum batch size, PDMs gain an additional speedup on batch inference tasks over a
+model without patching.
+Figure 5: A generated sample from our FFHQ model with
+P = 4. Even when zooming in, there are no discernable
+artifacts that may have resulted from using patching.
+7
+
+5
+Related Work
+Our work is most closely related to Subspace Diﬀusion models [15], who add dimensionality-
+reducing projections at speciﬁed points of diﬀusion process. Their framework allows for
+improved eﬃciency without marginalizing over external latent variables, but it neverthe-
+less modiﬁes the diﬀusion process and requires using multiple models.
+In contrast, our
+method acts on the full dimensional data and achieves speedup through an architecture
+change. Other similar methods, such as cascading [13] or latent diﬀusion [25], model lower-
+dimensional data and use a multi-stage generation process to produce full-resolution images.
+For generative models, a variant of patching was introduced in the coupling layers of nor-
+malizing ﬂows [5] to partition the data dimensions along the spatial axes, enabling a compu-
+tationally tractable determinant. Patching also sees widespread usage in vision transformers
+[6], which have seen success on various other image tasks [8; 33]. ViT-based architectures
+have also been applied to GANs [18; 38], but not to diﬀusion models; we brieﬂy experimented
+with ViTs but found that U-Nets generally outperformed them (details in Appendix D).
+6
+Conclusion
+Our work provides a practical solution to reduce training and sampling costs through the
+use of patching. Unlike previous works that achieve eﬃciency by using compressed data
+representations, our method works directly on the original data, and is applicable to any
+diﬀusion model. By adjusting the patch size, practitioners can trade oﬀspeed for quality
+depending on their resource constraints.
+Alternatively, one can avoid this trade-oﬀby
+using multiple models with diﬀerent patch sizes for diﬀerent noise levels; combining such
+an approach into a single model is a possible direction of future work. Another avenue
+for future work is applying vision transformers to diﬀusion models, since transformer-based
+architectures are often more powerful and scalable than CNN-based architectures.
+8
+
+References
+[1] A. Brock, J. Donahue, and K. Simonyan. Large scale GAN training for high ﬁdelity
+natural image synthesis.
+In International Conference on Learning Representations,
+2019. URL https://openreview.net/forum?id=B1xsqj09Fm.
+[2] J. Choi, S. Kim, Y. Jeong, Y. Gwon, and S. Yoon. Ilvr: Conditioning method for
+denoising diﬀusion probabilistic models, 2021. URL https://arxiv.org/abs/2108.
+02938.
+[3] J. Deng, W. Dong, R. Socher, L.-J. Li, K. Li, and F.-F. Li.
+Imagenet: A large-
+scale hierarchical image database. In CVPR, pages 248–255. IEEE Computer Society,
+2009.
+ISBN 978-1-4244-3992-8.
+URL http://dblp.uni-trier.de/db/conf/cvpr/
+cvpr2009.html#DengDSLL009.
+[4] P. Dhariwal and A. Q. Nichol. Diﬀusion models beat GANs on image synthesis. In
+A. Beygelzimer, Y. Dauphin, P. Liang, and J. W. Vaughan, editors, Advances in Neural
+Information Processing Systems, 2021.
+URL https://openreview.net/forum?id=
+AAWuCvzaVt.
+[5] L. Dinh, J. Sohl-Dickstein, and S. Bengio.
+Density estimation using real nvp.
+CoRR, abs/1605.08803, 2016. URL http://dblp.uni-trier.de/db/journals/corr/
+corr1605.html#DinhSB16.
+[6] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weissenborn, X. Zhai, T. Unterthiner,
+M. Dehghani, M. Minderer, G. Heigold, S. Gelly, J. Uszkoreit, and N. Houlsby. An
+image is worth 16x16 words: Transformers for image recognition at scale. In Inter-
+national Conference on Learning Representations, 2021. URL https://openreview.
+net/forum?id=YicbFdNTTy.
+[7] P. Esser, R. Rombach, and B. Ommer. Taming transformers for high-resolution image
+synthesis, 2020.
+[8] Y. Fang, B. Liao, X. Wang, J. Fang, J. Qi, R. Wu, J. Niu, and W. Liu. You only look at
+one sequence: Rethinking transformer in vision through object detection. In NeurIPS,
+2021.
+[9] I. Goodfellow, J. Pouget-Abadie, M. Mirza, B. Xu, D. Warde-Farley, S. Ozair,
+A. Courville, and Y. Bengio.
+Generative adversarial nets.
+In Z. Ghahramani,
+M. Welling, C. Cortes, N. Lawrence, and K. Q. Weinberger, editors, Advances in
+Neural Information Processing Systems, volume 27, pages 2672–2680. Curran As-
+sociates, Inc., 2014.
+URL https://proceedings.neurips.cc/paper/2014/file/
+5ca3e9b122f61f8f06494c97b1afccf3-Paper.pdf.
+[10] M. Heusel, H. Ramsauer, T. Unterthiner, B. Nessler, and S. Hochreiter. Gans trained
+by a two time-scale update rule converge to a local nash equilibrium, 2018.
+[11] J. Ho and T. Salimans. Classiﬁer-free diﬀusion guidance. In NeurIPS 2021 Work-
+shop on Deep Generative Models and Downstream Applications, 2021. URL https:
+//openreview.net/forum?id=qw8AKxfYbI.
+[12] J. Ho, A. Jain, and P. Abbeel. Denoising diﬀusion probabilistic models, 2020.
+[13] J. Ho, C. Saharia, W. Chan, D. J. Fleet, M. Norouzi, and T. Salimans. Cascaded
+diﬀusion models for high ﬁdelity image generation. arXiv preprint arXiv:2106.15282,
+2021.
+9
+
+[14] A. Hyvrinen. Estimation of non-normalized statistical models by score matching. J.
+Mach. Learn. Res., 6:695–709, 2005. URL http://dblp.uni-trier.de/db/journals/
+jmlr/jmlr6.html#Hyvarinen05.
+[15] B. Jing, G. Corso, R. Berlinghieri, and T. Jaakkola.
+Subspace diﬀusion generative
+models. ArXiv, abs/2205.01490, 2022.
+[16] T. Karras, S. Laine, and T. Aila. A style-based generator architecture for generative
+adversarial networks, 2019.
+[17] D. P. Kingma and M. Welling. Auto-encoding variational bayes, 2013. URL https:
+//arxiv.org/abs/1312.6114.
+[18] K. Lee, H. Chang, L. Jiang, H. Zhang, Z. Tu, and C. Liu. ViTGAN: Training GANs
+with vision transformers. In International Conference on Learning Representations,
+2022. URL https://openreview.net/forum?id=dwg5rXg1WS_.
+[19] A. Lugmayr, M. Danelljan, A. Romero, F. Yu, R. Timofte, and L. Van Gool. Repaint:
+Inpainting using denoising diﬀusion probabilistic models, 2022. URL https://arxiv.
+org/abs/2201.09865.
+[20] C. Meng, Y. He, Y. Song, J. Song, J. Wu, J.-Y. Zhu, and S. Ermon. SDEdit: Guided
+image synthesis and editing with stochastic diﬀerential equations. In International Con-
+ference on Learning Representations, 2022. URL https://openreview.net/forum?
+id=aBsCjcPu_tE.
+[21] C. Nash, J. Menick, S. Dieleman, and P. W. Battaglia. Generating images with sparse
+representations, 2021. URL https://arxiv.org/abs/2103.03841.
+[22] A. Nichol and P. Dhariwal. Improved denoising diﬀusion probabilistic models, 2021.
+URL https://arxiv.org/abs/2102.09672.
+[23] O. Patashnik, Z. Wu, E. Shechtman, D. Cohen-Or, and D. Lischinski. Styleclip: Text-
+driven manipulation of stylegan imagery. In Proceedings of the IEEE/CVF Interna-
+tional Conference on Computer Vision (ICCV), pages 2085–2094, October 2021.
+[24] A. Ramesh, P. Dhariwal, A. Nichol, C. Chu, and M. Chen. Hierarchical text-conditional
+image generation with clip latents, 2022. URL https://arxiv.org/abs/2204.06125.
+[25] R. Rombach, A. Blattmann, D. Lorenz, P. Esser, and B. Ommer. High-resolution image
+synthesis with latent diﬀusion models, 2021.
+[26] O. Ronneberger, P. Fischer, and T. Brox. U-net: Convolutional networks for biomed-
+ical image segmentation, 2015.
+URL http://arxiv.org/abs/1505.04597.
+cite
+arxiv:1505.04597Comment: conditionally accepted at MICCAI 2015.
+[27] C. Saharia, W. Chan, H. Chang, C. A. Lee, J. Ho, T. Salimans, D. J. Fleet, and
+M. Norouzi. Palette: Image-to-image diﬀusion models, 2021. URL https://arxiv.
+org/abs/2111.05826.
+[28] C. Saharia, W. Chan, S. Saxena, L. Li, J. Whang, E. Denton, S. K. S. Ghasemipour,
+B. K. Ayan, S. S. Mahdavi, R. G. Lopes, T. Salimans, J. Ho, D. J. Fleet, and
+M. Norouzi. Photorealistic text-to-image diﬀusion models with deep language under-
+standing, 2022. URL https://arxiv.org/abs/2205.11487.
+[29] T. Salimans and J. Ho.
+Progressive distillation for fast sampling of diﬀusion mod-
+els.
+In International Conference on Learning Representations, 2022.
+URL https:
+//openreview.net/forum?id=TIdIXIpzhoI.
+10
+
+[30] J. Sohl-Dickstein, E. A. Weiss, N. Maheswaranathan, and S. Ganguli. Deep unsuper-
+vised learning using nonequilibrium thermodynamics, 2015.
+[31] Y. Song and S. Ermon.
+Generative modeling by estimating gradients of the data
+distribution, 2019. URL https://arxiv.org/abs/1907.05600.
+[32] Y. Song, J. Sohl-Dickstein, D. P. Kingma, A. Kumar, S. Ermon, and B. Poole. Score-
+based generative modeling through stochastic diﬀerential equations, 2020.
+[33] R. Strudel, R. G. Pinel, I. Laptev, and C. Schmid. Segmenter: Transformer for semantic
+segmentation. 2021 IEEE/CVF International Conference on Computer Vision (ICCV),
+pages 7242–7252, 2021.
+[34] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit, L. Jones, A. N. Gomez, . Kaiser,
+and I. Polosukhin. Attention is all you need. In I. Guyon, U. V. Luxburg, S. Bengio,
+H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in Neural
+Information Processing Systems 30, page 59986008. Curran Associates, Inc., 2017. URL
+https://papers.nips.cc/paper/7181-attention-is-all-you-need.
+[35] P. Vincent. A connection between score matching and denoising autoencoders. Neural
+computation, 23(7):1661–1674, 2011.
+[36] Y. Wu and K. He. Group normalization, 2018. URL https://arxiv.org/abs/1803.
+08494.
+[37] F. Yu, A. Seﬀ, Y. Zhang, S. Song, T. Funkhouser, and J. Xiao. Lsun: Construction of
+a large-scale image dataset using deep learning with humans in the loop, 2016.
+[38] J. Yu, X. Li, J. Y. Koh, H. Zhang, R. Pang, J. Qin, A. Ku, Y. Xu, J. Baldridge,
+and Y. Wu. Vector-quantized image modeling with improved VQGAN. In Interna-
+tional Conference on Learning Representations, 2022.
+URL https://openreview.
+net/forum?id=pfNyExj7z2.
+11
+
+A
+Derivations
+This appendix contains the derivation for Equation 4, the formula for the optimal re-
+construction network that minimizes Equation 3.
+First, deﬁne mapping function xθ :
+RD × {1, . . . , T} →RD, whose cost function J(θ) has its global minimum at x*.
+J(θ) :=
+T
+X
+t=1
+γtEq(x,zt)
+h
+∥xθ(zt, t) −x∥2
+2
+i
++ C
+(5)
+x* := arg min
+θ
+J(θ)
+(6)
+We now show that for any zt ∈RD and t ∈{1, . . . , T}, we have x
+∗(zt, t) = Eq(x)
+h
+x q(zt|x)
+q(zt)
+i
+.
+Because the function xθ(zt, t) receives timestep t as an input, we can treat xθ(zt, t) as
+T diﬀerent functions x(1)
+θ (zt), . . . x(T )
+θ
+(zt), and have each x(t)
+θ (zt) optimize a single term of
+the summation. We now turn our attention to ﬁnding the minimization of each individual
+term. Deﬁning ¯x(zt) := Eq(x|zt) [x], we have:
+x(t)* = arg min
+θ
+γtEq(x,zt)
+x(t)
+θ (zt) −x
+
+2
+2
+
+(7)
+= arg min
+θ
+γtEq(zt)
+
+Eq(x|zt)
+x(t)
+θ (zt) −x
+
+2
+2
+
+(8)
+= arg min
+θ
+γtEq(zt)
+
+Eq(x|zt)
+
+
+x(t)
+θ (zt) −¯x(zt)
+
+−(x −¯x(zt))
+
+2
+2
+
+(9)
+= arg min
+θ
+γtEq(zt)
+
+Eq(x|zt)
+x(t)
+θ (zt) −¯x(zt)
+
+2
+2 + ∥x −¯x(zt)∥2
+2
+
+(10)
+= arg min
+θ
+γtEq(zt)
+
+Eq(x|zt)
+x(t)
+θ (zt) −¯x(zt)
+
+2
+2
+
+(11)
+= arg min
+θ
+γtEq(zt)
+x(t)
+θ (zt) −¯x(zt)
+
+2
+2
+
+(12)
+From this, we can see that x(t)* will always map zt to ¯x(zt), or the mean of q(x|zt). This
+makes sense, since the mean-squared loss over q(x|zt) in Equation 8 is minimized by its
+mean. Finally, the result in Equation 4 can be obtained by using Bayes’ rule.
+Given the connections between diﬀusion models and score-based models [31; 12; 32], we
+oﬀer an alternative interpretation of our result in Equation 4 through the lens of score-
+matching [14]. Speciﬁcally, when setting ∇zt log q(zt) = −(zt −√αt¯x(zt))/(1 −αt) the
+objective in Equation 12 becomes a score-matching objective between score network s(t)
+θ (zt)
+and the marginal score. Meanwhile, Equation 7 corresponds to the denoising score matching
+objective which is equivalent to the score matching objective up to a constant [35].
+12
+
+B
+Code Implementation
+In this appendix, we provide an example PyTorch implementation of our patched architec-
+ture, that includes code segments for both the patching and unpatching operations. Aside
+from the architecture changes listed here, no other modiﬁcations are necessary. Note that
+other implementations of patching may exist; this one uses the same patch ordering as
+Tensorﬂow’s image.extract patches function.
+# Code for a modified UNet architecture that operates on patched images
+class PatchedUNet(nn.Module):
+def __init__(self, *args, **kwargs):
+# create the U-Net architecture as normal
+# but make sure input/output projections use 3*patch_size**2 channels, not 3
+# ...
+self.patch_size = patch_size
+def convert_image_to_patches(self, x):
+p = self.patch_size
+B, C, H, W = x.shape
+x = x.permute(0, 2, 3, 1)
+#BHWC format, bc reshape is done on last 2 axes
+x = x.reshape(B, H, W//p, C*p) #reshape from width axis to channel axis
+x = x.permute(0, 2, 1, 3)
+#now height & channel should be last 2 axes
+x = x.reshape(B, W//p, H//p, C*p*p) #reshape from height axis to channel axis
+return x.permute(0, 3, 2, 1)
+#convert to channels-first format
+def convert_patches_to_image(self, x):
+p = self.patch_size
+B, C, H, W = x.shape
+x = x.permute(0,3,2,1) #BWHC; from_patches starts w/ height axis, not width
+x.reshape(B, W, H*p, C//p)
+#reshape from channel axis to height axis
+x = x.permute(0,2,1,3) #now width & channel should be last 2 axes
+x = x.reshape(B, H*p, W*p, C//(p*p)) #reshape from channel axis to width axis
+return x.permute(0, 3, 1, 2)
+#convert to channels-first format
+def forward(self, x, t):
+x = self.convert_image_to_patches(x)
+# run the forward pass of the U-Net the same exact way as before.
+# ...
+x = self.convert_patches_to_image(x)
+return x
+13
+
+C
+Implementation Details
+This section covers some of the most signiﬁcant choices we made during experimentation.
+For more detailed information, one can visit our Tensorﬂow implementation or a Pytorch
+implementation which is based on the repository from [4]. Our U-Net architecture is similar
+to the one used in [4], but with several changes that we list below:
+• Similar to [22], we learn the reverse process variances to facilitate faster sampling.
+However, instead of optimizing their hybrid objective, we chose to use the main net-
+work to optimize Lsimple only, and use a small auxiliary network to minimize Lvlb. We
+opted for this approach to avoid having to balance out the two diﬀerent objectives, as
+λ = 0.001 may not be suitable for our diﬀerent weighting of γt in Lsimple.
+• We add 2D sinusoidal positional encodings [34; 6] to incorporate spatial information
+into the network. This information is added once, right after the ﬁrst input projection.
+• We eliminate attention at the 322 resolution due to memory constraints. Before the 162
+and 82 attention, we also add a GroupNormalization [36] layer to normalize attention
+inputs.
+• In the upsampling stack, we decrease the kernel size of the convolutional skip connec-
+tion from 3 to 1 for reduced parameter counts.
+• For class-conditional experiments on ImageNet, we injected class information through
+a sigmoid gate before the residual connection in our convolutional blocks, instead of
+in the AdaGN layers.
+• To reduce memory requirements in distributed training, we held a single copy of the
+exponential-moving-averaged weights on the CPU instead of replicating across devices.
+For better throughput, we updated the EMA weights once every 100 iterations, with
+decay of 0.99.
+Table 3: Hyperparameters used in our LSUN experiment.
+Patch Size
+P = 2
+P = 4
+P = 8
+Parameters
+123M
+121M
+121M
+Base channel size
+128
+256
+256
+Channel multiplier
+1,2,2,4,4
+1,1,2,2
+1,1.5,2
+Blocks per resolution
+2
+2
+3
+Attention resolutions
+16,8
+16,8
+16,8
+Dropout
+0.0
+0.0
+0.0
+Batch size
+128
+256
+512
+Learning Rate
+1 × 10−4
+1 × 10−4
+1 × 10−4
+Adam β1
+0.9
+0.9
+0.9
+Adam β2
+0.99
+0.99
+0.99
+Warmup steps
+5000
+5000
+5000
+Training iterations
+335k
+275k
+215k
+Diﬀusion βT
+0.02
+0.02
+0.02
+14
+
+Table 4: Hyperparameters used in our experiments.
+Dataset
+FFHQ
+ImageNet 2562 (1st split)
+ImageNet 2562 (2nd split)
+Parameters
+163M
+202M
+202M
+Base channel size
+128
+256
+256
+Channel multiplier
+1,2,2,4,4,4
+1,2,2,2
+1,2,2,2
+Blocks per resolution
+2
+3
+3
+Attention resolutions
+16,8
+16,8
+16,8
+Dropout
+0.0
+0.0
+0.0
+Batch size
+32
+256
+256
+Learning Rate
+2 × 10−5
+1 × 10−4
+5 × 10−5
+Adam β1
+0.9
+0.9
+0.9
+Adam β2
+0.98
+0.98
+0.999
+Warmup steps
+5000
+5000
+10000
+Training iterations
+780k
+500k
+500k
+Diﬀusion βT
+0.025
+0.02
+0.02
+D
+Vision Transfomer Experiments
+Arguably the most common usage of patching is in Vision Transformer architectures [6].
+We tested applying these architectures to diﬀusion models as well, but unfortunately it
+was unable to achieve the same level of performance as the U-Net [26] architecture. The
+primary cause of this was unstable training; most models trained stably up to a point, after
+which their gradient diverged (to inﬁnity in some cases). In general, divergence was only
+temporarily delayed by various stability tricks we tried. In the interest of completeness and
+potential future research, we describe our results here.
+Our initial conﬁguration trained on LSUN Church was an 11-layer ViT with 322 sequences,
+a patch size of 8, and a batch size of 128. It used time-conditional layer normalization after
+(i.e. PostNorm) each residual connection, and had linear projections of its input injected to
+it in at the 4th, 8th, and last layers (to mimic the long-range skips in the U-Net). However,
+the model’s gradient norm diverged to inﬁnity after only a few thousand iterations, even
+with a low value of β2 = 0.95 and a warmup of 10000 steps. We then employed the following
+stability tricks:
+• We moved the time-conditional LayerNorm to before the attention and feedforward
+networks (i.e. PreNorm), and employed an initial weight scaling of 1/
+p
+Nlayers com-
+pared to the default initializer. This conﬁguration also diverged quickly, but less so
+compared to the previous.
+• Instead of scaling the initial weights of the output projection, we scaled the output of
+the residual layer itself by 1/
+p
+Nlayers, which reduces the eﬀective learning rate of the
+output projection. We also switched from LayerNorm to GroupNorm. Both improved
+stability but could not stop eventual divergence.
+• To increase the model’s learning signal, we switched from x prediction to v prediction.
+To give some sense of convolutional information, we gave the model additional inputs
+that were blurred versions of its input (blurred with σ = 1, 2, 4, and 8). Again, these
+improved stability but still resulted in divergence.
+15
+
+• We reduced the learning rate from 1 × 10−4 to 5 × 10−5, and increased the warmup
+steps to 20000. This conﬁguration did not diverge, but had signiﬁcant loss spikes that
+couldn’t fully recover. We tried reducing it further to 2 × 10−5 which trained stably,
+but had unacceptably high loss.
+• We tried using time-conditional GroupNorm in the feed-forward only, using uncondi-
+tional GroupNorm before the attention. We also tried using unconditional GroupNorm
+in both, injected timestep information once in the beginning. The former still resulted
+in loss spikes; the latter did not, but had very poor performace.
+In some instances, ViT models performed comparably to a U-Net with P = 8 in the stage
+before instabilities occured.
+We believe that addressing the underlying instabilities can
+enable ViTs to reach similar or better performance compared to U-Nets.
+16
+
+E
+Samples
+Figure 6: A comparison of samples generated from our LSUN models with P = 2, 4, and 8. While
+images have proper global structure, images from the P = 8 model are sometimes blurry. We keep
+the noise seed constant and use the strided sampling schedule from [4].
+17
+
+Figure 7: Uncurated ImageNet samples from our model with P = 4 and
+classiﬁer-free guidance scale 1.5. The class labels are: goldﬁsh, arctic fox,
+monarch butterﬂy, african elephant, ﬂamingo, tennis ball, cheeseburger, foun-
+tain, balloon, tabby cat, lorikeet, agaric.
+18
+
+Figure 8: Uncurated ImageNet samples from our model with P = 4 and
+classiﬁer-free guidance scale 2.25. The class labels are: goldﬁsh, arctic fox,
+monarch butterﬂy, african elephant, ﬂamingo, tennis ball, cheeseburger, foun-
+tain, balloon, tabby cat, lorikeet, agaric.
+19
+
+Figure 9: Uncurated FFHQ samples from our model with P = 4. We used 1000 sampling
+steps for all images.
+20
+

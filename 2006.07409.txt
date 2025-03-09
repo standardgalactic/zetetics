@@ -1,0 +1,1534 @@
+How to Avoid Being Eaten by a Grue:
+Structured Exploration Strategies for Textual Worlds
+Prithviraj Ammanabrolu †
+Ethan Tien †
+Matthew Hausknecht‡
+Mark O. Riedl †
+†Georgia Institute of Technology
+‡Microsoft Research
+raj.ammanabrolu@gatech.edu
+Abstract
+Text-based games are long puzzles or quests, characterized by a sequence of sparse
+and potentially deceptive rewards. They provide an ideal platform to develop agents
+that perceive and act upon the world using a combinatorially sized natural language
+state-action space. Standard Reinforcement Learning agents are poorly equipped to
+effectively explore such spaces and often struggle to overcome bottlenecks—states
+that agents are unable to pass through simply because they do not see the right action
+sequence enough times to be sufﬁciently reinforced. We introduce Q*BERT 1, an
+agent that learns to build a knowledge graph of the world by answering questions,
+which leads to greater sample efﬁciency. To overcome bottlenecks, we further
+introduce MC!Q*BERT an agent that uses an knowledge-graph-based intrinsic
+motivation to detect bottlenecks and a novel exploration strategy to efﬁciently learn
+a chain of policy modules to overcome them. We present an ablation study and
+results demonstrating how our method outperforms the current state-of-the-art on
+nine text games, including the popular game, Zork, where, for the ﬁrst time, a
+learning agent gets past the bottleneck where the player is eaten by a Grue.
+1
+Introduction
+Text-adventure—or interaction ﬁction—games are simulations featuring language-based state and
+action spaces. An example of a one turn agent interaction in the popular text-game Zork1 [7] can
+be seen in Fig. 1. Prior works have focused on a few challenges that are inherent to this medium:
+(1) Partial observability the agent must reason about the world solely through incomplete textual
+descriptions [22, 10, 5]. (2) Commonsense reasoning to enable the agent to more intelligently interact
+with objects in its surroundings [14, 27, 2, 4]. (3) A combinatorial state-action space wherein
+most games have action spaces exceeding a billion possible actions per step; for example the game
+Zork1 has 1.64 × 1014 possible actions at every step [15, 3]. Despite these challenges, modern
+text-adventure agents such as KG-A2C [3], TDQN [15], and DRRN [16] have relied on surprisingly
+simple exploration strategies such as ϵ-greedy or sampling from the distribution of possible actions.
+In this paper, we focus on a particular type of exploration problem: that of detecting and overcoming
+bottleneck states. Most text-adventure games have relatively linear plots in which players must
+solve a sequence of puzzles to advance the story and gain score. To solve these puzzles, players
+have freedom to a explore previously unlocked areas of the game, collect clues, and acquire tools
+needed to solve the next puzzle and unlock the next portion of the game. From a Reinforcement
+Learning perspective, These puzzles can be viewed as bottlenecks that act as partitions between
+different regions of the state space. We contend that existing Reinforcement Learning agents are
+unaware of such latent structure and are thus poorly equipped for solving these types of problems.
+We present techniques for automatically detecting bottlenecks and efﬁciently learning policies that
+take advantage of the natural partitions in the state space.
+1Code can be found here https://github.com/rajammanabrolu/Q-BERT
+Preprint. Under review.
+arXiv:2006.07409v1  [cs.AI]  12 Jun 2020
+
+Observation: West of House You are standing
+in an open ﬁeld west of a white house, with a
+boarded front door. There is a small mailbox
+here.
+Action: Open mailbox
+Observation: Opening the small mailbox reveals
+a leaﬂet.
+Action: Read leaﬂet
+Observation: (Taken) "WELCOME TO ZORK!
+ZORK is a game of adventure, danger, and low
+cunning. In it you will explore some of the most
+amazing territory ever seen by mortals. No com-
+puter should be without one!"
+Action: Go north
+Observation: North of House You are facing
+the north side of a white house. There is no door
+here, and all the windows are boarded up. To the
+north a narrow path winds through the trees.
+Figure 1: Excerpt from Zork1.
+Overcoming bottlenecks is not as simple as se-
+lecting the correct action from the bottleneck
+state. Most bottlenecks have long-range depen-
+dencies that must ﬁrst be satisﬁed: Zork1 for
+instance features a bottleneck in which the agent
+must pass through the unlit Cellar where a mon-
+ster known as a Grue lurks, ready to eat unsus-
+pecting players who enter without a light source.
+To pass this bottleneck the player must have pre-
+viously acquired and lit the latern. Other bottle-
+necks don’t rely on inventory items and instead
+require the player to have satisﬁed an external
+condition such as visiting the reservoir control
+to drain water from a submerged room before
+being able to visit it. In both cases, the actions
+that fulﬁll dependencies of the bottleneck, e.g.
+acquiring the lantern or draining the room, are
+not rewarded by the game. Thus agents must
+correctly satisfy all latent dependencies, most of
+which are unrewarded, then take the right action
+from the correct location to overcome such bot-
+tlenecks. Consequently, most existing agents—
+regardless of whether they use a reduced action
+space [31, 27] or the full space [15, 3]—have
+failed to consistently clear these bottlenecks.
+To better understand how to design algorithms that pass these bottlenecks, we ﬁrst need to gain a
+sense for what they are. We observe that quests in text games—and any such sequential decision
+making problem requiring long term dependencies—can be modeled in the form of a dependency
+graph. These dependency graphs are directed acyclic graphs (DAGs) where the vertices indicate either
+rewards that can be collected or dependencies that must be met to progress. In text-adventure games
+the dependencies are of two types: items that must be collected for future use, and locations that must
+be visited. An example of such a graph for the game of Zork1 can found in Fig. 2. More formally,
+bottleneck states are vertices in the dependency graph that, when the graph is laid out topographically,
+are (a) the only state on a level, and (b) there is another state at a higher level with non-zero reward.
+Bottlenecks can be mathematically expressed as follows: let D = ⟨V, E⟩be the directed acyclic
+dependency graph for a particular game where each vertex is tuple v = ⟨sl, si, r(s)⟩containing
+information on some state s such that sl are location dependencies, si are inventory dependencies,
+and r(s) is the reward associated with the state. There is a directed edge e ∈E between any two
+vertices such that the originating state meets the requirements sl and si of the terminating vertex.
+D can be topologically sorted into levels L = {l1, ..., ln} where each level represents a set of game
+states that are not dependant on each other. We formulate the set of all bottleneck states in the game:
+B = {b : (|li| = 1, b ∈li, V ) ∧(∃s ∈lj s.t. (j > i ∧r(s) ̸= 0))}
+(1)
+This reads as the set of all states that that belong to a level with only one vertex and that there exists
+some state with a non-zero reward that depends on it. Intuitively, regardless of the path taken to get
+to a bottleneck state, any agent must pass it in order to continue collecting future rewards. Behind
+House is an example of a bottleneck state as seen in Fig. 2. The branching factor before and after this
+state is high but it is the only state through which one can enter the Kitchen through the window.
+In this paper, we introduce Q*BERT, a deep reinforcement learning agent that plays text games
+by building a knowledge graph of the world and answering questions about it. Knowledge graph
+state representations have been shown to alleviate other challenges associated with text games such
+as partial-observability [5, 28, 3, 6, 1, 21]. We introduce the Jericho-QA dataset, for question-
+answering in text-game-like environments, and show that our novel question-answering-based graph
+construction procedure improves sample efﬁciency but not asymptotic performance. In order to
+improve performance and pass through bottlenecks, we extend Q*BERT with a novel exploration
+strategy that uses intrinsic motivation based on the knowledge graph to alleviate the sparse, deceptive
+reward problem. Our exploration strategy ﬁrst detects bottlenecks and then modularly chains policies
+that go from one bottleneck to another. We call this combined system MC!Q*BERT. These two
+2
+
+Loc: West of House
+Inv: None
+Loc: Kitchen
+Inv: None
+get painting
+navigate
+Loc: Up a Tree
+Inv: Golden Egg
++5
+Loc: Forest Path
+Inv: None
+Loc: Behind House
+Inv: None
+open window
+Go in
+get lamp
+get sword
+navigate
+navigate
+navigate
+Key
+Positive Rewards
+Bottlenecks
+Loc: Troll Room
+Inv: Lamp, Sword
+Loc: Gallery
+Inv: Lamp, Sword,
+Painting
++4
+Loc: Cellar
+Inv: Lamp, Sword
++25
++10
+Figure 2: Portion of the Zork1 quest structure visualized as a directed acyclic graph. Each node
+represents a state; clouds represent areas of high branching factor with labels indicating some of the
+actions that must be performed to progress
+enhancements form the two core contributions of this paper. We evaluate Q*BERT, MC!Q*BERT,
+and ablations of both on a set of nine text games. We further compare our technique to alternative
+exploration methods such as Go Explore [12]; our full technique achieves state-of-the-art performance
+on eight out of nine games.
+2
+Related Work and Background
+We use the deﬁnition of text-adventure games as seen in Côté et al. [10] and Hausknecht et al. [15].
+These games are partially observable Markov decision processes (POMDPs), represented as a 7-tuple
+of ⟨S, T, A, Ω, O, R, γ⟩representing the set of environment states, mostly deterministic conditional
+transition probabilities between states, the vocabulary or words used to compose text commands,
+observations returned by the game, observation conditional probabilities, reward function, and the
+discount factor respectively. LSTM-DQN [22] and Action Elimination DQN [31] operate on a
+reduced action space of the order of 102 actions per step by considering either verb-noun pairs or by
+using a walkthrough of the game respectively. The agents learn how to produce Q-value estimates
+that maximize long term expected reward. The DRRN algorithm for choice-based games [16, 32]
+estimates Q-values for a particular action from a particular state. Fulda et al. [14] try to use word
+embeddings speciﬁcally in an attempt to model affordances for items in these games, learning how to
+interact with them.
+There have been a couple of works detailing potential methods of exploration in this domain. Jain et al.
+[17] extend consistent Q-learning [9] to text-games, focusing on taking into account historical context.
+In terms of exploration strategies, Yuan et al. [29] detail how counting the number of unique states
+visited improves generalization in unseen games. Côté et al. [10] introduce TextWorld, a framework
+for procedurally generating parser-based games via a grammar, allowing a user to control the difﬁculty
+of a generated game.Urbanek et al. [26] introduce LIGHT, a dataset of crowdsourced text-adventure
+game dialogs focusing on giving collaborative agents the ability to generate contextually relevant
+dialog and emotes. Hausknecht et al. [15] introduce Jericho, a framework for interacting with text-
+games, in addition to a series of baseline reinforcement learning agents. Yuan et al. [30] introduce the
+concept of interactive question-answering in the form of QAit—modeling QA tasks in TextWorld.
+Ammanabrolu and Riedl [5] introduce the KG-DQN, using knowledge graphs as states spaces for
+text-game agents and Ammanabrolu and Riedl [4] extend it to enable transfer of knowledge between
+games. Ammanabrolu and Hausknecht [3] showcase the KG-A2C, for the ﬁrst time tackling the fully
+combinatorial action space and presenting state-of-the-art results on many man-made text games.
+In a similar vein, Adhikari et al. [1] present the Graph-Aided Transformer Agent (GATA) which
+learns to construct a knowledge graph during game play and improves zero-shot generalization on
+procedurally generated TextWorld games.
+3
+Q*BERT
+This section presents the base reinforcement learning algorithm we introduce, which we call Q*BERT.
+Q*BERT is based on KG-A2C [3]; it uses a knowledge-graph to represent it’s understanding of the
+world state. A knowledge graph is a set of relations ⟨s, r, o⟩such that s is a subject, r is a relation, and
+o is an object. See Figure 3 (left) for an example fragment of a knowledge graph for a text-adventure
+game. Instead of using relation extraction rules, Q*BERT uses a variant of the BERT [11] natural
+3
+
+Behind House
+You are behind the white house. A path leads into
+the forest to the east. In one corner of the house
+there is a small window which is slightly ajar.
+You are carrying:
+A jewel-encrusted egg
+Attributes: talkable, openable, animate, treasure ...
+You
+egg
+Behind
+House
+Forest
+North of
+House
+South of
+House
+house
+window
+path
+treasure
+open-
+able
+open-
+able
+Key:
+Locations
+Surr. Obj.s
+Inv. Obj.s
+Attributes
+.  .  .
+.
+.
+.
+.
+.
+.
+.  .  .
+in
+east
+is
+is
+is
+north
+south
+has
+has
+has
+have
+Observation
+ALBERT-QA
+R-GCN
+KGt-1
+KGt
+Update
+Vt
+Recurrent
+Text Encoder
+Sequential
+Action
+Decoder
+Value
+Predictor
+Actor
+graph mask
+gt
+Value
+Action
+Critic
+Q*BERT
+Questions:
+Where am I located?
+What is here?
+What do I have? ...
+Figure 3: One-step knowledge graph extraction in the Jericho-QA format, and overall Q*BERT
+architecture at time step t. At each step the ALBERT-QA model extracts a relevant highlighted entity
+set Vt by answering questions based on the observation, which is used to update the knowledge graph.
+language transformer to answer questions about the current state text description and populate the
+knowledge graph from the answers.
+Knowledge Graph State Representation
+Ammanabrolu and Riedl [5] are the ﬁrst to use question
+answering (QA) in text-game playing to pre-train a network to answer the question of “What action
+best next to take?” using game traces from an oracle agent capable of playing a game perfectly.
+They pre-train an LSTM to predict the action based on a environment text description. We build on
+this idea but instead treat the problem of constructing the knowledge graph as a question-answering
+task. The method ﬁrst extracts a set of graph vertices V by asking a question-answering system
+relevant questions and then linking them together using a set of relations R to form a knowledge
+graph representing information the agent has learned about the world. Examples of questions include:
+“What is my current location?”, “What objects are around me?”, and ”What am I carrying?” to
+respectively extract information regarding the agent’s current location, surrounding objects, inventory
+objects. Further, we predict attributes for each object by asking the question “What attributes does x
+object have?”. An example of the knowledge graph that can be extracted from description text and
+the overall architecture are shown in Fig. 3.
+For question-answering, we use the pre-trained language model ALBERT [18], a variant of BERT [11]
+that is ﬁne-tuned for question answering on the SQuAD [23] question-answering dataset. We further
+ﬁne-tune the ALBERT model on a dataset speciﬁc to the text-game domain. This dataset, dubbed
+Jericho-QA, was created by making question answering pairs about text-games. Jericho [15]2 is a
+framework for reinforcement learning in text-games. Using Jericho we construct a question-answering
+corpus for ﬁne-tuning ALBERT as follows. For each game in Jericho, we use an oracle—an agent
+capable of playing the game perfectly—and a random exploration agent to gather ground truth
+state information about locations, objects, and attributes. These agents are designed to extract this
+information directly from the game engine, which is otherwise off-limits when Q*BERT is trained.
+From this ground truth, we construct pairs of questions in the form that Q*BERT will ask as it
+encounters environment description text, and the corresponding answers. These question-answer
+pairs are used to ﬁne-tune the Q/A model and the ground truth data is discarded. No data from games
+we test on is used during ALBERT ﬁne-tuning. Additional details regarding Jericho-QA, graph
+update rules, and Q*BERT can be found in Appendix A.1.
+In a text-game the observation is a textual description of the environment. For every observation
+received, Q*BERT produces a ﬁxed set of questions. The questions and the observation text are sent
+to the question-answering system. Predicted answers are converted into ⟨s, r, o⟩triples and added to
+2https://github.com/microsoft/jericho
+4
+
+the knowledge graph. The complete knowledge graph is the input into Q*BERT’s neural architecture
+(training described below), which makes a prediction of the next action to take.
+Action Space
+Solving Zork1, the cannonical text-adventure game, requires the generation of actions
+consisting of up to ﬁve-words from a relatively modest vocabulary of 697 words recognized by the
+game’s parser. This results in O(6975) = 1.64 × 1014 possible actions at every step. Hausknecht et al.
+[15] propose a template-based action space in which the agent ﬁrst selects a template, consisting of
+an action verb and preposition, and then ﬁlling that in with relevant entities (e.g. [get]
+[from]
+).
+Zork1 has 237 templates, each with up to two blanks, yielding a template-action space of size
+O(237 × 6972) = 1.15 × 108. This space is still far larger than most used by previous approaches
+applying reinforcement learning to text-based games. We use this template action space for all games.
+Training
+At every step an observation consisting of several components is received: ot =
+(otdesc, otgame, otinv, at−1) corresponding to the room description, game feedback, inventory, and
+previous action, and total score Rt. The room description otdesc is a textual description of the agent’s
+location, obtained by executing the command “look”. The game feedback otgame is the simulators
+response to the agent’s previous action and consists of narrative and ﬂavor text. The inventory otinv
+and previous action at−1 components inform the agent about the contents of its inventory and the last
+action taken respectively.
+Each of these components is processed using a GRU based encoder utilizing the hidden state from
+the previous step and combined to have a single observation embedding ot. At each step, we update
+our knowledge graph Gt using ot as described in earlier in Section 3 and it is then embedded into a
+single vector gt. This encoding is based on the R-GCN and is calculated as:
+gt = f
+
+Wgσ
+
+X
+r∈R
+X
+j∈Nir
+1
+ci,r
+Wr
+(l)hj
+(l) + W0
+(l)hi
+(l)
+
++ bg
+
+
+(2)
+Where R is the set of relations, Ni
+r is the 1-step neighborhood of a vertex i with respect to relation
+r, Wr
+(l) and hj
+(l) are the learnable convolutional ﬁlter weights with respect to relation r and hidden
+state of a vertex j in the last layer l of the R-GCN respectively, ci,r is a normalization constant, and
+Wg and bg the weights and biases of the output linear layer. The full architecture can be found
+in Fig. 3. The state representation consists only of the textual observations and knowledge graph.
+Another key use of the knowledge graph, introduced as part of KG-A2C, is the graph mask, which
+restricts the possible set of entities that can be predicted to ﬁll into the action templates at every step
+to those found in the agent’s knowledge graph. The rest of the training methodology is unchanged
+from Ammanabrolu and Hausknecht [3], more details can be found in Appendix A.1.
+4
+Structured Exploration
+This section describes an exploration method built on top of Q*BERT that ﬁrst detects bottlenecks
+and then searches for ways to pass them, learning policies that take it from bottleneck to bottleneck.
+This method of chaining policies and backtracking can be thought of in terms of options [24, 25],
+where the agent decomposes the task of solving the text game into the sub-tasks, each of which has
+it’s own policy. In our case, each sub-task delivers the agent to a bottleneck state.
+4.1
+Bottleneck Detection using Intrinsic Motivation
+Examples of some bottlenecks can be seen in Figure 2 based on our deﬁnition of a bottleneck in Eq. 1.
+Inspired by McGovern and Barto [20], we present an intuitive way of detecting these bottleneck
+states—or sub-tasks—in terms of whether or not the agent’s ability to collect reward stagnates. If
+the agent does not collect a new reward for a number of environment interactions—deﬁned in terms
+of a patience parameter—then it is possible that it is stuck due to a bottleneck state. An issue with
+this method, however, is that the placement of rewards does not always correspond to an agent being
+stuck. Complicating matters, rewards are sparse and often delayed; the agent not collecting a reward
+for a while might simply indicate that further exploration is required instead of truly being stuck.
+To alleviate these issues, we deﬁne an intrinsic motivation for the agent that leverages the knowledge
+graph being built during exploration. The motivation is for the agent to learn more information
+5
+
+regarding the world and expand the size of its knowledge graph. This provides us with a better
+indication of whether an agent is stuck or not—a stuck agent does not visit any new states, learns no
+new information about the world, and therefore does not expand its knowledge graph—leading to
+more effective bottleneck detection overall. To prevent the agent from discovering reward loops based
+on knowledge graph changes, we formally deﬁne this reward in terms of new information learned.
+rIMt = ∆(KGglobal −KGt) where KGglobal =
+t−1
+[
+i=1
+KGi
+(3)
+Here KGglobal is the set of all edges that the agent has ever had in its knowledge graph and the
+subtraction operator is a set difference. When the agent adds new edges to the graph perhaps as a
+the result of ﬁnding a new room KGglobal changes and a positive reward is generated—this does not
+happen when that room is rediscovered in subsequent episodes. This is then scaled by the game score
+so the intrinsic motivation does not drown out the actual quest rewards, the overall reward the agent
+receives at time step t looks like this:
+rt = rgt + αrIMt
+rgt + ϵ
+rmax
+(4)
+Algorithm 1 Structured Exploration
+{πchain, πb, π} ←φ
+▷Chained, backtrack, current policy
+{Sb, S} ←φ
+▷Backtrack, current state buffers
+s0, rinit ←ENV.RESET()
+Jmax ←rinit, p ←0
+for timestep t in 0...M do
+▷Train for M Steps
+st+1, rt, π ←Q*BERTUPDATE(st, π)
+S ←S + st+1
+▷Append current state to state buffer
+p ←p + 1
+▷Lose patience
+if J (π) ≤Jmax then
+if p >= patience then
+▷Stuck at a bottleneck
+st, rmax, π ←BACKTRACK(πb, Sb)
+▷Bottleneck passed; Add π to the chained policy
+πchain ←πchain + π
+if J (π) > Jmax then
+▷New highscore found
+Jmax ←J (π); πb ←π; Sb ←S; p ←0
+return πchain
+▷Chained policy that reaches max score
+function Q*BERTUPDATE(st, π)
+▷One-step update
+st+1, rgt ←ENV.STEP(st, π)
+▷Section 3
+rt ←CALCULATEREWARD(st+1, rgt)
+▷Eq. 4
+π ←A2C.UPDATE(π, rt)
+▷Appendix A.1
+return st+1, rt, π
+function BACKTRACK(πb, Sb)
+▷Try to overcome bottleneck
+for b in REVERSE(Sb) do
+▷States leading to highscore
+s0 ←b; π ←φ
+for timestep t in 0...N do
+▷Train for N steps
+st+1, rt, π ←Q*BERTUPDATE(st, π)
+if J (π) > J (πb) then return st, rt, π
+Terminate
+▷Can’t ﬁnd better score; Give up.
+where ϵ is a small smoothing factor,
+α is a scaling factor, rgt is the game
+reward, rmax is the maximum score
+possible for that game, and rt is the
+reward received by the agent on time
+step t.
+4.2
+Modular Policy Chaining
+A primary reason that agents fail to
+pass bottlenecks is not satisfying all
+the required dependencies. To solve
+this problem, we introduce a method
+of policy chaining, where the agent
+utilizes the determinism of the simula-
+tor to backtrack to previously visited
+states in order to fulﬁll dependencies
+required to overcome a bottleneck.
+Speciﬁcally, Algorithm 1 optimizes
+the policy π as usual, but also keeps
+track of a buffer S of the distinct states
+and knowledge graphs that led up to
+each state (we use state st to collo-
+quially refer to the combination of an
+observation ot and knowledge graph
+KGt). Similarly, a bottleneck buffer
+Sb and policy πb reﬂect the sequence
+of states and policy with the maximal
+return Jmax. A bottleneck is identiﬁed
+when the agents fails to improve upon
+Jmax after patience number of steps, i.e. no improvement in raw game score or knowledge-graph-
+based intrinsic motivation reward. The agent then backtracks by searching backwards through the
+state sequence Sb, restarting from each of the previous states—and training for N steps in search of
+a more optimal policy to overcome the bottleneck. When such a policy is found, it is appended to
+modular policy chain πchain. Conversely, if no such policy is found, then we have failed to pass the
+current bottleneck and the training terminates.
+5
+Evaluation
+We ﬁrst evaluate the quality of the knowledge graph construction in a supervised setting. Next we
+perform and end-to-end evaluation in which knowledge graph construction is used by Q*BERT.
+6
+
+Expt.
+Jericho-QA
+KG-A2C
+Q*BERT
+MC!Q*BERT
+GO!Q*BERT
+Game Reward
+✓
+✓
+✓
+✓
+✓
+Intrinsic Motive
+✓
+✓
+Metric
+EM
+F1
+Eps.
+Max
+Eps.
+Max
+Max
+Max
+Max
+zork1
+40.01
+44.62
+34
+35
+33.6
+35
+32
+41.6
+31
+library
+36.76
+46.45
+14.3
+19
+10.0
+18
+19
+19
+18
+detective
+60.28
+63.21
+207.9
+214
+246.1
+274
+320
+330
+304
+balances
+55.26
+56.49
+10
+10
+9.8
+10
+10
+10
+10
+pentari
+63.89
+68.37
+50.7
+56
+48.2
+56
+56
+58
+40
+ztuu
+28.71
+29.76
+6
+9
+5
+5
+5
+11.8
+5
+ludicorp
+52.32
+59.95
+17.8
+19
+17.6
+19
+19
+22.8
+20.6
+deephome
+8.03
+9.27
+1
+1
+1
+1
+8
+6
+1
+temple
+48.92
+49.17
+7.6
+8
+7.9
+8
+8
+8
+8
+Table 1: QA results on Jericho-QA test set and averaged asymptotic scores on games by different
+methods across 5 independent runs. For KG-A2C and Q*BERT, we present scores averaged across
+the ﬁnal 100 episodes as well as max scores. Methods using exploration strategies show only max
+scores given their workings. Agents are allowed 106 steps for each parallel A2C agent with a batch
+size of 16.
+0
+20000
+40000
+60000
+80000
+100000
+0
+5
+10
+15
+20
+25
+30
+35
+40
+zork1
+Q*BERT
+KG-A2C
+(a) Episode reward curves for KG-A2C and Q*BERT.
+0
+10000
+20000
+30000
+40000
+50000
+0
+10
+20
+30
+40
+Kitchen
+Egg
+Cellar
+Cellar+Egg
+Painting
+Kitchen
+Egg
+Cellar
+zork1
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+(b) Max reward curves for exploration strategies.
+Figure 4: Select ablation results on Zork1 conducted across 5 independent runs per experiment. We
+see where the agents using structured exploration pass each bottleneck seen in Fig. 2. Q*BERT
+without IM is unable to detect nor surpass bottlenecks beyond the Cellar.
+5.1
+Graph Extraction Evaluation
+Table 1 left shows QA performance on the Jericho-QA dataset. Exact match (EM) refers to the
+percentage of times the model was able to predict the exact answer string, while F1 measures token
+overlap between prediction and ground truth. We observe a direct correlation between the quality of
+the extracted graph and Q*BERT’s performance on the games. On games where Q*BERT performed
+comparatively better than KG-A2C in terms of asymptotic scores, e.g. detective, the QA model
+had relatively high EM and F1, and vice versa as seen with ztuu. In general, however, Q*BERT
+reaches comparable asymptotic performance to KG-A2C on 7 out of 9 games. However, as shown in
+Figure 4a, Q*BERT reaches asymptotic performance faster than KG-A2C, indicating that the QA
+model leads to faster learning. Appendix B contains more plots illustrating this trend. Both agents rely
+on the graph to constrain the action space and provide a richer input state representation. Q*BERT
+uses a QA model ﬁne-tuned on regularities of a text-game producing more relevant knowledge graphs
+than those extracted by OpenIE [8] in KG-A2C for this purpose.
+5.2
+Intrinsic Motivation and Exploration Strategy Evaluation
+We evaluate intrinsic motivation through policy chaining, dubbed MC!Q*BERT (Modularly Chained
+Q*BERT) by ﬁrst testing policy chaining with only game reward and with both game reward and
+intrinsic motivation. We provide a qualitative analysis of the bottlenecks detected with both methods
+with respect to those found in Fig. 2 on Zork1. Just as KG-A2C provided us with a direct comparison
+for assessing the graph extraction abilities of Q*BERT, we test MC!Q*BERT’s structured exploration
+against an alternative exploration method in the form of Go-Explore [12], an algorithm with similar
+properties to our policy module chaining and has been show to work well for large, discrete game
+7
+
+state spaces. Further, MC!Q*BERT using both game reward and intrinsic motivation matches or
+outperforms all other methods on 8 out of 9 games, with MC!Q*BERT using only game reward
+received the highest score on the 9th game, deephome.
+GO!Q*BERT Go-Explore [12] is an algorithm designed to keep track of sub-optimal and under-
+explored states in order to allow the agent to explore upon more optimal states that may be a result of
+sparse rewards. The Go-Explore algorithm consists of two phases, the ﬁrst to continuously explore
+until a set of promising states and corresponding trajectories are found on the basis of total score, and
+the second to robustify this found policy against potential stochasticity in the game. Promising states
+are deﬁned as those states when explored from will likely result in higher reward trajectories. Madotto
+et al. [19] look at applying Go-Explore to text-games on a set of simpler games generated using the
+game generation framework TextWorld [10]. They use a small set of “admissible actions”—actions
+guaranteed to change the world state at any given step during Phase 1—to explore and ﬁnd high
+reward trajectories. We adapt this, instead training Q*BERT in parallel to generate actions from
+the full action space used for exploration to maintain a constant action space size across all models.
+Implementation details are found in Appendix A.3.
+6
+Analysis
+Table 1 shows that across all the games MC!Q*BERT matches or outperforms the current state-of-the-
+art when compared across the metric of the max score consistently received across runs. There are two
+main trends: First, MC!Q*BERT greatly beneﬁts from the inclusion of intrinsic motivation rewards.
+Qualitative analysis of bottlenecks detected by each agent on the game of Zork1 reveals differences
+in the overall accuracy of the bottleneck detection between MC!Q*BERT with and without intrinsic
+motivation. Figure 4b shows exactly when each of these agents detects and subsequently overcomes
+the bottlenecks outlined in Figure 2. What we see here is that when the intrinsic motivation is not
+used, the agent discovers that it can get to the Kitchen with a score of +10 and then Cellar with a
+score of +25 immediately after. It forgets how to get the Egg with a smaller score of +5 and never
+makes it past the Grue in the Cellar. Intrinsic motivation prevents this in two ways: (1) it makes it
+less focused on a locally high-reward trajectory—making it less greedy and helping it chain together
+rewards for the Egg and Cellar, and (2) provides rewards for fulﬁlling dependencies that would
+otherwise not be rewarded by the game—this is seen by the fact that it learns that picking up the
+lamp is the right way to surpass the Cellar bottleneck and reach the Painting. A similar behavior
+is observed with GO!Q*BERT, the agent settles pre-maturely on a locally high-reward trajectory
+and thus never has incentive to ﬁnd more globally optimal trajectories by fulﬁlling the underlying
+dependency graph. Here, the likely cause is due to GO!Q*BERT’s inability to backtrack and rethink
+discovered high reward trajectories.
+The second point is that using both the improvements to graph construction in addition to intrinsic
+motivation and structured exploration consistently yields higher max scores across a majority of the
+games when compared to the rest of the methods. Having just the improvements to graph building
+or structured exploration by themselves is not enough. Thus we infer that the full MC!Q*BERT
+agent is fundamentally exploring this combinatorially-sized space more effectively by virtue of being
+able to more consistently detect and clear bottlenecks. The improvement over systems using default
+exploration such as KG-A2C or Q*BERT by itself indicates that structured exploration is necessary
+when dealing with sparse and ill-placed reward functions.
+7
+Conclusions
+Modern deep reinforcement learning agents using default exploration strategies such as ϵ-greedy are
+ill-equipped to deal with the challenge of sparse and delayed rewards, especially when placed in a
+combinatorially-sized state-action space. Building on top of Q*BERT, an agent that constructs a
+knowledge graph of the world by asking questions about it, we introduce MC!Q*BERT, an agent that
+uses this graph as an intrinsic motivation to help detect bottlenecks arising from delayed rewards and
+chains policies that go from bottleneck to bottleneck. A key insight from an ablation study is that
+the graph-based intrinsic motivation is crucial for bottleneck detection, preventing the agent from
+falling into locally optimal high reward trajectories due to ill-placed rewards. Policy chaining used
+in tandem with intrinsic motivation results in agents that explore further in the game by clearing
+bottlenecks more consistently.
+8
+
+8
+Broader Impacts
+The ability to plan for long-term state dependencies in partially-observable environment has down-
+stream applications beyond playing games. We see text games as simpliﬁed analogues for systems
+capable of long-term dialogue with humans, such as in assistance with planning complex tasks,
+and also discrete planning domains such as logistics. Broadly speaking, reinforcement learning is
+applicable to many sequential tasks, some of which cannot be anticipated. Reinforcement learning for
+text environments are more suited for domains in which change in the world is affected via language,
+which mitigates physical risks—our line of work is not directly relevant to robotics—but not cognitive
+and emotional risks, as any system capable of generating natural language is capable of accidental or
+intentional non-normative language use [13].
+References
+[1] A. Adhikari, X. Yuan, M.-A. Côté, M. Zelinka, M.-A. Rondeau, R. Laroche, P. Poupart, J. Tang,
+A. Trischler, and W. L. Hamilton. Learning dynamic knowledge graphs to generalize on
+text-based games. arXiv preprint arXiv:2002.09127, 2020.
+[2] L. Adolphs and T. Hofmann. Ledeepchef: Deep reinforcement learning agent for families of
+text-based games. arXiv preprint arXiv:1909.01646, 2019.
+[3] P. Ammanabrolu and M. Hausknecht. Graph constrained reinforcement learning for natural
+language action spaces. In International Conference on Learning Representations, 2020. URL
+https://openreview.net/forum?id=B1x6w0EtwH.
+[4] P. Ammanabrolu and M. Riedl. Transfer in deep reinforcement learning using knowledge
+graphs. In Proceedings of the Thirteenth Workshop on Graph-Based Methods for Natural
+Language Processing (TextGraphs-13) at EMNLP, 2019. URL https://www.aclweb.org/
+anthology/D19-5301.
+[5] P. Ammanabrolu and M. O. Riedl. Playing text-adventure games with graph-based deep
+reinforcement learning. In Proceedings of 2019 Annual Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language Technologies,
+NAACL-HLT 2019, 2019.
+[6] P. Ammanabrolu, W. Cheung, D. Tu, W. Broniec, and M. O. Riedl. Bringing stories alive:
+Generating interactive ﬁction worlds. In 1st Joint Workshop on Narrative Understanding,
+Storylines, and Events (NUSE) at ACL, 2020. URL https://arxiv.org/abs/2001.10161.
+[7] T. Anderson, M. Blank, B. Daniels, and D. Lebling.
+Zork.
+http://ifdb.tads.org/
+viewgame?id=4gxk83ja4twckm6j, 1979.
+[8] G. Angeli, J. Premkumar, M. Jose, and C. D. Manning. Leveraging Linguistic Structure
+For Open Domain Information Extraction. In Proceedings of the 53rd Annual Meeting of
+the Association for Computational Linguistics and the 7th International Joint Conference on
+Natural Language Processing (Volume 1: Long Papers), 2015.
+[9] M. G. Bellemare, G. Ostrovski, A. Guez, P. Thomas, and R. Munos.
+Increasing the ac-
+tion gap: New operators for reinforcement learning. In AAAI Conference on Artiﬁcial In-
+telligence, 2016. URL https://www.aaai.org/ocs/index.php/AAAI/AAAI16/paper/
+view/12428/11761.
+[10] M.-A. Côté, A. Kádár, X. Yuan, B. Kybartas, T. Barnes, E. Fine, J. Moore, M. Hausknecht, L. E.
+Asri, M. Adada, W. Tay, and A. Trischler. Textworld: A learning environment for text-based
+games. CoRR, abs/1806.11532, 2018.
+[11] J. Devlin, M. Chang, K. Lee, and K. Toutanova. BERT: pre-training of deep bidirectional
+transformers for language understanding. CoRR, abs/1810.04805, 2018.
+[12] A. Ecoffet, J. Huizinga, J. Lehman, K. O. Stanley, and J. Clune. Go-explore: a new approach
+for hard-exploration problems. CoRR, abs/1901.10995, 2019.
+[13] S. Frazier, M. O. Al Nahian, Md Sultan Riedl, and B. Harrison. Learning norms from stories: A
+prior for value aligned agents. CoRR, abs/1912.03553, 2019.
+[14] N. Fulda, D. Ricks, B. Murdoch, and D. Wingate. What can you do with a rock? affordance
+extraction via word embeddings. In IJCAI, pages 1039–1045, 2017. doi: 10.24963/ijcai.2017/
+144.
+9
+
+[15] M. Hausknecht, P. Ammanabrolu, M.-A. Côté, and X. Yuan. Interactive ﬁction games: A
+colossal adventure. In Thirty-Fourth AAAI Conference on Artiﬁcial Intelligence (AAAI), 2020.
+URL https://arxiv.org/abs/1909.05398.
+[16] J. He, J. Chen, X. He, J. Gao, L. Li, L. Deng, and M. Ostendorf. Deep reinforcement learning
+with a natural language action space. In ACL, 2016.
+[17] V. Jain, W. Fedus, H. Larochelle, D. Precup, and M. G. Bellemare. Algorithmic improvements
+for deep reinforcement learning applied to interactive ﬁction. CoRR, abs/1911.12511, 2019.
+[18] Z. Lan, M. Chen, S. Goodman, K. Gimpel, P. Sharma, and R. Soricut. Albert: A lite bert for
+self-supervised learning of language representations. In International Conference on Learning
+Representations, 2020. URL https://openreview.net/forum?id=H1eA7AEtvS.
+[19] A. Madotto, M. Namazifar, J. Huizinga, P. Molino, A. Ecoffet, H. Zheng, A. Papangelis, D. Yu,
+C. Khatri, and G. Tur. Exploration based language learning for text-based games. CoRR,
+abs/2001.08868, 2020.
+[20] A. McGovern and A. G. Barto. Automatic discovery of subgoals in reinforcement learning
+using diverse density. 2001.
+[21] K. Murugesan, M. Atzeni, P. Shukla, M. Sachan, P. Kapanipathi, and K. Talamadupula. Enhanc-
+ing text-based reinforcement learning agents with commonsense knowledge. arXiv preprint
+arXiv:2005.00811, 2020.
+[22] K. Narasimhan, T. D. Kulkarni, and R. Barzilay. Language understanding for text-based games
+using deep reinforcement learning. In EMNLP, pages 1–11, 2015.
+[23] P. Rajpurkar, J. Zhang, K. Lopyrev, and P. Liang. SQuAD: 100,000+ questions for machine
+comprehension of text. In Proceedings of the 2016 Conference on Empirical Methods in
+Natural Language Processing, pages 2383–2392, Austin, Texas, Nov. 2016. Association for
+Computational Linguistics. doi: 10.18653/v1/D16-1264. URL https://www.aclweb.org/
+anthology/D16-1264.
+[24] M. Stolle and D. Precup. Learning options in reinforcement learning. In Proceedings of the 5th
+International Symposium on Abstraction, Reformulation and Approximation, page 212–223,
+Berlin, Heidelberg, 2002. Springer-Verlag. ISBN 3540439412.
+[25] R. S. Sutton, D. Precup, and S. Singh. Between mdps and semi-mdps: A framework for temporal
+abstraction in reinforcement learning. Artiﬁcial intelligence, 112(1-2):181–211, 1999.
+[26] J. Urbanek, A. Fan, S. Karamcheti, S. Jain, S. Humeau, E. Dinan, T. Rocktäschel, D. Kiela,
+A. Szlam, and J. Weston. Learning to speak and act in a fantasy text adventure game. CoRR,
+abs/1903.03094, 2019.
+[27] X. Yin and J. May. Comprehensible context-driven text game playing. CoRR, abs/1905.02265,
+2019.
+[28] X. Yin and J. May. Learn how to cook a new recipe in a new house: Using map familiarization,
+curriculum learning, and common sense to learn families of text-based adventure games. arXiv
+preprint arXiv:1908.04777, 2019.
+[29] X. Yuan, M. Côté, A. Sordoni, R. Laroche, R. T. des Combes, M. J. Hausknecht, and A. Trischler.
+Counting to explore and generalize in text-based games. CoRR, abs/1806.11525, 2018.
+[30] X. Yuan, M.-A. Côté, J. Fu, Z. Lin, C. Pal, Y. Bengio, and A. Trischler. Interactive language
+learning by question answering. In EMNLP, 2019.
+[31] T. Zahavy, M. Haroush, N. Merlis, D. J. Mankowitz, and S. Mannor. Learn what not to learn:
+Action elimination with deep reinforcement learning. In S. Bengio, H. Wallach, H. Larochelle,
+K. Grauman, N. Cesa-Bianchi, and R. Garnett, editors, Advances in Neural Information Pro-
+cessing Systems 31, pages 3562–3573. Curran Associates, Inc., 2018.
+[32] M. Zelinka. Using reinforcement learning to learn how to play text-based games. CoRR,
+abs/1801.01999, 2018.
+10
+
+A
+Implementation Details
+We would like to preface the appendix with a discussion on the relative differences in the assumptions
+that Q*BERT and MC!Q*BERT make regarding the underlying environment. Although both are
+framed as POMDPs, MC!Q*BERT makes stronger assumptions regarding the determinism of the
+game as compared to Q*BERT. MC!Q*BERT (and GO!Q*BERT) rely on the fact that the set of
+transition probabilities in a text-game are mostly deterministic. Using this, they are able to assume
+that frozen policies can be executed deterministically, i.e. with no signiﬁcant deviations from the
+original trajectory. It is possible to robustify such policies by extending our method of structured
+exploration to perhaps perform imitation learning on the found highest score trajectories as seen
+in Phase 2 of the original GoExplore algorithm [12]. Stochasticity is not among set of challenges
+tackled in this work, however—we focus on learning how to better explore combinatorially-sized
+spaces with underlying long-term dependencies. For future works in this space, we believe that agents
+should be compared based on the set of assumptions made: agents like KG-A2C and Q*BERT when
+operating under standard reinforcement learning assumptions, and MC!Q*BERT and GO!Q*BERT
+when under the stronger assumption of having a deterministic simulator.
+A.1
+Q*BERT
+This section outlines how Q*BERT is trained, including details of the Jericho-QA dataset, the overall
+architecture, A2C training and hyperparameter details.
+A.1.1
+Jericho-QA Dataset
+Jericho-QA contains 221453 Question-Answer pairs in the training set and 56667 pairs in the held
+out test set. The test set consists of all the games that we test on in this paper. It is collected by
+randomly exploring games using a set of admissible actions in addition to using the walkthroughs for
+each game as found in the Jericho framework [15]. The set of attributes for a game is taken directly
+from the game engine and is deﬁned by the game developer.
+A single sample looks like this:
+Context:
+[loc] Chief’s Office
+You are standing in the chief’s office. He is telling you, "The mayor was murdered yeaterday night at
+12:03 am. I want you to solve it before we get any bad publicity or the FBI has to come in." "Yessir!" you reply. He
+hands you a sheet of paper. once you have read it, go north or west. You can see a piece of white paper here.
+[inv] You are carrying nothing.
+[obs] [your score has just gone up by ten points.]
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area , little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+Question: Where am I located? Answer: chief’s office
+Question: What is here? Answer: paper, west
+Question: What do I have? Answer: nothing
+Question: What attributes does paper have? Answer: legible, animate
+Question: What attributes does west have? Answer: room, animate
+11
+
+A.1.2
+Knowledge Graph Update Rules
+Every step, given the current state and possible attributes as context—the QA network predicts the
+current room location, the set of all inventory objects, the set of all surrounding objects, and all
+attributes for each object.
+• Linking the current room type (e.g. “Kitchen”, “Cellar”) to the items found in the room with
+the relation “has”, e.g. ⟨kitchen, has, lamp⟩
+• All attribute information for each object is linked to the object with the relation “is”. e.g.
+⟨egg, is, treasure⟩
+• Linking
+all
+inventory
+objects
+with
+relation
+“have”
+to
+the
+“you”
+node,
+e.g.
+⟨you, have, sword⟩
+• Linking rooms with directions based on the action taken to move between the rooms, e.g.
+⟨Behind House, east of, Forest⟩after the action “go east” is taken to go from behind the
+house to the forest
+Below is an excerpt from Zork1 showing the exact observations given to the Q*BERT,the knowledge
+graph, and the corresponding action taken by the agent after the graph extraction and update process
+has occurred as described above for a trajectory consisting of 5 timesteps. These timesteps begin
+at the start of the game in West of House and continue till the agent has entered the Kitchen as seen
+in Fig. 2 and Fig. 7. The set of ⟨s, r, o⟩triples that make up the graph are in the text and the ﬁgure
+shows a partial visualization of the graph at that particular step in the trajectory.
+is
+in
+is
+in
+in
+is
+door
+animate
+west
+you
+mailbox
+[loc] West of House You are standing in an open field west of a white house, with a boarded front door. There is a small
+mailbox here. [inv] You are empty handed.
+[obs] Copyright c 1981, 1982, 1983 Infocom, Inc. All rights reserved. ZORK is a registered trademark of Infocom, Inc.
+Revision 88 / Serial number 840726 West of House You are standing in an open field west of a white house, with a
+boarded front door. There is a small mailbox here.
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area, little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+[graph] [(you, in, west), (door, is, animate), (door, in, west), (west, is, animate), (mailbox, in, west), (mailbox, is,
+animate)]
+[next act] go north
+12
+
+north
+in
+in
+is
+is
+in
+in
+is
+north_of_house
+west
+you
+windows
+window
+animate
+north
+path
+trees
+[loc] North of House You are facing the north side of a white house. There is no door here, and all the windows are boarded
+up. To the north a narrow path winds through the trees.
+[inv] You are empty handed.
+[obs] North of House You are facing the north side of a white house. There is no door here, and all the windows are boarded
+up. To the north a narrow path winds through the trees.
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area, little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+[graph] [(north_of_house, north, west), (you, in, north_of_house), (door, is, animate), (door, in, west), (west, is, animate
+), (west, in, west), (mailbox, in, west), (mailbox, is, animate), (windows, in, north_of_house), (windows, is, animate
+), (north, is, animate), (north, in, north_of_house), (path, is, animate), (path, in, north_of_house), (trees, in,
+north_of_house), (trees, is, animate)]
+[next act] go east
+north
+east
+in
+in
+is
+is
+north_of_house
+west
+behind_house
+you
+window
+animate
+forest
+[loc] Behind House You are behind the white house. A path leads into the forest to the east. In one corner of the house
+there is a small window which is slightly ajar.
+[inv] You are empty handed.
+[obs] Behind House You are behind the white house. A path leads into the forest to the east. In one corner of the house
+there is a small window which is slightly ajar.
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area, little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+[graph] [(north_of_house, north, west), (behind_house, east, north_of_house), (you, in, behind_house), (door, is, animate),
+(door, in, west), (west, is, animate), (west, in, west), (you, in, behind_house), (mailbox, in, west), (mailbox, is,
+animate), (windows, in, north_of_house), (windows, is, animate), (north, is, animate), (north, in, north_of_house), (
+path, is, animate), (path, in, north_of_house), (trees, in, north_of_house), (trees, is, animate), (window, in,
+behind_house), (window, is, animate), (forest, in, behind_house), (forest, is, animate), (east, in, behind_house), (
+east, is, animate)]
+[next act] open window
+13
+
+north
+east
+in
+is
+in
+in
+north_of_house
+west
+behind_house
+you
+window
+open
+path
+[loc] Behind House You are behind the white house. A path leads into the forest to the east. In one corner of the house
+there is a small window which is open. [inv] You are empty handed.
+[obs] With great effort, you open the window far enough to allow entry.
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area, little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+[graph] [(north_of_house, north, west), (behind_house, east, north_of_house), (you, in, behind_house), (door, is, animate),
+(door, in, west), (west, is, animate), (west, in, west), (mailbox, in, west), (mailbox, is, animate), (windows, in,
+north_of_house), (windows, is, animate), (windows, is, open), (north, is, animate), (north, in, north_of_house), (path
+, is, animate), (path, in, north_of_house), (trees, in, north_of_house), (trees, is, animate), (window, in,
+behind_house), (window, is, animate), (forest, in, behind_house), (forest, is, animate), (east, in, behind_house), (
+east, is, animate)]
+north
+east
+in
+in
+in
+in
+in
+north_of_house
+west
+behind_house
+kitchen
+you
+window
+table
+bottle
+[loc] Kitchen You are in the kitchen of the white house. A table seems to have been used recently for the preparation of
+food. A passage leads to the west and a dark staircase can be seen leading upward. A dark chimney leads down and to
+the east is a small window which is open. On the table is an elongated brown sack, smelling of hot peppers. A bottle
+is sitting on the table. The glass bottle contains: A quantity of water
+[inv] You are empty handed.
+[obs] Kitchen You are in the kitchen of the white house. A table seems to have been used recently for the preparation of
+food. A passage leads to the west and a dark staircase can be seen leading upward. A dark chimney leads down and to
+the east is a small window which is open. On the table is an elongated brown sack, smelling of hot peppers. A bottle
+is sitting on the table. The glass bottle contains: A quantity of water
+[atr] talkable, seen, lieable, enterable, nodwarf, indoors, visited, handed, lockable, surface, thing, water_room, unlock,
+lost, afflicted, is_treasure, converse, mentioned, male, npcworn, no_article, relevant, scored, queryable, town,
+pluggable, happy, is_followable, legible, multitude, burning, room, clothing, underneath, ward_area, little, intact,
+animate, bled_in, supporter, readable, openable, near, nonlocal, door, plugged, sittable, toolbit, vehicle, light,
+lens_searchable, open, familiar, is_scroll, aimable, takeable, static, unique, concealed, vowelstart, alcoholic,
+bodypart, general, is_spell, full, dry_land, pushable, known, proper, inside, clean, ambiguously_plural, container,
+edible, treasure, can_plug, weapon, is_arrow, insubstantial, pluralname, transparent, is_coin, air_room, scenery, on,
+is_spell_book, burnt, burnable, auto_searched, locked, switchable, absent, rockable, beenunlocked, progressing,
+severed, worn, windy, stone, random, neuter, legible, female, asleep, wiped
+[graph] [(north_of_house, north, west), (behind_house, east, north_of_house), (behind_house, in, kitchen), (you, in, kitchen
+), (door, is, animate), (door, in, west), (west, is, animate), (west, in, west), (west, in, kitchen), (mailbox, in,
+west), (mailbox, is, animate), (windows, in, north_of_house), (windows, is, animate), (north, is, animate), (north, in
+, north_of_house), (path, is, animate), (path, in, north_of_house), (trees, in, north_of_house), (trees, is, animate),
+(window, in, behind_house), (window, is, animate), (forest, in, behind_house), (forest, is, animate), (east, in,
+behind_house), (east, is, animate), (table, in, kitchen), (table, is, animate)]]
+[next act] go in
+14
+
+A.1.3
+Architecture
+Further details of what is found in Figure 3. The sequential action decoder consists two GRUs
+that are linked together as seen in Ammanabrolu and Hausknecht [3]. The ﬁrst GRU decodes an
+action template and the second decodes objects that can be ﬁlled into the template. These objects
+are constrained by a graph mask, i.e. the decoder is only allowed to select entities that are already
+present in the knowledge graph.
+The question answering network based on ALBERT [18] has the following hyperparameters, taken
+from the original paper and known to work well on the SQuAD [23] dataset. No further hyperparam-
+eter tuning was conducted.
+Parameters
+Value
+batch size
+8
+learning rate
+3 × 10−5
+max seq len
+512
+doc stride
+128
+warmup steps
+814
+max steps
+8144
+gradient accumulation steps
+24
+A.1.4
+A2C Training
+The rest of the A2C training is unchanged from Ammanabrolu and Hausknecht [3]. A2C training
+starts with calculating the advantage of taking an action in a state A(st, at), deﬁned as the value of
+taking an action Q(st, at) compared to the average value of taking all possible admissible actions in
+that state V (st):
+A(st, at) = Q(st, at) −V (st)
+(5)
+Q(st, at) = E[rt + γV (st+1)]
+(6)
+The value is predicted by the critic as shown in Fig. 3 and rt is the reward received at step t.
+The action decoder or actor is then updated according to the gradient:
+−∇θ(logπT(τ|st; θt) +
+n
+X
+i=1
+logπOi(oi|st, τ, ..., oi−1; θt))A(st, at)
+(7)
+updating the template policy πT and object policies πOi based on the fact that each step in the action
+decoding process is conditioned on all the previously decoded portions. The critic is updated with
+respect to the gradient:
+1
+2∇θ(Q(st, at; θt) −V (st; θt))2
+(8)
+bringing the critic’s prediction of the value of being in a state closer to its true underlying value. An
+entropy loss is also added:
+LE(st, at; θt) =
+X
+a∈V (st)
+P(a|st)logP(a|st)
+(9)
+Hyperparameters are taken from KG-A2C as detailed by Ammanabrolu and Hausknecht [3] and not
+tuned any further.
+A.2
+MC!Q*BERT
+The additional hyperparamters used for modular policy chaining are detailed below. Patience batch
+factor is the proportion of the batch that must have stagnated at a particular score for patience
+number of episodes of unchanging score before a bottleneck is detected. Patience within a range of
+1000 −6000 in increments of 500 and buffer size within a range of 10 −60 in increments of 10 were
+the only additional parameters tuned for, on Zork1. The resulting best hyperparameter set was used
+on the rest of the games.
+15
+
+Parameters
+Value
+patience
+3000
+buffer size
+40
+batch size
+16
+patience batch factor
+.75
+A.3
+GO!Q*BERT
+Since the text games we are dealing with are mostly deterministic, with the exception of Zork1
+in later stages, we only focus on using Phase 1 of the Go-Explore algorithm to ﬁnd an optimal
+policy. Go-Explore maintains an archive of cells—deﬁned as a set of states that map to a single
+representation—to keep track of promising states. Ecoffet et al. [12] simply encodes each cell by
+keeping track of the agent’s position and Madotto et al. [19] use the textual observations encoded by
+recurrent neural network as a cell representation. We improve on this implementation by training
+the Q*BERT network in parallel, using the snapshot of the knowledge graph in conjunction with
+the game state to further encode the current state and use this as a cell representation. At each step,
+Go-Explore chooses a cell to explore at random (weighted by score to prefer more advanced cells).
+Q*BERT will run for a number of steps in each cell, for all our experiments we use a cell step size of
+32, starting with the knowledge graph state and the last seen state of the game from the cell. This will
+generate a trajectory for the agent while further training Q*BERT at each iteration, creating a new
+representation for the knowledge graph as well as a new game state for the cell. After expanding a
+cell, Go-Explore will continue to sample cells by weight to continue expanding its known states. At
+the same time, Q*BERT will beneﬁt from the heuristics of selecting preferred cells and be trained on
+promising states more often.
+B
+Results
+B.1
+Graph Evaluation Results
+0
+20000
+40000
+60000
+80000
+100000
+0
+5
+10
+15
+20
+25
+30
+35
+40
+zork1
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+6
+8
+10
+12
+14
+16
+library
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+50
+100
+150
+200
+250
+300
+350
+detective
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+4
+6
+8
+10
+12
+balances
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+0
+10
+20
+30
+40
+50
+60
+pentari
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+4
+5
+6
+ztuu
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+8
+10
+12
+14
+16
+18
+20
+ludicorp
+Q*BERT
+KG-A2C
+0
+20000
+40000
+60000
+80000
+100000
+−1.00
+−0.75
+−0.50
+−0.25
+0.00
+0.25
+0.50
+0.75
+1.00
+×10−12 +1
+deephome
+Q*BERT
+KG-A2C
+0
+10000
+20000
+30000
+40000
+50000
+60000
+70000
+80000
+2
+4
+6
+8
+10
+temple
+Q*BERT
+KG-A2C
+Figure 5: Episode initial reward curves for KG-A2C and Q*BERT.
+16
+
+B.2
+Intrinsic Motivation and Structured Exploration Results
+0
+10000
+20000
+30000
+40000
+50000
+0
+10
+20
+30
+40
+zork1
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+5000
+10000
+15000
+20000
+25000
+4
+6
+8
+10
+12
+14
+16
+library
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+5000
+10000
+15000
+20000
+25000
+30000
+35000
+0
+50
+100
+150
+200
+250
+300
+350
+detective
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+500
+1000
+1500
+2000
+2500
+0
+2
+4
+6
+8
+10
+balances
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+5000
+10000
+15000
+20000
+25000
+30000
+0
+10
+20
+30
+40
+50
+pentari
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+10000
+20000
+30000
+40000
+50000
+5
+6
+7
+8
+9
+10
+ztuu
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+5000
+10000
+15000
+20000
+25000
+30000
+35000
+8
+10
+12
+14
+16
+18
+20
+22
+24
+ludicorp
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+2500
+5000
+7500
+10000
+12500
+15000
+17500
+0
+2
+4
+6
+8
+deephome
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+0
+2000
+4000
+6000
+8000
+0
+2
+4
+6
+8
+temple
+MC!Q*BERT
+MC!Q*BERT-no-IM
+GO!Q*BERT
+Figure 6: Best initial reward curves for the exploration strategies.
+C
+Zork1
+Start here
+Kitchen +10
+Egg +5
+Cellar +25
+Painting +4
+Figure 7: Map of Zork1 annotated with rewards taken from Ammanabrolu and Hausknecht [3] and
+corresponding to the states and rewards found in Figure 2.
+17
+

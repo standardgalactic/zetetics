@@ -1,0 +1,1749 @@
+Fast large-scale optimization by unifying
+stochastic gradient and quasi-Newton methods
+Jascha Sohl-Dickstein
+JASCHA@{STANFORD.EDU,KHANACADEMY.ORG}
+Ben Poole
+POOLE@CS.STANFORD.EDU
+Surya Ganguli
+SGANGULI@STANFORD.EDU
+Abstract
+We present an algorithm for minimizing a sum of
+functions that combines the computational efﬁ-
+ciency of stochastic gradient descent (SGD) with
+the second order curvature information leveraged
+by quasi-Newton methods. We unify these ap-
+proaches by maintaining an independent Hessian
+approximation for each contributing function in
+the sum. We maintain computational tractability
+and limit memory requirements even for high di-
+mensional optimization problems by storing and
+manipulating these quadratic approximations in
+a shared, time evolving, low dimensional sub-
+space. Each update step requires only a single
+contributing function or minibatch evaluation (as
+in SGD), and each step is scaled using an ap-
+proximate inverse Hessian and little to no adjust-
+ment of hyperparameters is required (as is typical
+for quasi-Newton methods). This algorithm con-
+trasts with earlier stochastic second order tech-
+niques that treat the Hessian of each contribut-
+ing function as a noisy approximation to the full
+Hessian, rather than as a target for direct estima-
+tion. We experimentally demonstrate improved
+convergence on seven diverse optimization prob-
+lems. The algorithm is released as open source
+Python and MATLAB packages.
+1. Introduction
+A common problem in optimization is to ﬁnd a vector
+x∗∈RM which minimizes a function F (x), where F (x)
+is a sum of N computationally cheaper differentiable sub-
+Proceedings of the 31 st International Conference on Machine
+Learning, Beijing, China, 2014. JMLR: W&CP volume 32. Copy-
+right 2014 by the author(s).
+functions fi (x),
+F (x) =
+N
+X
+i=1
+fi (x) ,
+(1)
+x∗= argmin
+x
+F (x) .
+(2)
+Many optimization tasks ﬁt this form (Boyd & Vanden-
+berghe, 2004), including training of autoencoders, support
+vector machines, and logistic regression algorithms, as well
+as parameter estimation in probabilistic models. In these
+cases each subfunction corresponds to evaluating the ob-
+jective on a separate data minibatch, thus the number of
+subfunctions N would be the datasize D divided by the
+minibatch size S. This scenario is commonly referred to in
+statistics as M-estimation (Huber, 1981).
+There are two general approaches to efﬁciently optimizing
+a function of this form. The ﬁrst is to use a quasi-Newton
+method (Dennis Jr & Mor´e, 1977), of which BFGS (Broy-
+den, 1970; Fletcher, 1970; Goldfarb, 1970; Shanno, 1970)
+or LBFGS (Liu & Nocedal, 1989) are the most common
+choices. Quasi-Newton methods use the history of gradi-
+ent evaluations to build up an approximation to the inverse
+Hessian of the objective function F (x). By making de-
+scent steps which are scaled by the approximate inverse
+Hessian, and which are therefore longer in directions of
+shallow curvature and shorter in directions of steep curva-
+ture, quasi-Newton methods can be orders of magnitude
+faster than steepest descent. Additionally, quasi-Newton
+techniques typically require adjusting few or no hyperpa-
+rameters, because they use the measured curvature of the
+objective function to set step lengths and directions. How-
+ever, direct application of quasi-Newton methods requires
+calculating the gradient of the full objective function F (x)
+at every proposed parameter setting x, which can be very
+computationally expensive.
+The second approach is to use a variant of Stochastic Gra-
+dient Descent (SGD) (Robbins & Monro, 1951; Bottou,
+1991). In SGD, only one subfunction’s gradient is evalu-
+ated per update step, and a small step is taken in the neg-
+ative gradient direction. More recent descent techniques
+arXiv:1311.2115v7  [cs.LG]  30 Nov 2014
+
+Sum of Functions Optimizer
+xt−1 xt−2
+f1(x)
+f2(x)
+F(x)
+g t−1
+1
+(x)
+g t−1
+2
+(x)
+Gt−1 (x)
+(a)
+xt−1 xt−2
+xt
+min Gt−1 (x)
+f1(x)
+f2(x)
+F(x)
+g t−1
+1
+(x)
+g t−1
+2
+(x)
+Gt−1 (x)
+(b)
+xt−1 xt−2
+xt
+f1(x)
+f2(x)
+F(x)
+g t
+1 (x)
+g t
+2 (x)
+Gt (x)
+(c)
+Figure 1. A cartoon illustrating the proposed optimization technique. (a) The objective function F (x) (solid blue line) consists of a sum
+of two subfunctions (dashed blue lines), F (x) = f1 (x)+f2 (x). At learning step t−1, f1 (x) and f2 (x) are approximated by quadratic
+functions gt−1
+1
+(x) and gt−1
+2
+(x) (red dashed lines). The sum of the approximating functions Gt−1 (x) (solid red line) approximates the
+full objective F (x). The green dots indicate the parameter values at which each subfunction has been evaluated (b) The next parameter
+setting xt is chosen by minimizing the approximating function Gt−1 (x) from the prior update step. See Equation 4. (c) After each
+parameter update, the quadratic approximation for one of the subfunctions is updated using a second order expansion around the new
+parameter vector xt. See Equation 6. The constant and ﬁrst order term in the expansion are evaluated exactly, and the second order term
+is estimated by performing BFGS on the subfunction’s history. In this case the approximating subfunction gt
+1 (x) is updated (long-dashed
+red line). This update is also reﬂected by a change in the full approximating function Gt (x) (solid red line). Optimization proceeds
+by repeating these two illustrated update steps. In order to remain tractable in memory and computational overhead, optimization is
+performed in an adaptive low dimensional subspace determined by the history of gradients and iterates.
+like IAG (Blatt et al., 2007), SAG (Roux et al., 2012), and
+MISO (Mairal, 2013; 2014) instead take update steps in
+the average gradient direction. For each update step, they
+evaluate the gradient of one subfunction, and update the
+average gradient using its new value. (Bach & Moulines,
+2013) averages the iterates rather than the gradients. If the
+subfunctions are similar, then SGD can also be orders of
+magnitude faster than steepest descent on the full batch.
+However, because a different subfunction is evaluated for
+each update step, the gradients for each update step cannot
+be combined in a straightforward way to estimate the in-
+verse Hessian of the full objective function. Additionally,
+efﬁcient optimization with SGD typically involves tuning
+a number of hyperparameters, which can be a painstaking
+and frustrating process. (Le et al., 2011) compares the per-
+formance of stochastic gradient and quasi-Newton methods
+on neural network training, and ﬁnds both to be competi-
+tive.
+Combining quasi-Newton and stochastic gradient methods
+could improve optimization time, and reduce the need to
+tweak optimization hyperparameters.
+This problem has
+been approached from a number of directions. In (Schrau-
+dolph et al., 2007; Sunehag et al., 2009) a stochastic variant
+of LBFGS is proposed. In (Martens, 2010), (Byrd et al.,
+2011), and (Vinyals & Povey, 2011) stochastic versions of
+Hessian-free optimization are implemented and applied to
+optimization of deep networks. In (Lin et al., 2008) a trust
+region Newton method is used to train logistic regression
+and linear SVMs using minibatches. In (Hennig, 2013) a
+nonparametric quasi-Newton algorithm is proposed based
+on noisy gradient observations and a Gaussian process
+prior.
+In (Byrd et al., 2014) LBFGS is performed, but
+with the contributing changes in gradient and position re-
+placed by exactly computed Hessian vector products com-
+puted periodically on extra large minibatches. Stochastic
+meta-descent (Schraudolph, 1999), AdaGrad (Duchi et al.,
+2010), and SGD-QN (Bordes et al., 2009) rescale the gra-
+dient independently for each dimension, and can be viewed
+as accumulating something similar to a diagonal approx-
+imation to the Hessian. All of these techniques treat the
+Hessian on a subset of the data as a noisy approximation to
+the full Hessian. To reduce noise in the Hessian approxima-
+tion, they rely on regularization and very large minibatches
+to descend F (x). Thus, unfortunately each update step re-
+quires the evaluation of many subfunctions and/or yields a
+highly regularized (i.e. diagonal) approximation to the full
+Hessian.
+We develop a novel second-order quasi-Newton technique
+that only requires the evaluation of a single subfunction
+per update step. In order to achieve this substantial sim-
+pliﬁcation, we treat the full Hessian of each subfunction as
+a direct target for estimation, thereby maintaining a sep-
+arate quadratic approximation of each subfunction. This
+approach differs from all previous work, which in contrast
+treats the Hessian of each subfunction as a noisy approxi-
+mation to the full Hessian. Our approach allows us to com-
+
+Sum of Functions Optimizer
+bine Hessian information from multiple subfunctions in a
+much more natural and efﬁcient way than previous work,
+and avoids the requirement of large minibatches per up-
+date step to accurately estimate the full Hessian. More-
+over, we develop a novel method to maintain computa-
+tional tractability and limit the memory requirements of
+this quasi-Newton method in the face of high dimensional
+optimization problems (large M). We do this by storing
+and manipulating the subfunctions in a shared, adaptive
+low dimensional subspace, determined by the recent his-
+tory of the gradients and iterates.
+Thus our optimization method can usefully estimate and
+utilize powerful second-order information while simulta-
+neously combatting two potential sources of computational
+intractability: large numbers of subfunctions (large N) and
+a high-dimensional optimization domain (large M). More-
+over, the use of a second order approximation means that
+minimal or no adjustment of hyperparameters is required.
+We refer to the resulting algorithm as Sum of Functions
+Optimizer (SFO). We demonstrate that the combination of
+techniques and new ideas inherent in SFO results in faster
+optimization on seven disparate example problems.
+Fi-
+nally, we release the optimizer and the test suite as open
+source Python and MATLAB packages.
+2. Algorithm
+Our goal is to combine the beneﬁts of stochastic and quasi-
+Newton optimization techniques. We ﬁrst describe the gen-
+eral procedure by which we optimize the parameters x.
+We then describe the construction of the shared low di-
+mensional subspace which makes the algorithm tractable
+in terms of computational overhead and memory for large
+problems. This is followed by a description of the BFGS
+method by which an online Hessian approximation is main-
+tained for each subfunction. Finally, we end this section
+with a review of implementation details.
+2.1. Approximating Functions
+We deﬁne a series of functions Gt (x) intended to approxi-
+mate F (x),
+Gt (x) =
+N
+X
+i=1
+gt
+i (x) ,
+(3)
+where the superscript t indicates the learning iteration.
+Each gt
+i (x) serves as a quadratic approximation to the cor-
+responding fi (x). The functions gt
+i (x) will be stored, and
+one of them will be updated per learning step.
+2.2. Update Steps
+As is illustrated in Figure 1, optimization is performed by
+repeating the steps:
+1. Choose a vector xt by minimizing the approximating
+objective function Gt−1 (x),
+xt = argmin
+x
+Gt−1 (x) .
+(4)
+Since Gt−1 (x) is a sum of quadratic functions
+gt−1
+i
+(x), it can be exactly minimized by a Newton
+step,
+xt = xt−1 −ηt  Ht−1−1 ∂Gt−1  xt−1
+∂x
+,
+(5)
+where Ht−1 is the Hessian of Gt−1 (x).
+The step
+length ηt is typically unity, and will be discussed in
+Section 3.5.
+2. Choose an index j ∈{1...N}, and update the cor-
+responding approximating subfunction gt
+i (x) using a
+second order power series around xt, while leaving all
+other subfunctions unchanged,
+gt
+i (x) =
+
+
+
+
+
+
+
+
+
+
+
+gt−1
+i
+(x)
+i ̸= j
+
+
+fi (xt)
++ (x −xt)T f ′
+i (xt)
++ 1
+2 (x −xt)T Ht
+i (x −xt)
+
+
+i = j
+.
+(6)
+The constant and ﬁrst order term in Equation 6 are set
+by evaluating the subfunction and gradient, fj (xt) and
+f ′
+j (xt). The quadratic term Ht
+j is set by using the BFGS
+algorithm to generate an online approximation to the true
+Hessian of subfunction j based on its history of gradient
+evaluations (see Section 2.4). The Hessian of the summed
+approximating function Gt (x) in Equation 5 is the sum of
+the Hessians for each gt
+j (x), Ht = P
+j Ht
+j.
+2.3. A Shared, Adaptive, Low-Dimensional
+Representation
+The dimensionality M of x ∈RM is typically large. As
+a result, the memory and computational cost of working
+directly with the matrices Ht
+i ∈RM×M is typically pro-
+hibitive, as is the cost of storing the history terms ∆f ′ and
+∆x required by BFGS (see Section 2.4). To reduce the
+dimensionality from M to a tractable value, all history is
+instead stored and all updates computed in a lower dimen-
+sional subspace, with dimensionality between Kmin and
+Kmax. This subspace is constructed such that it includes
+the most recent gradient and position for every subfunc-
+tion, and thus Kmin ≥2N. This guarantees that the sub-
+space includes both the steepest gradient descent direction
+over the full batch, and the update directions from the most
+recent Newton steps (Equation 5).
+
+Sum of Functions Optimizer
+For the results in this paper, Kmin = 2N and Kmax = 3N.
+The subspace is represented by the orthonormal columns of
+a matrix Pt ∈RM×Kt, (Pt)T Pt = I. Kt is the subspace
+dimensionality at optimization step t.
+2.3.1. EXPANDING THE SUBSPACE WITH A NEW
+OBSERVATION
+At each optimization step, an additional column is added to
+the subspace, expanding it to include the most recent gra-
+dient direction. This is done by ﬁrst ﬁnding the component
+in the gradient vector which lies outside the existing sub-
+space, and then appending that component to the current
+subspace,
+qorth = f ′
+j
+ xt
+−Pt−1  Pt−1T f ′
+j
+ xt
+,
+(7)
+Pt =
+
+Pt−1
+qorth
+||qorth||
+
+,
+(8)
+where j is the subfunction updated at time t. The new posi-
+tion xt is included automatically, since the position update
+was computed within the subspace Pt−1. Vectors embed-
+ded in the subspace Pt−1 can be updated to lie in Pt sim-
+ply by appending a 0, since the ﬁrst Kt−1 dimensions of
+Pt consist of Pt−1.
+2.3.2. RESTRICTING THE SIZE OF THE SUBSPACE
+In order to prevent the dimensionality Kt of the subspace
+from growing too large, whenever Kt > Kmax, the sub-
+space is collapsed to only include the most recent gradient
+and position measurements from each subfunction. The or-
+thonormal matrix representing this collapsed subspace is
+computed by a QR decomposition on the most recent gradi-
+ents and positions. A new collapsed subspace is thus com-
+puted as,
+P′ = orth
+h
+f ′
+1
+
+xτ t
+1
+
+· · · f ′
+N
+
+xτ t
+N
+
+xτ t
+1 · · · xτ t
+N
+i
+,
+(9)
+where τ t
+i indicates the learning step at which the ith sub-
+function was most recently evaluated, prior to the current
+learning step t. Vectors embedded in the prior subspace P
+are projected into the new subspace P′ by multiplication
+with a projection matrix T = (P′)T P. Vector compo-
+nents which point outside the subspace deﬁned by the most
+recent positions and gradients are lost in this projection.
+Note that the subspace P′ lies within the subspace P. The
+QR decomposition and the projection matrix T are thus
+both computed within P, reducing the computational and
+memory cost (see Section 4.1).
+2.4. Online Hessian Approximation
+An independent online Hessian approximation Ht
+j is main-
+tained for each subfunction j. It is computed by performing
+BFGS on the history of gradient evaluations and positions
+for that single subfunction1.
+2.4.1. HISTORY MATRICES
+For each subfunction j, we construct two matrices, ∆f ′
+and ∆x.
+Each column of ∆f ′ holds the change in the
+gradient of subfunction j between successive evaluations
+of that subfunction, including all evaluations up until the
+present time. Each column of ∆x holds the corresponding
+change in the position x between successive evaluations.
+Both matrices are truncated after a number of columns L,
+meaning that they include information from only the prior
+L + 1 gradient evaluations for each subfunction. For all re-
+sults in this paper, L = 10 (identical to the default history
+length for the LBFGS implementation used in Section 5).
+2.4.2. BFGS UPDATES
+The BFGS algorithm functions by iterating through the
+columns in ∆f ′ and ∆x, from oldest to most recent. Let s
+be a column index, and Bs be the approximate Hessian for
+subfunction j after processing column s. For each s, the
+approximate Hessian matrix Bs is set so that it obeys the
+secant equation ∆f ′
+s = Bs∆xs, where ∆f ′
+s and ∆xs are
+taken to refer to the sth columns of the gradient difference
+and position difference matrix respectively.
+In addition to satisfying the secant equation, Bs is chosen
+such that the difference between it and the prior estimate
+Bs−1 has the smallest weighted Frobenius norm2. This
+produces the standard BFGS update equation
+Bs = Bs−1 + ∆f ′
+s∆f ′T
+s
+∆f ′T
+s ∆xs
+−Bs−1∆xs∆xT
+s Bs−1
+∆xTs Bs−1∆xs
+.
+(10)
+The ﬁnal update is used as the approximate Hessian for
+subfunction j, Ht
+j = Bmax(s).
+3. Implementation Details
+Here we brieﬂy review additional design choices that were
+made when implementing this algorithm. Each of these
+choices is presented more thoroughly in Appendix C. Sup-
+plemental Figure C.1 demonstrates that the optimizer per-
+formance is robust to changes in several of these design
+1We additionally experimented with Symmetric Rank 1 (Den-
+nis Jr & Mor´e, 1977) updates to the approximate Hessian, but
+found they performed worse than BFGS. See Supplemental Fig-
+ure C.1.
+2The weighted Frobenius norm is deﬁned as ||E||F,W =
+||WEW||F . For BFGS, W = B
+−1
+2
+s
+(Papakonstantinou, 2009).
+Equivalently, in BFGS the unweighted Frobenius norm is mini-
+mized after performing a linear change of variables to map the
+new approximate Hessian to the identity matrix.
+
+Sum of Functions Optimizer
+Optimizer
+Computation per pass
+Memory use
+SFO
+O
+ QN + MN 2
+O (MN)
+SFO, ‘sweet spot’
+O (QN)
+O (MN)
+LBFGS
+O (QN + ML)
+O (ML)
+SGD
+O (QN)
+O (M)
+AdaGrad
+O (QN)
+O (M)
+SAG
+O (QN)
+O (MN)
+Table 1. Leading terms in the computational cost and memory re-
+quirements for SFO and several competing algorithms. Q is the
+cost of computing the value and gradient for a single subfunction,
+M is the number of data dimensions, N is the number of sub-
+functions, and L is the number of history terms retained. “SFO,
+‘sweet spot”’ refers to the case discussed in Section 4.1.1 where
+the minibatch size is adjusted to match computational overhead
+to subfunction evaluation cost. For this table, it is assumed that
+M ≫N ≫L.
+choices.
+3.1. BFGS Initialization
+The ﬁrst time a subfunction is evaluated (before there is
+sufﬁcient history to run BFGS), the approximate Hessian
+Ht
+j is set to the identity times the median eigenvalue of the
+average Hessian of the other active subfunctions. For later
+evaluations, the initial BFGS matrix is set to a scaled iden-
+tity matrix, B0 = βI, where β is the minimum eigenvalue
+found by solving the squared secant equation for the full
+history. See Appendix C.1 for details and motivation.
+3.2. Enforcing Positive Deﬁniteness
+It is typical in quasi-Newton techniques to enforce that the
+Hessian approximation remain positive deﬁnite. In SFO
+each Ht
+i is constrained to be positive deﬁnite by an explicit
+eigendecomposition and setting any too-small eigenvalues
+to the median positive eigenvalue. This is computationally
+cheap due to the shared low dimensional subspace (Section
+2.3). This is described in detail in Appendix C.2.
+3.3. Choosing a Target Subfunction
+The subfunction j to update in Equation 6 is chosen to be
+the one farthest from the current location xt, using the cur-
+rent Hessian approximation as the metric. This is described
+more formally in Appendix C.3. As illustrated in Supple-
+mental Figure C.1, this distance based choice outperforms
+the commonly used random choice of subfunction.
+3.4. Growing the Number of Active Subfunctions
+For many problems of the form in Equation 1, the gradient
+information is nearly identical between the different sub-
+functions early in learning. We therefore begin with only
+0
+5 ·105
+106
+M
+0
+27
+54
+Overhead (s)
+Fixed N =100
+CPU
+GPU
+(a)
+0
+75
+150
+N
+0
+58
+117
+Overhead (s)
+Fixed M =106
+CPU
+GPU
+(b)
+SFO N =1
+SFO N =3
+SFO N =8
+SFO N =24
+SFO N =69
+SFO N =200
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-16
+10
+-14
+10
+-12
+10
+-10
+10
+-8
+10
+-6
+10
+-4
+10
+-2
+10
+0
+10
+2
+Full Batch Objective - Minimum
+Logistic Regression, Protein Dataset
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-12
+10
+-10
+10
+-8
+10
+-6
+10
+-4
+10
+-2
+10
+0
+10
+2
+10
+4
+Full Batch Objective - Minimum
+Ising / Hopfield with MPF Objective
+(c)
+Figure 2. An exploration of computational overhead and opti-
+mizer performance, especially as the number of minibatches or
+subfunctions N is adjusted. (a) Computational overhead required
+by SFO for a full pass through all the subfunctions as a function
+of dimensionality M for ﬁxed N = 100. (b) Computational over-
+head of SFO as a function of N for ﬁxed M = 106. Both plots
+show the computational time required for a full pass of the op-
+timizer, excluding time spent computing the target objective and
+gradient. This time is dominated by the O
+ MN 2
+cost per pass
+of N iterations of subspace projection. CPU indicates that all
+computations were performed on a 2012 Intel i7-3970X CPU (6
+cores, 3.5 GHz). GPU indicates that subspace projection was per-
+formed on a GeForce GTX 660 Ti GPU. (c) Optimization perfor-
+mance on the two convex problems in Section 5 as a function of
+the number of minibatches N. Note that near maximal perfor-
+mance is achieved after breaking the target problem into only a
+small number of minibatches.
+two active subfunctions, and expand the active set when-
+ever the length of the standard error in the gradient across
+subfunctions exceeds the length of the gradient. This pro-
+cess is described in detail in Appendix C.4. As illustrated
+in Supplemental Figure C.1, performance only differs from
+the case where all subfunctions are initially active for the
+ﬁrst several optimization passes.
+3.5. Detecting Bad Updates
+Small eigenvalues in the Hessian can cause update steps to
+overshoot severely (ie, if higher than second order terms
+come to dominate within a distance which is shorter than
+the suggested update step). It is therefore typical in quasi-
+Newton methods such as BFGS, LBFGS, and Hessian-free
+
+Sum of Functions Optimizer
+optimization to detect and reject bad proposed update steps,
+for instance by a line search. In SFO, bad update steps
+are detected by comparing the measured subfunction value
+fj (xt) to its quadratic approximation gt−1
+j
+(xt). This is
+discussed in detail in Section C.5.
+4. Properties
+4.1. Computational Overhead and Storage Cost
+Table 1 compares the cost of SFO to competing algorithms.
+The dominant computational costs are the O (MN) cost of
+projecting the M dimensional gradient and current param-
+eter values into and out of the O (N) dimensional active
+subspace for each learning iteration, and the O (Q) cost
+of evaluating a single subfunction. The dominant memory
+cost is O (MN), and stems from storing the active sub-
+space Pt. Table A.1 in the Supplemental Material provides
+the contribution to the computational cost of each compo-
+nent of SFO. Figure 2 plots the computational overhead per
+a full pass through all the subfunctions associated with SFO
+as a function of M and N. If each of the N subfunctions
+corresponds to a minibatch, then the computational over-
+head can be shrunk as described in Section 4.1.1.
+Without the low dimensional subspace, the leading term
+in the computational cost of SFO would be the far larger
+O
+ M 2.4
+cost per iteration of inverting the approximate
+Hessian matrix in the full M dimensional parameter space,
+and the leading memory cost would be the far larger
+O
+ M 2N
+
+from storing an M × M dimensional Hessian
+for all N subfunctions.
+4.1.1. IDEAL MINIBATCH SIZE
+Many objective functions consist of a sum over a number
+of data points D, where D is often larger than M. For
+example, D could be the number of training samples in a
+supervised learning problem, or data points in maximum
+likelihood estimation. To control the computational over-
+head of SFO in such a regime, it is useful to choose each
+subfunction in Equation 3 to itself be a sum over a mini-
+batch of data points of size S, yielding N =
+D
+S . This
+leads to a computational cost of evaluating a single sub-
+function and gradient of O (Q) = O (MS). The computa-
+tional cost of projecting this gradient from the full space to
+the shared N dimensional adaptive subspace, on the other
+hand, is O (MN) = O
+ M D
+S
+
+. Therefore, in order for the
+costs of function evaluation and projection to be the same
+order, the minibatch size S should be proportional to
+√
+D,
+yielding
+N ∝
+√
+D.
+(11)
+The constant of proportionality should be chosen small
+enough that the majority of time is spent evaluating the
+subfunction. In most problems of interest,
+√
+D ≪M, jus-
+tifying the relevance of the regime in which the number of
+subfunctions N is much less than the number of parameters
+M. Finally, the computational and memory costs of SFO
+are the same for sparse and non-sparse objective functions,
+while Q is often much smaller for a sparse objective. Thus
+the ideal S (N) is likely to be larger (smaller) for sparse
+objective functions.
+Note that as illustrated in Figure 2c and Figure 3 perfor-
+mance is very good even for small N.
+4.2. Convergence
+Concurrent work by (Mairal, 2013) considers a similar al-
+gorithm to that described in Section 2.2, but with Ht
+i a
+scalar constant rather than a matrix.
+Proposition 6.1 in
+(Mairal, 2013) shows that in the case that each gi majorizes
+its respective fi, and subject to some additional smooth-
+ness constraints, Gt (x) monotonically decreases, and x∗is
+an asymptotic stationary point. Proposition 6.2 in (Mairal,
+2013) further shows that for strongly convex fi, the algo-
+rithm exhibits a linear convergence rate to x∗. A near iden-
+tical proof should hold for a simpliﬁed version of SFO, with
+random subfunction update order, and with Ht
+i regularized
+in order to guarantee satisfaction of the majorization con-
+dition.
+5. Experimental Results
+We compared our optimization technique to several com-
+peting optimization techniques for seven objective func-
+tions. The results are illustrated in Figures 3 and 4, and the
+optimization techniques and objectives are described be-
+low. For all problems our method outperformed all other
+techniques in the comparison.
+Open source code which implements the proposed tech-
+nique and all competing optimizers, and which directly
+generates the plots in Figures 1, 2, and 3, is provided
+at
+https://github.com/Sohl-Dickstein/
+Sum-of-Functions-Optimizer.
+5.1. Optimizers
+SFO refers to Sum of Functions Optimizer, and is the new
+algorithm presented in this paper. SAG refers to Stochastic
+Average Gradient method, with the trailing number pro-
+viding the Lipschitz constant.
+SGD refers to Stochastic
+Gradient Descent, with the trailing number indicating the
+step size. ADAGrad indicates the AdaGrad algorithm, with
+the trailing number indicating the initial step size. LBFGS
+refers to the limited memory BFGS algorithm.
+LBFGS
+minibatch repeatedly chooses one tenth of the subfunc-
+tions, and runs LBFGS for ten iterations on them. Hessian-
+free refers to Hessian-free optimization.
+
+Sum of Functions Optimizer
+ADAGrad η =0.1
+ADAGrad η =1
+ADAGrad η =10
+LBFGS
+LBFGS minibatch
+SAG L =0.1
+SAG L =1
+SAG L =10
+SFO
+SGD η =0.1
+SGD η =1
+SGD η =10
+SGD+mom η =0.1, µ =0.95
+(a)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-16
+10
+-14
+10
+-12
+10
+-10
+10
+-8
+10
+-6
+10
+-4
+10
+-2
+10
+0
+10
+2
+Full Batch Objective - Minimum
+Logistic Regression, Protein Dataset
+ADAGrad η =0.01
+ADAGrad η =0.1
+ADAGrad η =1
+LBFGS
+LBFGS minibatch
+SAG L =1
+SAG L =10
+SAG L =100
+SFO
+SGD η =0.1
+SGD η =1
+SGD η =10
+SGD+mom η =1, µ =0.5
+(b)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+15
+20
+25
+30
+Full Batch Objective
+Contractive Autoencoder
+ADAGrad η =0.01
+ADAGrad η =0.1
+ADAGrad η =1
+LBFGS
+LBFGS minibatch
+SAG L =1
+SAG L =10
+SAG L =100
+SFO
+SGD η =0.01
+SGD η =0.1
+SGD η =1
+SGD+mom η =0.1, µ =0.9
+(c)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+0
+10
+1
+10
+2
+10
+3
+Full Batch Objective
+ICA
+ADAGrad η =0.001
+ADAGrad η =0.01
+ADAGrad η =0.1
+LBFGS
+LBFGS minibatch
+SAG L =10
+SAG L =100
+SAG L =1000
+SFO
+SGD η =0.001
+SGD η =0.01
+SGD η =0.1
+SGD+mom η =0.001, µ =0.95
+(d)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-11
+10
+-9
+10
+-7
+10
+-5
+10
+-3
+10
+-1
+10
+1
+10
+3
+10
+5
+Full Batch Objective - Minimum
+Ising / Hopfield with MPF Objective
+ADAGrad η =0.01
+ADAGrad η =0.1
+ADAGrad η =1
+LBFGS
+LBFGS minibatch
+SAG L =0.1
+SAG L =1
+SAG L =10
+SFO
+SGD η =0.1
+SGD η =1
+SGD η =10
+SGD+mom η =0.1, µ =0.99
+(e)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-7
+10
+-6
+10
+-5
+10
+-4
+10
+-3
+10
+-2
+10
+-1
+10
+0
+10
+1
+Full Batch Objective
+Multi-Layer Perceptron, Sigmoid
+ADAGrad η =0.001
+ADAGrad η =0.01
+ADAGrad η =0.1
+LBFGS
+LBFGS minibatch
+SAG L =1
+SAG L =10
+SAG L =100
+SFO
+SGD η =0.01
+SGD η =0.1
+SGD η =1
+SGD+mom η =0.01, µ =0.95
+(f)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-5
+10
+-4
+10
+-3
+10
+-2
+10
+-1
+10
+0
+10
+1
+Full Batch Objective
+Convolutional Network, CIFAR-10
+Figure 3. A comparison of SFO to competing optimization techniques for six objective functions. The bold lines indicate the best
+performing hyperparameter for each optimizer. Note that unlike all other techniques besides LBFGS, SFO does not require tuning
+hyperparameters (for instance, the displayed SGD+momentum traces are the best out of 32 hyperparameter conﬁgurations). The objec-
+tive functions shown are (a) a logistic regression problem, (b) a contractive autoencoder trained on MNIST digits, (c) an Independent
+Component Analysis (ICA) model trained on MNIST digits, (d) an Ising model / Hopﬁeld associative memory trained using Minimum
+Probability Flow, (e) a multi-layer perceptron with sigmoidal units trained on MNIST digits, and (f) a multilayer convolutional network
+with rectiﬁed linear units trained on CIFAR-10. The logistic regression and MPF Ising objectives are convex, and their objective values
+are plotted relative to the global minimum.
+For SAG, SGD, and ADAGrad the hyperparameter was cho-
+sen by a grid search. The best hyperparameter value, and
+the hyperparameter values immediately larger and smaller
+in the grid search, are shown in the plots and legends for
+each model in Figure 3. In SGD+momentum the two hy-
+perparameters for both step size and momentum coefﬁcient
+were chosen by a grid search, but only the best param-
+eter values are shown. The grid-searched momenta were
+0.5, 0.9, 0.95, and 0.99, and the grid-searched step lengths
+were all integer powers of ten between 10−5 and 102. For
+Hessian-free, the hyperparameters, source code, and objec-
+tive function are identical to those used in (Martens, 2010),
+and the training data was divided into four “chunks.” For
+all other experiments and optimizers the training data was
+divided into N = 100 minibatches (or subfunctions).
+5.2. Objective Functions
+A detailed description of all target objective functions in
+Figure 3 is included in Section B of the Supplemental Ma-
+terial. In brief, they consisted of:
+• A logistic regression objective, chosen to be the same
+as one used in (Roux et al., 2012).
+• A contractive autoencoder with 784 visible units, and
+256 hidden units, similar to the one in (Rifai et al.,
+
+Sum of Functions Optimizer
+2011).
+• An Independent Components Analysis (ICA) (Bell &
+Sejnowski, 1995) model with Student’s t-distribution
+prior.
+• An Ising model / Hopﬁeld network trained using code
+from (Hillar et al., 2012) implementing MPF (Sohl-
+Dickstein et al., 2011b;a).
+• A multilayer perceptron with a similar architecture to
+(Hinton et al., 2012), with layer sizes of 784, 1200,
+1200, and 10.
+Training used Theano (Bergstra &
+Breuleux, 2010).
+• A deep convolutional network with max pooling and
+rectiﬁed linear units, similar to (Goodfellow & Warde-
+Farley, 2013a), with two convolutional layers with 48
+and 128 units, and one fully connected layer with 240
+units. Training used Theano and Pylearn2 (Goodfel-
+low & Warde-Farley, 2013b).
+The logistic regression and Ising model / Hopﬁeld objec-
+tives are convex, and are plotted relative to their global min-
+imum. The global minimum was taken to be the smallest
+value achieved on the objective by any optimizer.
+In Figure 4, a twelve layer neural network was trained on
+cross entropy reconstruction error for the CURVES dataset.
+This objective, and the parameter initialization, was chosen
+to be identical to an experiment in (Martens, 2010).
+6. Future Directions
+We perform optimization in an O (N) dimensional sub-
+space. It may be possible, however, to drastically reduce
+the dimensionality of the active subspace without signif-
+icantly reducing optimization performance. For instance,
+the subspace could be determined by accumulating, in an
+online fashion, the leading eigenvectors of the covariance
+matrix of the gradients of the subfunctions, as well as the
+leading eigenvectors of the covariance matrix of the update
+steps. This would reduce memory requirements and com-
+putational overhead even for large numbers of subfunctions
+(large N).
+Most portions of the presented algorithm are naively par-
+allelizable.
+The gt
+i (x) functions can be updated asyn-
+chronously, and can even be updated using function and
+gradient evaluations from old positions xτ, where τ < t.
+Developing a parallelized version of this algorithm could
+make it a useful tool for massive scale optimization prob-
+lems. Similarly, it may be possible to adapt this algorithm
+to an online / inﬁnite data context by replacing subfunctions
+in a rolling fashion.
+Quadratic functions are often a poor match to the geome-
+try of the objective function (Pascanu et al., 2012). Neither
+10
+0
+10
+1
+10
+2
+10
+3
+Effective Passes Through Data
+10
+2
+10
+3
+Full Batch Objective
+Hessian-free
+SFO
+Figure 4. A comparison of SFO to Hessian-free optimization for
+a twelve layer neural network trained on the CURVES dataset.
+This problem is identical to an experiment in (Martens, 2010), and
+the Hessian-free convergence trace was generated using source
+code from the same paper. SFO converges in approximately one
+tenth the number of effective passes through the data as Hessian-
+free optimization.
+the dynamically updated subspace nor the use of indepen-
+dent approximating subfunctions gt
+i (x) which are ﬁt to the
+true subfunctions fi (x) depend on the functional form of
+gt
+i (x). Exploring non-quadratic approximating subfunc-
+tions has the potential to greatly improve performance.
+Section 3.1 initializes the approximate Hessian using a di-
+agonal matrix. Instead, it might be effective to initialize
+the approximate Hessian for each subfunction using the
+average approximate Hessian from all other subfunctions.
+Where individual subfunctions diverged they would over-
+write this initialization. This would take advantage of the
+fact that the Hessians for different subfunctions are very
+similar for many objective functions.
+Recent work has explored the non-asymptotic convergence
+properties of stochastic optimization algorithms (Bach &
+Moulines, 2011). It may be fruitful to pursue a similar anal-
+ysis in the context of SFO.
+Finally, the natural gradient (Amari, 1998) can greatly ac-
+celerate optimization by removing the effect of dependen-
+cies and relative scalings between parameters. The natu-
+ral gradient can be simply combined with other optimiza-
+tion methods by performing a change of variables, such
+that in the new parameter space the natural gradient and
+the ordinary gradient are identical (Sohl-Dickstein, 2012).
+It should be straightforward to incorporate this change-of-
+variables technique into SFO.
+7. Conclusion
+We have presented an optimization technique which com-
+bines the beneﬁts of LBFGS-style quasi-Newton optimiza-
+tion and stochastic gradient descent. It does this by using
+BFGS to maintain an independent quadratic approximation
+for each contributing subfunction (or minibatch) in an ob-
+jective function. Each optimization step then alternates be-
+
+Sum of Functions Optimizer
+tween descending the quadratic approximation of the full
+objective, and evaluating a single subfunction and updat-
+ing the quadratic approximation for that single subfunction.
+This procedure is made tractable in memory and computa-
+tional time by working in a shared low dimensional sub-
+space deﬁned by the history of gradient evaluations.
+References
+Amari, Shun-Ichi.
+Natural Gradient Works Efﬁciently in Learning.
+Neu-
+ral Computation, 10(2):251–276, 1998.
+ISSN 08997667.
+doi:
+10.1162/
+089976698300017746.
+Bach, F and Moulines, E. Non-strongly-convex smooth stochastic approximation
+with convergence rate O (1/n). Neural Information Processing Systems, 2013.
+Bach, FR and Moulines, E. Non-Asymptotic Analysis of Stochastic Approxima-
+tion Algorithms for Machine Learning. Neural Information Processing Systems,
+2011.
+Bell, AJ and Sejnowski, TJ. An information-maximization approach to blind sepa-
+ration and blind deconvolution. Neural computation, 1995.
+Bergstra, J and Breuleux, O. Theano: a CPU and GPU math expression compiler.
+Proceedings of the Python for Scientiﬁc Computing Conference (SciPy), 2010.
+Blatt, Doron, Hero, Alfred O, and Gauchman, Hillel. A convergent incremental
+gradient method with a constant step size. SIAM Journal on Optimization, 18(1):
+29–51, 2007.
+Bordes, Antoine, Bottou, L´eon, and Gallinari, Patrick. SGD-QN: Careful quasi-
+Newton stochastic gradient descent. The Journal of Machine Learning Research,
+10:1737–1754, 2009.
+Bottou, L´eon.
+Stochastic gradient learning in neural networks.
+Proceedings of
+Neuro-Nimes, 91:8, 1991.
+Boyd, S P and Vandenberghe, L. Convex optimization. Cambridge Univ Press, 2004.
+ISBN 0521833787.
+Broyden, CG. The convergence of a class of double-rank minimization algorithms
+2. The new algorithm. IMA Journal of Applied Mathematics, 1970.
+Byrd, RH, Hansen, SL, Nocedal, J, and Singer, Y.
+A Stochastic Quasi-Newton
+Method for Large-Scale Optimization. arXiv preprint arXiv:1401.7020, 2014.
+Byrd, RH Richard H, Chin, GM Gillian M, Neveitt, Will, and Nocedal, Jorge. On
+the use of stochastic hessian information in optimization methods for machine
+learning. SIAM Journal on Optimization, 21(3):977–995, 2011.
+Dennis Jr, John E and Mor´e, Jorge J. Quasi-Newton methods, motivation and theory.
+SIAM review, 19(1):46–89, 1977.
+Duchi, John, Hazan, Elad, and Singer, Yoram. Adaptive subgradient methods for
+online learning and stochastic optimization. Journal of Machine Learning Re-
+search, 12:2121–2159, 2010.
+Fletcher, R. A new approach to variable metric algorithms. The computer journal,
+1970.
+Goldfarb, D. A family of variable-metric methods derived by variational means.
+Mathematics of computation, 1970.
+Goodfellow, IJ and Warde-Farley, D. Maxout networks. arXiv:1302.4389, 2013a.
+Goodfellow, IJ and Warde-Farley, D. Pylearn2: a machine learning research library.
+arXiv:1308.4214, 2013b.
+Hennig, P. Fast probabilistic optimization from noisy gradients. International Con-
+ference on Machine Learning, 2013.
+Hillar, Christopher, Sohl-Dickstein, Jascha, and Koepsell, Kilian. Efﬁcient and op-
+timal binary Hopﬁeld associative memory storage using minimum probability
+ﬂow. arXiv, 1204.2916, April 2012.
+Hinton, Geoffrey E., Srivastava, Nitish, Krizhevsky, Alex, Sutskever, Ilya, and
+Salakhutdinov, Ruslan R.
+Improving neural networks by preventing co-
+adaptation of feature detectors. arXiv:1207.0580, 2012.
+Huber, PJ. Robust statistics. Wiley, New York, 1981.
+Le, Quoc V., Ngiam, Jiquan, Coates, Adam, Lahiri, Abhik, Prochnow, Bobby, and
+Ng, Andrew Y. On optimization methods for deep learning. International Con-
+ference on Machine Learning, 2011.
+Lin, Chih-Jen, Weng, Ruby C, and Keerthi, S Sathiya. Trust region newton method
+for logistic regression. The Journal of Machine Learning Research, 9:627–650,
+2008.
+Liu, Dong C DC and Nocedal, Jorge. On the limited memory BFGS method for
+large scale optimization. Mathematical programming, 45(1-3):503–528, 1989.
+Mairal, J. Optimization with First-Order Surrogate Functions. International Confer-
+ence on Machine Learning, 2013.
+Mairal, Julien. Incremental Majorization-Minimization Optimization with Applica-
+tion to Large-Scale Machine Learning. arXiv:1402.4419, February 2014.
+Martens, James. Deep learning via Hessian-free optimization. In Proceedings of the
+27th International Conference on Machine Learning (ICML), volume 951, pp.
+2010, 2010.
+Papakonstantinou, JM. Historical Development of the BFGS Secant Method and Its
+Characterization Properties. 2009.
+Pascanu, Razvan, Mikolov, Tomas, and Bengio, Yoshua. On the difﬁculty of training
+Recurrent Neural Networks. arXiv preprint arXiv:1211.5063., November 2012.
+Rifai, Salah, Vincent, Pascal, Muller, Xavier, Glorot, Xavier, and Bengio, Yoshua.
+Contractive auto-encoders: Explicit invariance during feature extraction. In Pro-
+ceedings of the 28th International Conference on Machine Learning (ICML-11),
+pp. 833–840, 2011.
+Robbins, Herbert and Monro, Sutton.
+A stochastic approximation method.
+The
+Annals of Mathematical Statistics, pp. 400–407, 1951.
+Roux, N Le, Schmidt, M, and Bach, F.
+A Stochastic Gradient Method with an
+Exponential Convergence Rate for Finite Training Sets. NIPS, 2012.
+Schraudolph, Nicol, Yu, Jin, and G¨unter, Simon. A stochastic quasi-Newton method
+for online convex optimization. AIstats, 2007.
+Schraudolph, Nicol N.
+Local gain adaptation in stochastic gradient descent.
+In
+Artiﬁcial Neural Networks, 1999. ICANN 99. Ninth International Conference on
+(Conf. Publ. No. 470), volume 2, pp. 569–574. IET, 1999.
+Shanno, DF.
+Conditioning of quasi-Newton methods for function minimization.
+Mathematics of computation, 1970.
+Sohl-Dickstein, Jascha. The Natural Gradient by Analogy to Signal Whitening, and
+Recipes and Tricks for its Use. arXiv:1205.1828v1, May 2012.
+Sohl-Dickstein, Jascha, Battaglino, Peter, and DeWeese, Michael.
+New Method
+for Parameter Estimation in Probabilistic Models: Minimum Probability Flow.
+Physical Review Letters, 107(22):11–14, November 2011a. ISSN 0031-9007.
+doi: 10.1103/PhysRevLett.107.220601.
+Sohl-Dickstein, Jascha, Battaglino, Peter B., and DeWeese, Michael R. Minimum
+Probability Flow Learning. International Conference on Machine Learning, 107
+(22):11–14, November 2011b. ISSN 0031-9007. doi: 10.1103/PhysRevLett.107.
+220601.
+Sunehag, Peter, Trumpf, Jochen, Vishwanathan, S V N, and Schraudolph,
+Nicol.
+Variable metric stochastic approximation theory.
+arXiv preprint
+arXiv:0908.3529, August 2009.
+Vinyals, Oriol and Povey, Daniel. Krylov subspace descent for deep learning. arXiv
+preprint arXiv:1111.4259, 2011.
+
+Fast large-scale optimization by
+unifying stochastic gradient and
+quasi-Newton methods -
+Supplemental Material
+A. Computational Complexity
+Here we provide a description of the computational cost
+of each component of the SFO algorithm. See Table A.1.
+The computational cost of matrix multiplication for N ×N
+matrices is taken to be O
+ N 2.4
+.
+A.1. Function and Gradient Computation
+By deﬁnition, the cost of computing the function value and
+gradient for each subfunction is O (Q), and this must be
+done N times to complete a full effective pass through all
+the subfunctions, yielding a total cost per pass of O (QN).
+A.2. Subspace Projection
+Once per iteration, the updated parameter values xt must
+be projected from the N dimensional adaptive low dimen-
+sional subspace into the full M dimensional parameter
+space. Similarly, once per iteration the gradient must be
+projected from the full M dimensional parameter space
+into the N dimensional subspace. See Section 2.3. Ad-
+ditionally the residual of the gradient projection must be
+appended to the subspace as described in Equation 8. Each
+of these operations has cost O (MN), stemming from mul-
+tiplication of a parameter or gradient vector by the sub-
+space matrix Pt. They are performed N times per effec-
+tive pass through the data, yielding a total cost per pass of
+O
+ MN 2
+.
+A.3. Subspace Collapse
+In order to constrain the dimensionality Kt of the subspace
+to remain order O (N), the subspace must be collapsed ev-
+ery O (N) steps, or O (1) times per pass. This is described
+in Section 2.3.2. The collapsed subspace is computed using
+a QR decomposition on the history terms (see Equation 9)
+within the current subspace, with computational complex-
+ity O
+ N 3
+. The old subspace matrix P is then projected
+into the new subspace matrix P′, involving the multiplica-
+tion of a O (M × N) matrix with a O (N × N) projection
+matrix, with corresponding complexity O
+ MN 1.4
+. The
+total complexity per pass is thus O
+ MN 1.4 + N 3
+.
+A.4. Minimize Gt (x)
+Gt (x) is minimized by an explicit matrix inverse in Equa-
+tion 5. Computing this inverse has cost O
+ N 2.4
+, and must
+be performed N times per effective pass through the data.
+With only small code changes, this inverse could instead be
+updated each iteration using the Woodbury identity and the
+inverse from the prior step, with cost O
+ N 2
+. However,
+minimization of Gt (x) is not a leading contributor to the
+overall computational cost, and so increasing its efﬁciency
+would have little effect.
+A.5. BFGS
+The BFGS iterations are performed in the O (L) di-
+mensional subspace deﬁned by the columns of ∆f ′ and
+∆x. Since BFGS consists of L rank two updates of an
+O (L × L) matrix, the cost of performing BFGS iterations
+is O
+ L3
+. See Section 2.4.2. The cost of using a QR de-
+composition to compute the L dimensional subspace de-
+ﬁned by the columns of ∆f ′ and ∆x is O
+ NL2
+, and the
+cost of projecting the L history terms of length N into the
+subspace is O
+ NL1.4
+. BFGS is performed N times per
+effective pass through the data. The total cost of BFGS is
+therefore O
+ N 2L2 + NL3
+.
+In the current implementation, the full BFGS chain for
+a subfunction is recomputed every iteration.
+However,
+BFGS could be modiﬁed to only compute the rank two
+update to the prior Hessian approximation at each itera-
+tion. This would sacriﬁce the history-dependent initializa-
+tion described in Section 3.1. The resulting complexity per
+iteration would instead be O
+ N 2
+, and the computational
+complexity per pass would instead be O
+ N 3
+. BFGS is
+also not a leading contributor to the overall computational
+cost, and so increasing its efﬁciency would have little ef-
+fect.
+B. Objective Functions
+A more detailed description of the objective functions used
+for experiments in the main text follows.
+B.1. Logistic Regression
+We chose the logistic regression objective, L2 regulariza-
+tion penalty, and training dataset to be identical to the pro-
+tein homology test case in the recent Stochastic Average
+Gradient paper (Roux et al., 2012), to allow for direct com-
+parison of techniques. The one difference is that our total
+objective function is divided by the number of samples per
+minibatch, but unlike in (Roux et al., 2012) is not also di-
+vided by the number of minibatches. This different scaling
+places the hyperparameters for all optimizers in the same
+range as for our other experiments.
+
+Sum of Functions Optimizer
+B.2. Autoencoder
+We trained a contractive autoencoder, which penalizes the
+Frobenius norm of the Jacobian of the encoder function,
+on MNIST digits. Autoencoders of this form have been
+successfully used for learning deep representations in neu-
+ral networks (Rifai et al., 2011). Sigmoid nonlinearities
+were used for both encoder and decoder. The regulariza-
+tion penalty was set to 1, and did not depend on the num-
+ber of hidden units. The reconstruction error was divided
+by the number of training examples per minibatch. There
+were 784 visible units, and 256 hidden units.
+B.3. Independent Components Analysis
+We trained an Independent Components Analysis (ICA)
+(Bell & Sejnowski, 1995) model with Student’s t-
+distribution prior on MNIST digits by minimizing the neg-
+ative log likelihood of the ICA model under the digit im-
+ages. Both the receptive ﬁelds and the Student’s t shape
+parameter were estimated. Digit images were preprocessed
+by performing PCA whitening and discarding components
+with variance less than 10−4 times the maximum variance.
+The objective function was divided by the number of train-
+ing examples per minibatch.
+B.4. Ising Model / Hopﬁeld Network via MPF
+We trained an Ising/Hopﬁeld model on MNIST digits, us-
+ing code from (Hillar et al., 2012). Optimal Hopﬁeld net-
+work storage capacity can be achieved by training the cor-
+responding Ising model via MPF (Hillar et al., 2012; Sohl-
+Dickstein et al., 2011b;a). The MPF objective was divided
+by the number of training examples per minibatch. An L2
+regularization penalty with coefﬁcient 0.01 was added to
+the objective for each minibatch.
+B.5. Multilayer Perceptron
+We trained a deep neural network to classify digits on the
+MNIST digit recognition benchmark. We used a similar
+architecture to (Hinton et al., 2012). Our network consisted
+of: 784 input units, one hidden layer of 1200 units, a second
+hidden layer of 1200 units, and 10 output units. We ran the
+experiment using both rectiﬁed linear and sigmoidal units.
+The objective used was the standard softmax regression on
+the output units. Theano (Bergstra & Breuleux, 2010) was
+used to implement the model architecture and compute the
+gradient.
+B.6. Deep Convolutional Network
+We trained a deep convolutional network on CIFAR-10 us-
+ing max pooling and rectiﬁed linear units. The architecture
+we used contains two convolutional layers with 48 and 128
+units respectively, followed by one fully connected layer of
+240 units. This architecture was loosely based on (Good-
+fellow & Warde-Farley, 2013a). Pylearn2 (Goodfellow &
+Warde-Farley, 2013b) and Theano were used to implement
+the model.
+C. Implementation Details
+Here we expand on the implementation details which are
+outlined in Section 3 in the main text. Figure C.1 provides
+empirical motivation for several of the design choices made
+in this paper, by showing the change in convergence traces
+when those design choices are changed. Note that even
+when these design choices are changed, convergence is still
+more rapid than for the competing techniques in Figure 3.
+C.1. BFGS Initialization
+No History
+An approximate Hessian can only be com-
+puted as described in Section 2.4 after multiple gradient
+evaluations. If a subfunction j only has one gradient evalu-
+ation, then its approximate Hessian Ht
+j is set to the identity
+times the median eigenvalue of the average Hessian of the
+other active subfunctions. If j is the very ﬁrst subfunc-
+tion to be evaluated, Ht
+j is initialized as the identity matrix
+times a large positive constant (106).
+The First BFGS Step
+The initial approximate Hessian
+matrix used in BFGS is set to a scaled identity matrix,
+so that B0 = βI.
+This initialization will be overwrit-
+ten by Equation 10 for all explored directions. It’s pri-
+mary function, then, is to set the estimated Hessian for
+unexplored directions. Gradient descent routines tend to
+progress from directions with large slopes and curvatures,
+and correspondingly large eigenvalues, to directions with
+shallow slopes and curvatures, and smaller eigenvalues.
+The typical eigenvalue in an unexplored direction is thus
+expected to be smaller than in previously explored direc-
+tions. We therefore set β using a measure of the smallest
+eigenvalue in an explored direction
+The scaling factor β is set to the smallest non-zero eigen-
+value of a matrix Q, β = minλQ>0 λQ, where λQ indi-
+cates the eigenvalues of Q. Q is the symmetric matrix with
+the smallest Frobenius norm which is consistent with the
+squared secant equations for all columns in ∆f ′ and ∆x.
+That is,
+Q =
+h
+(∆x)+T (∆f ′)T ∆f ′(∆x)+i 1
+2 ,
+(12)
+where + indicates the pseudoinverse, and 1
+2 indicates the
+matrix square root. All of the eigenvalues of Q are non-
+negative. Q and λQ are computed in the subspace deﬁned
+by ∆f ′ and ∆x, reducing computational cost (see Section
+4.1).
+
+Sum of Functions Optimizer
+C.2. Enforcing Positive Deﬁniteness
+It is typical in quasi-Newton techniques to enforce that the
+Hessian approximation remain positive deﬁnite. In SFO,
+at the end of the BFGS procedure, each Ht
+i is constrained
+to be positive deﬁnite by performing an eigendecomposi-
+tion, and setting any eigenvalues which are too small to
+the median positive eigenvalue. The median is used be-
+cause it provides a measure of “typical” curvature. When
+an eigenvalue is negative (or extremely close to 0), it pro-
+vides a poor estimate of curvature over the interval required
+to reach a minimum in the direction of the corresponding
+eigenvector. Replacing it with the median eigenvalue there-
+fore provides a more reasonable estimate. If λmax is the
+maximum eigenvalue of Ht
+i, then any eigenvalues smaller
+than γλmax are set to be equal to medianλ>0 λ. For all
+experiments shown here, γ = 10−8. As described in Sec-
+tion 2.3, a shared low dimensional representation makes
+this eigenvalue computation tractable.
+C.3. Choosing a Target Subfunction
+The subfunction j to update in Equation 6 is chosen as,
+j = argmax
+i
+
+xt −xτiT Qt 
+xt −xτi
+,
+(13)
+where τi indicates the time at which subfunction i was last
+evaluated, and Q is either set to either Ht
+i or Ht, with prob-
+ability 1
+2 for each.
+That is, the updated subfunction is the one which was last
+evaluated farthest from the current location, using the ap-
+proximate Hessian as a metric. This is motivated by the
+observation that the approximating functions which were
+computed farthest from the current location tend to be the
+functions which are least accurate at the current location,
+and therefore the most useful to update. The approximate
+Hessian Ht
+i for the single subfunction is typically a more
+accurate measure of distance for that subfunction – but we
+also use the approximate Hessian Ht for the full objective
+in order to avoid a bad Hessian estimate for a single sub-
+function preventing that subfunction from ever being eval-
+uated.
+This contrasts with the cyclic choice of subfunction in
+(Blatt et al., 2007), and the random choice of subfunction
+in (Roux et al., 2012). See Supplemental Figure C.1 for
+a comparison of the optimization performance correspond-
+ing to each update ordering scheme.
+C.4. Growing the Number of Active Subfunctions
+For many problems of the form in Equation 1, the gradient
+information is nearly identical between the different sub-
+functions early in learning. We therefore begin with only
+a small number of active subfunctions, and expand the ac-
+tive set as learning progresses. We expand the active set
+by one subfunction every time the average gradient shrinks
+to within a factor α of the standard error in the average
+gradient. This comparison is performed using the inverse
+approximate Hessian as the metric. That is, we increment
+the active subset whenever
+  ¯f ′tT Ht−1 ¯f ′t < α
+P
+i (f ′t
+i )T Ht−1f ′t
+i
+(N t −1) N t
+,
+(14)
+where N t is the size of the active subset at time t, Ht is the
+full Hessian, and ¯f ′t is the average gradient,
+¯f ′t = 1
+N t
+X
+i
+fi
+′  xt
+i
+
+.
+(15)
+For all the experiments shown here, α = 1, and the ini-
+tial active subset size is two. We additionally increased
+the active active subset size by 1 when a bad update is de-
+tected (Section 3.5) or when a full pass through the active
+batch occurs without a batch size increase. See Supple-
+mental Figure C.1 for a comparison to the case where all
+subfunctions are initially active.
+C.5. Detecting Bad Updates
+For some ill-conditioned problems, such as ICA with a
+Student’s t-prior (see Section 5), we additionally found it
+necessary to identify bad proposed parameter updates. In
+BFGS and LBFGS, bad update detection is also performed,
+but it is achieved via a line search on the full objective.
+Since we only evaluate a single subfunction per update
+step, a line search on the full objective is impossible. Up-
+dates are instead labeled bad when the value of a subfunc-
+tion has increased since its previous evaluation, and also
+exceeds its approximating function by more than the corre-
+sponding reduction in the summed approximating function
+(ie fj (xt) −gt−1
+j
+(xt) > Gt−1  xt−1
+−Gt−1 (xt)).
+When a bad update proposal is detected, xt is reset to its
+previous value xt−1. The BFGS history matrices ∆f ′ and
+∆x are also updated to include the change in gradient in the
+failed update direction. Additionally, after a failed update,
+the update step length in Equation 5 is temporarily short-
+ened. It then decays back towards 1 with a time constant of
+one data pass. That is, the step length is updated as,
+ηt+1 =
+
+1
+N + N−1
+N ηt
+successful update
+1
+2ηt
+failed update .
+(16)
+This temporary shortening of the update step length is mo-
+tivated by the observation that when the approximate Hes-
+sian for a single subfunction becomes inaccurate it has of-
+ten become inaccurate for the remaining subfunctions as
+well, and failed update steps thus tend to co-occur.
+
+Sum of Functions Optimizer
+SFO all active
+SFO cyclic
+SFO random
+SFO rank 1
+SFO standard
+(a)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-16
+10
+-14
+10
+-12
+10
+-10
+10
+-8
+10
+-6
+10
+-4
+10
+-2
+10
+0
+10
+2
+Full Batch Objective - Minimum
+Logistic Regression, Protein Dataset
+(b)
+0
+10
+20
+30
+40
+50
+Effective Passes Through Data
+10
+-11
+10
+-9
+10
+-7
+10
+-5
+10
+-3
+10
+-1
+10
+1
+10
+3
+10
+5
+Full Batch Objective - Minimum
+Ising / Hopfield with MPF Objective
+Figure C.1. SFO is insensitive to several speciﬁc design decisions. Plots showing the consequences of changing several of the design
+choices made in SFO for (a) the logistic regression objective, and (b) the Ising / Hopﬁeld objective. SFO as described in this paper
+corresponds to the SFO standard line. All other lines correspond to changing a single design choice. SFO rank 1 corresponds to using
+a rank 1 rather than BFGS update (Section 2.4). SFO all active corresponds to starting optimization with all the subfunctions active
+(Section 3.4). SFO random and SFO cyclic correspond to random and cyclic update ordering, rather than maximum distance ordering
+(Section 3.3). For all design choices, SFO outperforms all other techniques in Figure 3.
+Operation
+One time cost
+Repeats per pass
+Cost per pass
+Function and gradient computation
+O (Q)
+O (N)
+O (QN)
+Subspace projection
+O (MN)
+O (N)
+O
+ MN 2
+Subspace collapse
+O
+ MN 1.4 + N 3
+O (1)
+O
+ MN 1.4 + N 3
+Minimize Gt (x)
+≤O
+ N 2.4
+O (N)
+≤O
+ N 3.4
+BFGS
+≤O
+ NL2 + L3
+O (N)
+≤O
+ N 2L2 + NL3
+Total
+O
+ QN + MN 2 + N 3.4 + N 2L2 + NL3
+Table A.1. Computational cost for components of SFO. Q is the cost of evaluating the objective function and gradient for a single
+subfunction, M is the number of parameter dimensions, N is the number of subfunctions, L is the number of history terms kept per
+subfunction. Typically, M ≫N ≫L. In this case all contributions besides O
+ QN + MN 2
+become small. Additionally the number
+of subfunctions can be chosen such that O (QN) = O
+ MN 2
+(see Section 4.1.1 in the main paper). Contributions labeled with ‘≤’
+could be reduced with small changes in implementation, as described in Section A. However as also discussed, and as illustrated by
+Figure 2 in the main text, they are not typically the leading terms in the cost of the algorithm.
+

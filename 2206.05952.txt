@@ -1,0 +1,2042 @@
+SIχO: Smoothing Inference with Twisted Objectives
+Dieterich Lawson∗,
+Allan Raventós∗,
+Andrew Warrington∗,
+Scott Linderman
+{jdlawson, aravento, awarring, scott.linderman}@stanford.edu
+Stanford University
+June 22, 2022
+Abstract
+Sequential Monte Carlo (SMC) is an inference algorithm for state space models that
+approximates the posterior by sampling from a sequence of target distributions. The
+target distributions are often chosen to be the ﬁltering distributions, but these ignore
+information from future observations, leading to practical and theoretical limitations
+in inference and model learning. We introduce SIXO, a method that instead learns
+targets that approximate the smoothing distributions, incorporating information from
+all observations. The key idea is to use density ratio estimation to ﬁt functions that
+warp the ﬁltering distributions into the smoothing distributions. We then use SMC with
+these learned targets to deﬁne a variational objective for model and proposal learning.
+SIXO yields provably tighter log marginal lower bounds and oﬀers signiﬁcantly more
+accurate posterior inferences and parameter estimates in a variety of domains.
+1
+Introduction
+In this work we consider model learning and approximate posterior inference in probabilistic
+state space models. Sequential Monte Carlo (SMC) is a general-purpose method for these
+problems [1–3] that produces an unbiased estimate of the marginal likelihood as well as latent
+state trajectories (i.e. particles) that can be used to approximate posterior expectations.
+SMC can facilitate model learning via expectation-maximization or direct maximization of
+the marginal likelihood estimate [4, 5]. It can also be cast in a variational framework [6, 7] as
+a rich family of approximate posterior distributions that can be ﬁt using stochastic gradient
+ascent and modern automatic diﬀerentiation methods [8–12].
+The quality of SMC’s marginal likelihood and posterior estimates is driven by two
+design decisions: the choice of proposal distributions and target distributions. The proposal
+distributions specify how particles propagate from one time step to the next while the
+target distributions specify how those particles are weighted and which ones survive to
+future time steps. The most common SMC variant, ﬁltering SMC, sets the targets to the
+ﬁltering distributions, the conditional distributions over latent states x1:t = (x1, . . . , xt) given
+observations y1:t = (y1, . . . , yt). The central issue is that the ﬁltering distributions do not
+incorporate information from future observations yt+1:T .
+∗Equal contribution.
+1
+arXiv:2206.05952v2  [cs.LG]  20 Jun 2022
+
+−5
+0
+5
+10
+15
+xt
+pθ(xt|y1:t)
+(a) Filtering distributions
+−5
+0
+5
+10
+15
+xt
+pθ(xt|y1:T )
+(b) Smoothing distributions
+yT
+1
+4
+7
+10
+Timestep t
+0
+2
+4
+6
+8
+10
+xt
+(c) FIVO particle lineages
+1
+4
+7
+10
+Timestep t
+0
+2
+4
+6
+8
+10
+xt
+(d) SIXO particle lineages
+yT
+t=1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Figure 1: Theoretical and empirical target distributions for a Gaussian random walk with
+a single observation yT = 10 and y1:T−1 = ∅. (a) For t = 1, . . . , 9 the ﬁltering distributions
+reduce to a series of mean-zero Gaussians.
+At t = T = 10, the ﬁltering distribution
+incorporates the observation yT , resulting in a sudden shift and particle death. (b) In
+contrast, the smoothing distributions steadily shift towards the observation, matching the
+posterior perfectly. (c) The proposal learned by a previous method, FIVO [8–10], exploits
+smoothing information to propose particles upwards towards the observed value. However,
+FIVO is based on ﬁltering SMC which “resists” this by resampling particles back towards
+the prior, resulting in particle degeneracy. (d) SIXO’s proposal also leverages smoothing
+information, but proposed particles are preserved by the learned target distributions.
+Figure 1 illustrates why setting the target distributions to the ﬁltering distributions can
+be problematic. In this example, the latent states follow a simple Gaussian random walk,
+but only the last step is observed. Thus, the ﬁltering distributions reduce to the prior, a
+series of mean zero Gaussians shown in Figure 1a. If the observation is far from the prior,
+the ﬁltering distribution suddenly jumps at time T = 10. This is a recipe for disaster in
+SMC: the particles at time T −1 will be distributed according to a mean zero Gaussian and
+very few will survive to the next time step, causing the variance of the SMC estimator to
+explode. Even if the proposals incorporate smoothing information, using ﬁltering targets can
+cause particle degeneracy by resampling away high-quality particles, as seen in Figure 1c.
+Suppose instead that the target distributions were the smoothing distributions—the
+conditional distributions over latents x1:t given all observations y1:T . Figure 1b shows
+the smoothing distributions for the simple Gaussian random walk. Unlike the ﬁltering
+distributions, the smoothing distributions shift steadily toward the observation over time.
+These slow, smooth changes are ideal for SMC: Figure 1d shows many particles surviving
+from one step to the next, resulting in a low-variance SMC estimator.
+2
+
+In practice we do not have access to the smoothing distributions—if we did, there
+would be no need for SMC! Here, we introduce a new method called SIXO: Smoothing
+Inference with Twisted Objectives. SIXO provides a uniﬁed approach for learning model and
+proposal parameters, as well as a set of twisting functions that warp the ﬁltering distributions
+into targets that better approximate the smoothing distributions [13]. Like its predecessor
+FIVO [8–10], SIXO uses a variational approach, deriving a lower bound to the marginal
+likelihood. Unlike its predecessor, we prove that the SIXO bound can become tight, even
+with ﬁnitely many particles.
+The key challenge with SIXO is learning the twisting functions. We ﬁnd that a simple
+density ratio estimation approach works best, and we propose an algorithm that interleaves
+twist updates with updates to the model and proposal. Thus, SIXO oﬀers a means of jointly
+learning model parameters, SMC proposals, and targets for accurate posterior inference.
+Finally, we give empirical evidence to support our theoretical claims. Across a range of
+experiments with a Gaussian diﬀusion, a stochastic volatility model of currency exchange
+rates, and a Hodgkin-Huxley model of membrane potential in a neuron, SIXO consistently
+outperforms FIVO and related methods. We dissect these results to illustrate how learning
+better targets enables more eﬀective posterior inference and model learning.
+2
+Background
+Consider modeling sequential data y1:T ∈YT using latent variables x1:T ∈X T with Marko-
+vian structure, and let the joint distribution factorize as
+pθ(x1:T , y1:T ) = pθ(x1)pθ(y1 | x1)
+T
+Y
+t=2
+pθ(xt | xt−1)pθ(yt | xt)
+(1)
+with global parameters θ ∈Θ.
+We further assume that the conditional distributions
+pθ(xt | xt−1) and pθ(yt | xt) may depend nonlinearly on xt−1 and xt, respectively.
+The marginal likelihood and posterior for this model class are not readily available from
+the joint distribution due to the intractable integral over the latents x1:T , i.e.
+pθ(y1:T ) =
+Z
+X T pθ(y1:T , x1:T ) dx1:T ,
+cannot easily be computed due to the form of the conditional distributions.
+2.1
+Sequential Monte Carlo
+Sequential Monte Carlo is an algorithm for inference in state-space models that approximates
+the posterior pθ(x1:T | y1:T ) with a set of K weighted particles x1:K
+1:T . These particles are
+constructed by approximately sampling from a sequence of target distributions {πt(x1:t)}T
+t=1,
+with the intuition that sampling from a series of distributions that gradually approach
+the posterior is easier than attempting to sample it directly. The targets are often only
+available up to an unknown normalizing constant Zt, so SMC uses the unnormalized targets
+{γt(x1:t)}T
+t=1 which correspond to the normalized targets via πt(x1:t) = γt(x1:t)/Zt.
+3
+
+SMC repeats three steps: First, a set of latents are sampled from a proposal distribution
+qθ(xk
+t | xk
+t−1, y1:T ) conditional on the current particles x1:K
+1:t−1. Then, each particle is weighted
+using the unnormalized target γt(x1:t) to form an empirical approximation of the normalized
+target distribution. Finally, new particle trajectories x1:K
+1:t are drawn from this approximation
+to the normalized target.
+Ideally the target distributions smoothly approach the posterior so that sampling from
+the target at time t + 1 is easy given samples from the target at time t. However, as long as
+mild technical conditions are met and γT (x1:T ) ∝pθ(x1:T , y1:T ), SMC returns a consistent
+and unbiased estimate of the marginal likelihood pθ(y1:T ) and a set of weighted particles
+approximating the posterior pθ(x1:T | y1:T ) [1–3]. For more details see Appendix B.1 and for
+a thorough treatment of SMC see [1–3].
+2.2
+Filtering SMC and Model Learning
+The most commonly-used SMC algorithm is ﬁltering SMC, which sets the normalized targets
+to the ﬁltering distributions, i.e. πt(x1:t) = pθ(x1:t | y1:t) and γt(x1:t) ∝pθ(x1:t, y1:t). Let
+bZFSMC(θ, y1:T ) be the marginal likelihood estimator returned from running ﬁltering SMC
+with proposal distributions {qθ(xt | x1:t−1, y1:t)}T
+t=1 which may share parameters with pθ.
+Previous work used ﬁltering SMC to ﬁt model parameters by ascending a lower bound on
+the log marginal likelihood called a ﬁltering variational objective (FIVO) [8–10]. The FIVO
+bound is derived using Jensen’s inequality and the unbiasedness of bZFSMC,
+LFIVO(θ, y1:T ) ≜E[log bZFSMC(θ, y1:T )] ≤log E[ bZFSMC(θ, y1:T )] = log pθ(y1:T ),
+(2)
+and is optimized using stochastic gradient ascent in θ [8–10, 14].
+2.3
+Smoothing SMC via Twisting Functions
+The main disadvantage of ﬁltering SMC is that the ﬁltering distributions only condition on
+observations up to the current timestep t, ignoring future observations yt+1:T . This creates
+situations where future observations are highly unlikely given the current latent trajectories,
+which in turn causes particle death, high variance in the normalizing constant estimator, and
+poor inference and model learning [8, 13, 15]. Performing smoothing SMC would resolve this
+issue by choosing the smoothing distributions as targets, i.e. πt(x1:t) = pθ(x1:t | y1:T ) and
+γt(x1:t) ∝pθ(x1:t, y1:T ). Unfortunately, pθ(x1:t, y1:T ) is not readily available from the model
+and computing it is roughly as hard as the original inference problem.
+However, pθ(x1:t, y1:T ) factors into the product of the ﬁltering distributions, pθ(x1:t, y1:t),
+and the lookahead distributions, pθ(yt+1:T | xt) (Appendix B.2). If the lookahead distributions
+can be well-approximated by a series of “twisting” functions [13], {r(yt+1:T , xt)}T
+t=1, then
+running SMC with targets γt(x1:t) = pθ(x1:t, y1:t)r(yt+1:T , xt) would approximate smoothing
+SMC. In this sense, the lookahead distributions are optimal twisting functions [13, 16].
+Diﬀerent twisting functions yield diﬀerent SMC methods such as auxiliary particle
+ﬁlters and twisted particle ﬁlters [13, 17].
+However, as long as the ﬁnal unnormalized
+target γT (x1:T ) is proportional to pθ(x1:T , y1:T ) and regularity conditions are met, SMC will
+produce an unbiased estimate of the marginal likelihood regardless of the choice of twisting
+functions [1, 3, 18]. Instead, the quality of the twisting functions aﬀects the variance of
+SMC’s marginal likelihood estimate.
+4
+
+3
+SIXO: Model Learning with Smoothing SMC
+Our goal is to ﬁt models by optimizing a lower bound on their log marginal likelihood
+constructed using smoothing SMC. To construct the lower bound, ﬁx rψ(xT ) = 1 and let
+bZSIXO(θ, ψ, y1:T ) be the marginal likelihood estimator returned from running SMC with
+unnormalized targets {pθ(x1:t, y1:t)rψ(yt+1:T , xt)}T
+t=1 and proposal distributions {qθ(xt |
+x1:t−1, y1:T )}T
+t=1. Because the T th unnormalized target is pθ(x1:T , y1:T ), bZSIXO will be an
+unbiased estimator of the marginal likelihood pθ(y1:T ) [1, 3]. This implies via Jensen’s
+inequality that
+LSIXO(θ, ψ, y1:T ) ≜E
+h
+log bZSIXO(θ, ψ, y1:T )
+i
+≤log E
+h
+bZSIXO(θ, ψ, y1:T )
+i
+= log pθ(y1:T )
+(3)
+i.e. LSIXO(θ, ψ, y1:T ) is a lower bound on the log marginal likelihood log pθ(y1:T ) [14].
+3.1
+The Functional Form of the Twists
+The structure of the lookahead distributions pθ(yt+1:T | xt) suggests a functional form for rψ
+that accepts a single latent xt and produces distributions over all future observations yt+1:T .
+Because the twists will be evaluated once per particle and timestep in an SMC sweep, this
+functional form would lead to an algorithm with O(T 2) complexity. To reduce the complexity,
+we consider two methods: ﬁxed-lag twisting and backwards twisting.
+Fixed-lag twisting approximates the full lookahead distribution pθ(yt+1:T | xt) using
+a ﬁxed window of L observations, i.e. it models pθ(yt+1:t+L | xt) [17, 19, 20]. We deﬁne the
+ﬁxed-lag twisting functions {rψ(yt+1:t+L, xt)}T−1
+t=1 as a sequence of functions which accept
+xt ∈X and produce a distribution over yt+1:t+L ∈YL. This reduces the computational
+complexity to O(TL) at the cost of only looking at L observations.
+In our experiments we use an L = 1 twist that scores the next observation by approxi-
+mating the one-step lookahead
+pθ(yt+1 | xt) =
+Z
+pθ(yt+1 | xt+1)pθ(xt+1 | xt) dxt+1
+(4)
+with Gauss-Hermite quadrature [21]. We refer to this as the “quadrature twist”.
+Backwards twisting is motivated by rewriting the lookahead distributions using Bayes’
+rule,
+pθ(yt+1:T | xt) = pθ(xt | yt+1:T ) pθ(yt+1:T )
+pθ(xt)
+∝pθ(xt | yt+1:T )
+pθ(xt)
+,
+(5)
+dropping terms independent of xt because the twisting functions will be used to score
+particles in SMC. Thus, we need only approximate pθ(xt | yt+1:T )/pθ(xt). The numerator
+pθ(xt | yt+1:T ) is the reverse of the lookahead distributions—it is a distribution over a single
+latent conditioned on future observations. This makes it possible to parameterize the twists
+5
+
+Algorithm 1 SIXO-DRE
+1: procedure SIXO-DRE(y1:T , θ0, ψ0, S, N, K)
+2:
+for s = 1, . . . , S do
+3:
+ψs =TWIST-UPDATE(θs−1, ψs−1, N)
+4:
+θs =MODEL-UPDATE(y1:T , θs−1, ψs, N, K)
+5:
+return θS, ψS
+6: procedure TWIST-UPDATE(θ, ψ0, N)
+7:
+for i = 1, . . . , N do
+8:
+˜x1:T ∼pθ(x1:T )
+9:
+x1:T , y1:T ∼pθ(x1:T , y1:T )
+10:
+LDRE(ψ) =
+1
+T−1
+PT−1
+t=1 log σ(log rψ(yt+1:T , xt)) + log(1 −σ(log rψ(yt+1:T , ˜xt)))
+11:
+Compute ψi using the gradients of LDRE evaluated at ψi−1
+12:
+return ψN
+13: procedure MODEL-UPDATE(y1:T , θ0, ψ, N, K)
+14:
+for i = 1, . . . , N do
+15:
+bZSIXO(θ) = SMC({pθ(x1:t, y1:t)rψ(yt+1:T , xt)}T
+t=1, {qθ(xt | xt−1, y1:T )}T
+t=1, K)
+16:
+Compute θi using the biased gradients of bZSIXO evaluated at θi−1
+17:
+return θN
+18: procedure SMC({γt(x1:t)}T
+t=1, {qθ(xt | xt−1, y1:T )}T
+t=1, K)
+19:
+See Algorithm 2 in Appendix B.1.
+using a recurrent function approximator (e.g. a recurrent neural network or RNN) run
+backwards across the observations y1:T to produce twist values for each timestep.
+Speciﬁcally, we deﬁne the backwards twists {rψ(yt+1:T , xt)}T−1
+t=1 as a sequence of positive,
+integrable, real-valued functions YT−t × X →R+ with parameters ψ ∈Ψ. Parameterizing
+backward twists with a recurrent function approximator results in O(T) time complexity and
+allows the twist to condition on all future observations, making backwards twisting preferable
+to ﬁxed-lag twisting.
+3.2
+Learning Twists
+Ascending the Uniﬁed Objective
+One way to ﬁt the twists, proposal, and model is to
+ascend LSIXO in the parameters of pθ, qθ, and rψ, similar to FIVO [8–10]. The gradients of
+this objective include score-function terms that arise from the discrete resampling steps in
+SMC. We refer to ascending LSIXO with these unbiased gradients as SIXO-u. Because the
+resampling gradient terms have high variance, SIXO-u is impractical for complex settings
+[8, 11]. For a detailed discussion and derivation of the gradient, see Appendix C.1.
+Density Ratio Estimation
+Note that the optimal backwards twist is proportional to the
+ratio of a “backwards message” pθ(xt | yt:1:T ) and the latent marginal pθ(xt) (Equation 5).
+Thus, we can learn the backwards twist using density ratio estimation (DRE) [22, 23].
+6
+
+DRE via classiﬁcation estimates the ratio of two densities a(x)/b(x) by training a classiﬁer
+to distinguish between samples from a and b. If such a classiﬁer is trained using the logit
+link function, then its raw output will approximate log a(x) −log b(x) up to a constant [23].
+Using this approach, we interpret log rψ(yt+1:T , xt) as the logit of a Bernoulli classiﬁer and
+train it to distinguish between samples from pθ(xt, yt+1:T ) and pθ(xt)pθ(yt+1:T ), which are
+available from the model. When trained in this way, log rψ(yt+1:T , xt) will approximate
+log pθ(xt
+|
+yt+1:T ) −log pθ(xt) up to a constant which can be ignored, for details see
+Appendix C.2 and [23].
+We use the DRE-learned twisting functions in an alternating scheme that ﬁrst holds pθ, qθ
+ﬁxed and updates rψ using density ratio estimation, and then holds rψ ﬁxed and updates pθ
+and qθ by ascending a biased gradient estimator (no resampling terms) of LSIXO(θ, ψ) in θ.
+We call the full alternating procedure for learning θ and ψ SIXO-DRE, see Algorithm 1.
+3.3
+The SIXO Bound Can Become Tight
+Maddison et al. [8] show that the FIVO bound can only become tight in models with
+uncommon dependency structures. We show that the SIXO bound can become tight for any
+model in the class deﬁned in Section 2.
+Proposition 1. Sharpness of the SIXO bound. Let p(x1:T , y1:T ) be a latent variable model
+with Markovian structure as deﬁned in Section 2, let Q be the set of possible sequences
+of proposal distributions indexed by parameters θ ∈Θ, and let R be the set of possible
+sequences of positive, integrable twist functions indexed by parameters ψ ∈Ψ. Assume that
+{p(xt | xt−1, y1:T )}T
+t=1 ∈Q and {p(yt+1:T | xt)}T−1
+t=1 ∈R. Finally, assume LSIXO(θ, ψ, y1:T )
+has the unique optimizer θ∗, ψ∗= arg maxθ∈Θ,ψ∈Ψ LSIXO(θ, ψ, y1:T ).
+Then the following holds:
+1. qθ∗(xt | x1:t−1, y1:T ) = p(xt | x1:t−1, y1:T ) for t = 1, . . . , T,
+2. rψ∗(yt+1:T , xt) ∝p(yt+1:T | xt) up to a constant independent of xt for t = 1, . . . , T −1,
+3. LSIXO(θ∗, ψ∗, y1:T ) = log p(y1:T ) for any number of particles K ≥1.
+Proof. See Appendix C.4.
+This is an important advantage of our work—the SIXO objective is the ﬁrst to recover
+the true marginal likelihood with a ﬁnite number of particles while also being tailored to
+sequential tasks.
+4
+Related Work
+Good references for SMC include Doucet and Johansen [1], Naesseth et al. [2], and Del Moral
+[3] which provides a theoretical treatment of a generalization of SMC called Feynman-Kac
+formulae. Pitt and Shephard [17] introduced the auxiliary particle ﬁlter, an early smoothing
+SMC method which constructs an estimate of the one-step backwards message pθ(yt+1 | xt)
+using simulations from the model. Smoothing SMC in general is discussed thoroughly in
+Briers et al. [15] and Del Moral et al. [24]. Later, Whiteley and Lee [13] introduced twisted
+7
+
+particle ﬁlters, which perform SMC on a twisted model that approximates the smoothing
+distributions by multiplying the model’s ﬁltering distributions with “twisting” functions. Our
+work extends the theoretical framework in Whiteley and Lee [13] by proposing practical and
+eﬀective methods for learning parametric twisting functions.
+To make smoothing SMC computationally tractable, ﬁxed-lag techniques use information
+from only a ﬁxed window of future observations, as introduced in Clapp and Godsill [19]
+and surveyed in Lin et al. [20]. For example, Park and Ionides [25] use simulations from the
+model to estimate ﬁxed-lag twisting functions and Doucet et al. [26] sample blocks of latents
+conditional on their observations via various Monte Carlo methods. These methods suﬀer
+from computational complexity that grows with the window size, and fail to take advantage
+of all future observations.
+Other methods use twisting functions which depend on all observations. Most similar to
+our approach are Guarniero et al. [16] and Heng et al. [27] which learn parametric twists
+using a Bellman-type decomposition of the lookahead distributions p(yt+1:T | xt) in terms of
+the same distributions one step into the future. Del Moral and Murray [28] use Gaussian
+processes to approximate the twists, Lindsten et al. [18] use traditional graphical model
+techniques such as loopy belief propagation and expectation propagation, and Ruiz and
+Kappen [29] use optimal control techniques. None of these approaches consider model
+learning and their twist learning techniques are highly specialized to their problem settings.
+Fitting model parameters via stochastic gradient ascent on an evidence lower bound
+(ELBO) was introduced in Ranganath et al. [30], Hoﬀman et al. [31], Kingma and Welling
+[32], and later generalized to the Monte Carlo objectives (MCO) framework by Mnih and
+Rezende [14]. Since then, works have considered optimizing lower bounds deﬁned by the
+normalizing constant estimators from multiple importance sampling [33], rejection sampling
+and Hamiltonian Monte Carlo [12], ﬁltering SMC [8–10], and smoothing SMC [11, 34, 35].
+The prior work on smoothing SMC used an objective deﬁned by forward ﬁltering backwards
+smoothing [15] which suﬀers from the same particle degeneracy issues as ﬁltering SMC
+and cannot become tight. Kim et al. [36] optimize the importance weighted autoencoder
+(IWAE) bound [33] using a gradient estimator that incorporates a baseline derived from
+future likelihood estimates, but do not use SMC or resampling in their bound.
+5
+Experiments
+We experimentally explore our claims that:
+1. The SIXO bound can become tight while FIVO cannot.
+2. DRE-learned twists enable better posterior inference than ﬁltering SMC.
+3. Model learning with SIXO provides better parameter estimates than FIVO.
+5.1
+Gaussian Drift Diﬀusion
+We ﬁrst consider a one-dimensional Gaussian drift diﬀusion process with joint distribution
+pθ (x1:T , yT ) = N
+ yT | xT + α, σ2
+y
+
+N
+ x1; α, σ2
+x
+ T
+Y
+t=2
+N
+ xt | xt−1 + α, σ2
+x
+
+.
+(6)
+8
+
+0
+100
+200
+300
+400
+Optimization step (1000s)
+10−3
+10−1
+101
+103
+Bound gap
+log p(y1:T ) −L128
+FIVO
+SIXO-u
+SIXO-DRE
+IWAE
+(a) Bound gap for diﬀerent methods.
+0
+100
+200
+300
+400
+Optimization step (1000s)
+5
+10
+15
+σ2
+rt
+True
+1
+3
+5
+7
+9
+(b) Convergence of twist parameters with SIXO-u.
+Figure 2: Bound gap and parameter convergence for the Gaussian drift diﬀusion experiment
+presented in Section 5.1. Further ﬁgures and discussion are included in Appendix D.1.
+The single free model parameter is the drift α, the state is xt ∈R, and the observation is
+yT ∈R. Figures 1a and 1b show that for α = 0 the ﬁltering and smoothing distributions in
+this model quickly diverge, which can lead to poor inference for ﬁltering methods.
+We compare joint model, proposal and twist learning using two variants of SIXO to
+variational inference with the IWAE bound [33] and FIVO with unbiased gradients [8–10]. All
+methods use an independent proposal at each time step parameterized as qt(xt | xt−1, yT ) =
+N(xt; ft(xt−1, yT ), σ2
+qt) where ft is an aﬃne function, a family which contains the optimal
+proposal. SIXO-u uses twists parameterized as rt(yT , xt) = N(yT ; gt(xt), σ2
+rt) where gt is an
+aﬃne function, a family which contains the true lookahead distributions. The SIXO-DRE
+twist log rt(yT , xt) is parameterized as a quadratic function of xt, where the parameters of
+the quadratic function are generated by a neural network with inputs (yT , t). The true log
+density ratio will be quadratic in xt, so if the neural network is suﬃciently ﬂexible, the true
+log density ratio function can be obtained.
+Figure 2a shows the convergence of the variational bound for each method. As expected
+IWAE recovers a tight variational bound, whereas FIVO does not. While SIXO-u does
+recover a tight variational bound, the high variance of the unbiased gradient estimator makes
+it impractical for non-toy problems. Conversely, SIXO-DRE achieves a tight bound but
+under biased, lower variance gradients. This motivates its use in more complex, non-linear
+settings where the unbiased FIVO gradients are not practical. Figure 2b shows that SIXO-u
+recovers the correct twist parameters. More ﬁgures illustrating the convergence of θ and ψ
+are included in Appendix D.1.
+In Figures 1c and 1d we compare particle trajectories under FIVO and SIXO-u. We
+see that FIVO consistently proposes particles with high likelihood under the posterior
+distributions (identical to the smoothing distributions in this case) which are discarded
+by the resampling steps in ﬁltering SMC. In contrast, SIXO both proposes particles with
+high posterior likelihood and retains them through the resampling steps by properly scoring
+particles under the twisted target distributions. These results empirically verify the theoretical
+claims made in Section 3.3.
+9
+
+Table 1: Performance of FIVO and SIXO on the SVM.
+Method
+Train L4
+Method (as in [9])
+Train L2048
+BPF
+Test L2048
+BPF
+FIVO
+6921.29 ± 1.33
+7020.14 ± 2.86
+3352.71 ± 1.3
+SIXO-q
+6928.90 ± 1.24
+7019.65 ± 2.97
+3353.45 ± 1.58
+SIXO-DRE
+6931.51 ± 2.08
+7019.42 ± 3.01
+3354.27 ± 1.60
+5.2
+Stochastic Volatility Model
+We now apply SIXO to a stochastic volatility model (SVM) of monthly foreign exchange
+rates for N = 22 currencies in the period from 9/2007 to 8/2017 [37]. The SVM generative
+model is
+x1 ∼N (0, Q),
+xt = µ + φ ⊙(xt−1 −µ) + νt,
+yt = β ⊙exp
+xt
+2
+
+⊙et,
+(7)
+with transition noise νt ∼N (0, Q), observation noise et ∼N (0, IN×N), states x1:T ∈
+RT×N, and observations y1:T ∈RT×N. All multiplications are performed element-wise
+as represented by ⊙. The model has free parameters µ ∈RN, φ ∈[0, 1]N , β ∈RN
++, and
+Q ∈diag(RN
++) such that there are 4N model parameters. The proposal, qθ, is structured
+as qθ(x1:T ) ∝QT
+t=1 N(xt; µt, Σt)pθ(xt | xt−1) with means µt ∈RN and diagonal covariance
+matrices Σt ∈diag(RN
++) so that there are 2NT proposal parameters. We compare three
+approaches: FIVO, SIXO with quadrature twist (SIXO-q), and SIXO with density ratio twist
+(SIXO-DRE). For more speciﬁcs and hyperparameters, see Appendix D.2.
+Train Performance
+We ﬁrst compare our methods in terms of log marginal likelihood
+lower bounds as in Naesseth et al. [9]. We evaluate all checkpoints after 75% of training
+using each method’s corresponding 4-particle bound; for FIVO we report the FIVO bound,
+for SIXO-q we report the SIXO-q bound, and for SIXO-DRE we report the SIXO-DRE
+bound. Even though SIXO-q only scores a single future observation, it still obtains a 7-nat
+improvement over FIVO. SIXO-DRE, meanwhile, conditions on all future observations and
+obtains a 10-nat improvement over FIVO.
+We also attempt to estimate the true marginal likelihood by computing a bootstrap
+particle ﬁlter’s log marginal lower bound with 2048 particles, denoted L2048
+BPF [38]. Interestingly,
+a one-way ANOVA [39] does not reject the null hypothesis that the training set L2048
+BPF means
+are all equal (p = 0.25), suggesting that the log marginal likelihoods on training data are
+indistinguishable and training performance has saturated. It is clear, however, that SIXO
+performs better inference and makes more eﬃcient use of particles as the L4
+SIXO bounds are
+signiﬁcantly higher than L4
+FIVO for models with similar true marginal likelihoods.
+Test Performance
+We also compare methods on a held-out test set to evaluate each
+method’s inﬂuence on model learning. We construct this test set using the same data source
+as the training set, but use the period of time since Naesseth et al. [9] was published (an
+extra 55 months). Again, we report BPF log marginal lower bounds with 2048 particles and
+ﬁnd that SIXO-DRE outperforms SIXO-q and FIVO.
+10
+
+°100
+°50
+0
+50
+BPF
+SIXO
+yt
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Time, ms
+°100
+°50
+0
+50
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Membrane potential, mV
+Figure 3: Comparison of the ﬁltering distributions generated by a bootstrap particle ﬁlter
+(BPF) (top) and a SIXO sweep (bottom) on synthetic data from the Hodgkin-Huxley model.
+Dotted vertical lines are resampling events. Both sweeps use true model parameters and a
+bootstrap proposal, but SIXO uses DRE-trained twisting functions. We see that the twist
+has reduced the number of erroneous spikes generated under the BPF, and more particles
+accurately predict the initiation of a spike.
+5.3
+Hodgkin-Huxley Model
+We conclude by comparing FIVO and SIXO on the Hodgkin-Huxley (HH) model of neural
+action potentials [40, 41]. A single neuron is represented with a four-dimensional state-space:
+the instantaneous membrane potential and the relative conductivity of three ion gates. A
+noise-corrupted and subsampled membrane potential can be obtained using electrodes [42]
+or voltage imaging [43]. The state of the gates, however, is not observable, and must be
+inferred from the noisy potential recordings. The physiological parameters governing the
+time-evolution of the system are also of interest, such as the base conductance of each of the
+ion channels.
+We implement the HH model as a four-dimensional nonlinear state space model with
+Gaussian transition noise [44]. The observation is a single Gaussian-distributed value with
+mean equal to the instantaneous potential. We subsample observations by a factor of 50 to
+simulate an acquisition frequency of 1kHz. For more details, see Appendix D.3.
+In this model action potentials, or spikes, are rare events that happen quickly and invoke a
+rapid change in the state. Therefore, ﬁltering-based inference is particularly disadvantageous
+as noisy observations may trigger erroneous spikes or “miss” true spikes.
+Inference
+Figure 3 shows a BPF generating spurious spikes and missing the initiation of
+other spikes, demonstrating this shortcoming. SIXO, despite using an unlearned bootstrap
+proposal, generates fewer spurious spikes and fewer particles miss spikes. SIXO also achieves a
+higher log marginal lower bound (−73.88 nats) than the bootstrap particle ﬁlter (−74.89 nats),
+showing that it performs more eﬀective inference. These results hint at broader potential for
+DRE twists as a ﬂexible, general-purpose tool for improving inference in non-linear models.
+11
+
+0
+50
+100
+150
+200
+250
+Optimization step (1000s)
+−60
+−55
+−50
+L256
+BP F
+FIVO
+FIVO+c
+SIXO+c
+True
+(a) Test set L256
+BPF over training.
+0
+50
+100
+150
+200
+250
+Optimization step (1000s)
+−1
+0
+1
+2
+θ relative error
+(b) Relative parameter error over training.
+Figure 4: HH model learning results. SIXO is the only method to recover the true parameter.
+Table 2: Performance of FIVO and SIXO on the Hodgkin-Huxley model.
+Method
+Test L256
+Method
+Test L256
+BPF
+Relative Parameter Error
+(True model)
+(N/A)
+(−48.31)
+(0.0 ± 0.0)
+FIVO
+−50.25 ± 1.38
+−50.21 ± 1.28
+0.46 ± 0.16
+FIVO (+ clip)
+−51.43 ± 0.49
+−51.35 ± 0.29
+0.63 ± 0.02
+SIXO
+−47.94 ± 0.25
+−48.53 ± 0.36
+0.02 ± 0.09
+Model Learning
+We conclude by comparing FIVO and SIXO for parameter recovery in
+Figure 4. The relative parameter error is computed as (θ∗−θtrue)/θtrue. We found gradient
+clipping improves stability in SIXO, so we compare to FIVO with and without clipping.
+FIVO with clipping converges quickly to an incorrect parameter that achieves a low marginal
+likelihood, while FIVO without clipping converges more slowly to parameters that achieves
+a higher bound. SIXO is the only method to recover the correct model, and achieves the
+highest log marginal likelihood.
+6
+Conclusion
+In this work we proposed a method of learning twisting functions for smoothing SMC
+via density ratio estimation. Our approach involves ascending a lower bound on the log
+marginal likelihood that can theoretically become tight, a ﬁrst for sequential Monte Carlo
+objectives. We veriﬁed our theoretical claims by experimentally demonstrating improvements
+over existing techniques in inference and model learning.
+Acknowledgements and Disclosure of Funding
+We thank Matt MacKay for helpful
+discussions and edits. This work was supported by grants from the Simons Collabora-
+tion on the Global Brain (SCGB 697092), the NIH BRAIN Initiative (U19NS113201 and
+R01NS113119). Some of the computation for this work was made possible by Microsoft
+Education Azure cloud credits. Dieterich Lawson was supported in part by a Stanford Data
+Science Fellowship.
+12
+
+References
+[1] Arnaud Doucet and Adam M. Johansen. A tutorial on particle ﬁltering and smoothing:
+Fifteen years later. In Dan Crisan and Boris Rozovsky, editors, The Oxford Handbook
+of Nonlinear Filtering, pages 656–704. Oxford University Press, 2011.
+[2] Christian A. Naesseth, Fredrik Lindsten, Thomas B. Schön, et al. Elements of sequential
+Monte Carlo. Foundations and Trends® in Machine Learning, 12(3):307–392, 2019.
+[3] Pierre Del Moral. Feynman-Kac formulae: genealogical and interacting particle systems
+with applications, volume 88. Springer, 2004.
+[4] Christophe Andrieu, Arnaud Doucet, Sumeetpal S. Singh, and Vladislav B. Tadic.
+Particle methods for change detection, system identiﬁcation, and control. Proceedings
+of the IEEE, 92(3):423–438, 2004.
+[5] Shixiang Shane Gu, Zoubin Ghahramani, and Richard E. Turner. Neural adaptive
+sequential Monte Carlo. Advances in neural information processing systems, 28, 2015.
+[6] David Blei, Alp Kucukelbir, and Jon D. McAuliﬀe. Variational inference: A review for
+statisticians. Journal of the American Statistical Association, 112(518):859–877, 2017.
+[7] Martin J. Wainwright and Michael I. Jordan. Graphical models, exponential families,
+and variational inference. Foundations and Trends® in Machine Learning, 1(1–2):1–305,
+2008.
+[8] Chris J. Maddison, Dieterich Lawson, George Tucker, Nicolas Heess, Mohammad Norouzi,
+Andriy Mnih, Arnaud Doucet, and Yee Whye Teh. Filtering variational objectives.
+Advances in Neural Information Processing Systems, 30, 2017.
+[9] Christian A. Naesseth, Scott Linderman, Rajesh Ranganath, and David Blei. Variational
+sequential Monte Carlo. In International Conference on Artiﬁcial Intelligence and
+Statistics, pages 968–977. PMLR, 2018.
+[10] Tuan Anh Le, Maximilian Igl, Tom Rainforth, Tom Jin, and Frank Wood. Auto-encoding
+sequential Monte Carlo. In 6th International Conference on Learning Representations,
+2018.
+[11] Dieterich Lawson, George Tucker, Christian A. Naesseth, Chris Maddison, Ryan P.
+Adams, and Yee Whye Teh. Twisted variational sequential Monte Carlo. In Third
+workshop on Bayesian Deep Learning (NeurIPS), 2018.
+[12] Dieterich Lawson, George Tucker, Bo Dai, and Rajesh Ranganath. Energy-inspired
+models: Learning with sampler-induced distributions. Advances in Neural Information
+Processing Systems, 32, 2019.
+[13] Nick Whiteley and Anthony Lee. Twisted particle ﬁlters. The Annals of Statistics, 42
+(1):115–141, 2014.
+13
+
+[14] Andriy Mnih and Danilo Rezende. Variational inference for Monte Carlo objectives. In
+International Conference on Machine Learning, pages 2188–2196. PMLR, 2016.
+[15] Mark Briers, Arnaud Doucet, and Simon Maskell. Smoothing algorithms for state–space
+models. Annals of the Institute of Statistical Mathematics, 62(1):61–89, 2010.
+[16] Pieralberto Guarniero, Adam M. Johansen, and Anthony Lee. The iterated auxiliary
+particle ﬁlter. Journal of the American Statistical Association, 112(520):1636–1647,
+2017.
+[17] Michael K. Pitt and Neil Shephard. Filtering via simulation: Auxiliary particle ﬁlters.
+Journal of the American Statistical Association, 94(446):590–599, 1999.
+[18] Fredrik Lindsten, Jouni Helske, and Matti Vihola. Graphical model inference: Sequential
+Monte Carlo meets deterministic approximations. Advances in Neural Information
+Processing Systems, 31, 2018.
+[19] Tim C. Clapp and Simon J. Godsill. Fixed-lag smoothing using sequential importance
+sampling. In José-Miguel Bernardo, James Berger, Philip Dawid, and Adrian Smith,
+editors, Bayesian Statistics 6, pages 743–751. Citeseer, 1999.
+[20] Ming Lin, Rong Chen, and Jun S. Liu. Lookahead strategies for sequential Monte Carlo.
+Statistical Science, 28(1):69–94, 2013.
+[21] Milton Abramowitz and Irene A. Stegun. Handbook of mathematical functions with
+formulas, graphs, and mathematical tables, volume 55. US Government printing oﬃce,
+1964.
+[22] Shakir Mohamed and Balaji Lakshminarayanan. Learning in implicit generative models.
+arXiv preprint arXiv:1610.03483, 2016.
+[23] Masashi Sugiyama, Taiji Suzuki, and Takafumi Kanamori. Density ratio estimation in
+machine learning. Cambridge University Press, 2012.
+[24] Pierre Del Moral, Arnaud Doucet, and Sumeetpal Singh. Forward smoothing using
+sequential Monte Carlo. Technical Report CUED/F-INFENG/TR 638, Cambridge
+University, 2010.
+[25] Joonha Park and Edward L. Ionides. Inference on high-dimensional implicit dynamic
+models using a guided intermediate resampling ﬁlter. Statistics and Computing, 30(5):
+1497–1522, 2020.
+[26] Arnaud Doucet, Mark Briers, and Stéphane Sénécal. Eﬃcient block sampling strategies
+for sequential Monte Carlo methods. Journal of Computational and Graphical Statistics,
+15(3):693–711, 2006.
+[27] Jeremy Heng, Adrian N. Bishop, George Deligiannidis, and Arnaud Doucet. Controlled
+sequential Monte Carlo. The Annals of Statistics, 48(5):2904–2929, Oct 2020. ISSN
+0090-5364. doi: 10.1214/19-aos1914.
+14
+
+[28] Pierre Del Moral and Lawrence M. Murray.
+Sequential Monte Carlo with highly
+informative observations. SIAM/ASA Journal on Uncertainty Quantiﬁcation, 3(1):
+969–997, 2015.
+[29] Hans-Christian Ruiz and Hilbert J. Kappen. Particle smoothing for hidden diﬀusion
+processes: Adaptive path integral smoother. IEEE Transactions on Signal Processing,
+65(12):3191–3203, 2017.
+[30] Rajesh Ranganath, Sean Gerrish, and David Blei. Black box variational inference. In
+International Conference on Artiﬁcial Intelligence and Statistics, pages 814–822. PMLR,
+2014.
+[31] Matthew D. Hoﬀman, David Blei, Chong Wang, and John Paisley. Stochastic variational
+inference. Journal of Machine Learning Research, 2013.
+[32] Diederik Kingma and Max Welling. Auto-encoding variational Bayes. In 2nd Interna-
+tional Conference on Learning Representations, 2014.
+[33] Yuri Burda, Roger Grosse, and Ruslan Salakhutdinov. Importance weighted autoencoders.
+In 4th International Conference on Learning Representations, 2016.
+[34] Antonio Moretti, Zizhao Wang, Luhuan Wu, Iddo Drori, and Itsik Pe’er. Variational
+objectives for Markovian dynamics with backward simulation. In ECAI 2020, pages
+1371–1378. IOS Press, 2020.
+[35] Antonio Moretti, Zizhao Wang, Luhuan Wu, and Itsik Pe’er. Smoothing nonlinear
+variational objectives with sequential Monte Carlo. ICLR Workshop: Deep Generative
+Models for Highly Structured Data, 2019.
+[36] Geon-Hyeong Kim, Youngsoo Jang, Hongseok Yang, and Kee-Eung Kim. Variational
+inference for sequential data with future likelihood estimates. In International Conference
+on Machine Learning, pages 5296–5305. PMLR, 2020.
+[37] Siddhartha Chib, Yasuhiro Omori, and Manabu Asai. Multivariate stochastic volatility.
+In Handbook of ﬁnancial time series, pages 365–400. Springer, 2009.
+[38] Neil Gordon, David Salmond, and Adrian Smith. Novel approach to nonlinear/non-
+gaussian Bayesian state estimation. IEE Proceedings F (Radar and Signal Processing),
+140(2):107–113, April 1993.
+[39] Ronald Aylmer Fisher. Statistical methods for research workers. In Breakthroughs in
+statistics, pages 66–70. Springer, 1992.
+[40] Alan L. Hodgkin and Andrew F. Huxley. A quantitative description of membrane current
+and its application to conduction and excitation in nerve. The Journal of Physiology,
+117(4):500, 1952.
+[41] Peter Dayan and Laurence F. Abbott. Theoretical neuroscience: computational and
+mathematical modeling of neural systems. MIT press, 2005.
+15
+
+[42] Justin M. Kita and R. Mark Wightman. Microelectrodes for studying neurobiology.
+Current Opinion in Chemical Biology, 12(5):491–496, 2008.
+[43] Darcy S. Peterka, Hiroto Takahashi, and Rafael Yuste. Imaging voltage in neurons.
+Neuron, 69(1):9–21, 2011.
+[44] Quentin J.M. Huys and Liam Paninski. Smoothing of, and parameter estimation from,
+noisy biophysical recordings. PLoS computational biology, 5(5):e1000379, 2009.
+[45] Robert Price. A useful theorem for nonlinear devices having Gaussian inputs. IRE
+Transactions on Information Theory, 4(2):69–72, 1958.
+[46] Georges Bonnet. Transformations des signaux aléatoires a travers les systemes non
+linéaires sans mémoire. In Annales des Télécommunications, volume 19-9, pages 203–220.
+Springer, 1964.
+[47] Tim Salimans and David A. Knowles. Fixed-form variational posterior approximation
+through stochastic linear regression. Bayesian Analysis, 8(4):837–882, 2013.
+[48] Danilo Jimenez Rezende, Shakir Mohamed, and Daan Wierstra. Stochastic backpropa-
+gation and approximate inference in deep generative models. In International conference
+on machine learning, pages 1278–1286. PMLR, 2014.
+[49] Ronald J. Williams. Simple statistical gradient-following algorithms for connectionist
+reinforcement learning. Machine Learning, 8(3):229–256, 1992.
+[50] James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary,
+Dougal Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-
+Milne, and Qiao Zhang. JAX: composable transformations of Python+NumPy programs,
+2018. URL http://github.com/google/jax.
+[51] Diederik Kingma, Jimmy Ba, Yoshua Bengio, and Yann LeCun. Adam: A method for
+stochastic optimization. In 3rd International Conference on Learning Representations,
+2015.
+[52] Charles W. Dunnett. Pairwise multiple comparisons in the unequal variance case.
+Journal of the American Statistical Association, 75(372):796–800, 1980.
+[53] Derek C. Sauder and Christine E. DeMars. An updated recommendation for multiple
+comparisons. Advances in Methods and Practices in Psychological Science, 2(1):26–44,
+2019.
+16
+
+Appendices for SIχO: Smoothing Inference with Twisted Ob-
+jectives
+A
+Table of Notation
+Name
+Symbol
+Notes
+Sequence length
+T
+T ∈N
+Timestep
+t
+t ∈{1, . . . , T}
+Latent state
+xt
+xt ∈X
+Observation
+yt
+yt ∈Y
+Observation sequence
+y1:T
+y1:T ∈YT
+Number of SMC particles
+K
+K ∈N
+kth particle latent trajectory
+xk
+1:t
+xk
+1:t ∈X t
+Model and proposal parameters
+θ
+θ ∈Θ
+Twist parameters
+ψ
+ψ ∈Ψ
+Joint distribution
+pθ(x1:T , y1:T )
+Distribution on X T × YT
+tth transition distribution
+pθ(xt | xt−1)
+Conditional distribution on X
+tth observation distribution
+pθ(yt | xt)
+Conditional distribution on Y
+Proposal distributions
+{qθ(xt | xt−1, y1:T )}T
+t=1
+T conditional distributions on X
+Twist functions
+{rψ(yt+1:T , xt)}T −1
+t=1
+T −1 positive integrable functions in X ×
+YT −t−1 × Ψ →R≥0
+Filtering distributions
+{pθ(x1:t | y1:t)}T
+t=1
+T conditional distributions on X t
+Smoothing distribution
+{pθ(x1:t | y1:T )}T
+t=1
+T conditional distributions on X t
+Unnormalized target distributions
+{γt(x1:t)}T
+t=1
+T positive integrable functions in X t →
+R≥0
+Normalized target distributions
+{πt(x1:t)}T
+t=1
+T distributions on X t
+tth normalizing constant
+Zt
+Positive real, πt(x1:t) = γt(x1:t)/Zt
+Bootstrap particle ﬁlter
+BPF
+SMC using p(xt | xt−1) as the proposal and
+no twist.
+Filtering sequential Monte Carlo
+FSMC
+SMC with ﬁltering distributions as targets.
+SIXO-uniﬁed
+SIXO-u
+SIXO objective optimized with unbiased
+gradient ascent.
+SIXO-quadrature
+SIXO-q
+SIXO objective with quadrature twist.
+SIXO-density ratio estimation
+SIXO-DRE
+SIXO with density ratio estimate twist
+BPF bound
+LK
+BPF
+Log marginal likelihood bound from a K-
+particle BPF.
+FIVO bound
+LK
+FIVO
+FIVO bound (2) with K particles.
+SIXO bound
+LK
+SIXO
+SIXO bound (3) with K particles.
+DRE loss
+LDRE
+Loss used to learn twist with DRE.
+17
+
+B
+Background
+B.1
+Sequential Monte Carlo
+Sequential Monte Carlo (SMC) is a popular method for sampling from posterior distributions
+with sequential structure. For a thorough introduction we refer the reader to Doucet and
+Johansen [1] and Naesseth et al. [2]. We reproduce the general SMC algorithm in Algorithm
+2.
+Algorithm 2 Sequential Monte Carlo
+1: procedure SMC({γt(x1:t)}T
+t=1, {qt(xt | x1:t−1)}T
+t=1, K)
+2:
+w1:K
+0
+= 1,
+bZ0 = 1
+3:
+for t = 1, . . . , T do
+4:
+for k = 1, . . . , K do
+5:
+xk
+t ∼qt(xt|xk
+1:t−1)
+6:
+xk
+1:t = (xk
+1:t−1, xk
+t )
+7:
+αk
+t =
+γt(xk
+1:t)
+γt(xk
+1:t−1)qt(xk
+t | xk
+1:t−1)
+8:
+wk
+t = wk
+t−1αk
+t
+9:
+\
+Zt/Zt−1 =
+PK
+k=1 wk
+t
+PK
+k=1 wk
+t−1
+10:
+bZt = bZt−1( \
+Zt/Zt−1)
+11:
+if should resample then
+12:
+for k = 1, . . . , K do
+13:
+ak
+t ∼Categorical(w1:K
+t
+)
+14:
+˜xk
+1:t = xak
+t
+1:t
+15:
+x1:K
+1:t = ˜x1:K
+1:t
+16:
+w1:K
+t
+= 1
+17:
+return bZT , x1:K
+1:T
+B.2
+Factoring the Smoothing Distributions
+Here we show that the smoothing distributions can be factored into the ﬁltering distributions
+and the lookahead distributions.
+Let pθ(x1:T , y1:T ) be a model as deﬁned in (1). Then
+pθ(x1:t, y1:T ) =pθ(x1:t, y1:t)pθ(yt+1:T | y1:t, x1:t)
+(8)
+=pθ(x1:t, y1:t)pθ(yt+1:T | xt),
+(9)
+where yt+1:T is conditionally independent of (y1:t, x1:t−1) given xt because of the Markov
+structure of pθ.
+18
+
+C
+Methods
+C.1
+The Gradients of SMC
+The original FIVO papers [8–10] used biased gradients to optimize LFSMC which ignore
+score-function gradient terms arising from the discrete resampling operations. We use the
+same biased gradient estimator in SIXO-DRE when optimizing LSIXO(θ, ψ, y1:T ) in terms of
+θ, but for SIXO-u we use the full unbiased gradient estimator. We derive both estimators
+here.
+Assume resampling occurs at each timestep, let At = a1:K
+t
+and Xt = x1:K
+t
+be the
+ancestor indices and latents for all particles at time t, and let A = (A1, . . . , AT−1) and
+X = (X1, . . . , XT ) be the full sequence of ancestor indices and latents. We can then write
+the probability distribution over X, A that deﬁnes SMC as
+pSMC(X, A) =
+ K
+Y
+k=1
+q(xk
+1)
+! T
+Y
+t=2
+K
+Y
+k=1
+q(xk
+t |x
+ak
+t−1
+1:t−1)α
+ak
+t−1
+t−1
+(10)
+where αi
+t = αi
+t/(PK
+k=1 αk
+t ) is the normalized incremental weight. When the proposals and
+targets of SMC are parametric functions of θ, both q and α will depend on θ.
+To emphasize its dependence on θ when run with parametric twists and proposals we
+will write pSMC(X, A) as p(X, A; θ). Then the gradient of LSIXO is deﬁned as
+∇θ(LSIXO(θ)) =∇θEX,A∼p(X,A;θ)[log bZ(X, A, θ)]
+(11)
+where we have rewritten bZSIXO(θ, ψ, y1:T ) as bZ(X, A, θ) to emphasize its dependence on
+the random variables X and A and suppress its dependence on ψ and y1:T .
+The ﬁrst step is to reparameterize the expectation in terms of continuous noise instead of
+X [45, 46, 32, 47, 48]. Assume X is from a reparameterizable distribution and let φX(θ, ϵ)
+be a function that deterministically combines continuous noise ϵ and the parameters θ to
+produce a sample X. Then we have
+∇θEX,A[log bZ(X, A, θ)] = ∇θEϵ,A[log bZ(φX(θ, ϵ), A, θ)].
+(12)
+We will further abuse notation by writing bZ(φX(θ, ϵ), A, θ) as bZ(ϵ, A, θ). Rewriting the
+expectation (12) as an integral gives
+∇θEϵ,A[log ˆZ(ϵ, A, θ)] =∇θ
+Z
+log ˆZ(ϵ, A, θ)p(ϵ, A; θ)dϵdA.
+(13)
+Assuming that we can diﬀerentiate under the integral allows us to break the integrand apart
+using the product rule as
+Z
+∇θ(log bZ(ϵ, A, θ))p(ϵ, A; θ) + log bZ(ϵ, A, θ)∇θ(p(ϵ, A; θ))dϵdA.
+(14)
+The left hand term in the integrand of (14) equals Eϵ,A[∇θ log bZ(ϵ, A, θ)], the expectation
+of a gradient that can be estimated using simple Monte Carlo. The right hand term is a
+19
+
+“score-function gradient” [49] which can be rewritten using the fact that ∇θ(log f(θ)) =
+∇θ(f(θ))/f(θ) as
+Z
+log bZ(ϵ, A, θ)∇θ(log p(ϵ, A; θ))p(ϵ, A; θ)dϵdA
+(15)
+which in turn equals the expectation
+Eϵ,A
+h
+log bZ(ϵ, A, θ)∇θ log p(ϵ, A; θ)
+i
+.
+(16)
+Writing both terms together gives the full unbiased gradient that is amenable to estimation
+with simple Monte Carlo,
+Eϵ,A
+h
+∇θ log bZ(ϵ, A, θ) + log bZ(ϵ, A, θ)∇θ log p(ϵ, A; θ)
+i
+.
+(17)
+Similar to prior work [8–11] we ﬁnd that the term on the right hand side of (17) has
+prohibitively high variance which inhibits learning. Dropping it gives the biased SMC
+gradient estimator used in SIXO-DRE,
+Eϵ,A[∇θ log bZ(ϵ, A, θ)],
+(18)
+which can be estimated using open-source autodiﬀsoftware [50].
+The derivation above is adaptable for any resampling schedule that does not depend on
+the parameters (and by extension, the weights), but many common resampling schemes such
+as eﬀective sample size resampling do not meet this requirement. If the resampling scheme
+depends on the parameters of the model, it introduces additional gradient terms which are
+not described here. Thus for SIXO-u experiments which use the full unbiased gradient (17),
+we use a ﬁxed resampling schedule.
+C.2
+Density Ratio Estimation
+Density ratio estimation (DRE) considers estimating ratios of densities, e.g. a(x)/b(x) with
+a(x) and b(x) deﬁned on the same probability space and b(x) > 0 for all x. Instead of
+estimating a(x) and b(x) individually and then forming the ratio, an alternative approach is
+to directly estimate the odds that a given sample of x was drawn from a.
+Let p(x, z) = p(z)p(x | z) be an expanded generative model for x deﬁned as
+z ∼Bernoulli(α),
+(19)
+x ∼a(x)
+if
+z = 1,
+(20)
+x ∼b(x)
+if
+z = 0
+(21)
+with α ∈(0, 1). We can now write the density ratio in terms of conditionals in this generative
+20
+
+model,
+a(x)/b(x) = p(x | z = 1)/p(x | z = 0)
+(22)
+=
+p(x)p(z = 1 | x)
+p(z = 1)
+
+/
+p(x)p(z = 0 | x)
+p(z = 0)
+
+,
+(23)
+=
+p(z = 0)
+p(z = 1)
+
+/
+p(z = 0 | x)
+p(z = 1 | x)
+
+,
+(24)
+=
+1 −α
+α
+ p(z = 1 | x)
+p(z = 0 | x)
+
+.
+(25)
+Thus, the density ratio can be rewritten as proportional to the odds that x was drawn from
+a(x) instead of b(x).
+Density ratio estimation via classiﬁcation suggests training a binary classiﬁer with
+supervised learning to predict z given x [23, 22]. Let σ(x) = 1/(1 + e−x) be the sigmoid
+function and let gψ(x) be a classiﬁer trained with Bernoulli loss to maximize the log probability
+of a dataset z1:N, x1:N sampled IID from p(x, z). Speciﬁcally, ψ is ﬁt by minimizing LDRE(ψ),
+deﬁned as
+LDRE(ψ) ≜Ez1:N,x1:N∼p(x,z)
+"
+log
+N
+Y
+i=1
+Bernoulli(z; σ(gψ(x))
+#
+,
+(26)
+=Ez1:N,x1:N∼p(x,z)
+" N
+X
+i=1
+zi log(σ(gψ(xi))) + (1 −zi) log(σ(gψ(xi)))
+#
+.
+(27)
+If trained in this way, the raw output of gψ(x) will approximate the log-odds that x came
+from a(x) instead of b(x), i.e.
+gψ(x) ≈log
+
+p(z = 1 | x)
+1 −p(z = 1 | x)
+
+= log
+p(z = 1 | x)
+p(z = 0 | x)
+
+.
+(28)
+The log of the density ratio can then be expressed as
+log a(x)/b(x) = log(1 −α) −log(α) + log
+p(z = 1 | x)
+p(z = 0 | x)
+
+,
+(29)
+≈log(1 −α) −log(α) + gψ(x).
+(30)
+Assuming a ﬁxed α parameter, the log-ratio of densities is then proportional to the logit
+produced by gψ up to an additive constant. Thus as long as we can sample training pairs
+(x, z) from the expanded generative model above, we can estimate ratios of densities by
+training a binary classiﬁer.
+C.3
+Alternating Density Ratio Twist Training
+To train the density ratio twist functions we deﬁne a supervised maximum likelihood update
+that is applied oﬄine from the update to the model and proposal parameters. This update
+is shown in Algorithm 1, labeled as DRE.
+21
+
+To deﬁne this update, we use the approach in Section C.2 and set a(x) = pθ(xt | yt+1:T )
+and b(x) = pθ(xt). To generate positive and negative examples for DRE, we ﬁrst sample a
+set of M latent state and observation trajectories from the generative model, x1:M
+1:T , y1:M
+1:T ∼
+pθ(x1:T , y1:T ). Because these are samples from joint distribution they are also samples from
+the conditionals {pθ(xt | yt+1:T )}T−1
+t=1 . We will refer to these samples as positive samples. We
+can then draw a second set of samples, but discard the observed data, ˜x1:M
+1:T ∼pθ(x1:T ). We
+will refer to these as negative samples. The sets of positive and negative examples form the
+data on which we will train the twist classiﬁer. Generating examples sequentially in this
+manner is cheap and parallelizable, allowing us to use relatively large values of M.
+To train the RNN twist, we ﬁrst pass the RNN backwards over an observed data sample
+ym
+1:T to generate a sequence of encodings em
+1:T−1 (noting that we ﬂip the resulting encodings
+so they are “forward” in time). To evaluate the probability of a positive classiﬁcation we
+concatenate the encoding em
+t with xm
+t at each timestep, feed the result into a multi-layer
+perceptron (MLP) with scalar output, and take the output as a positive example Bernoulli
+logit. To evaluate the probability of a negative classiﬁcation we take the same sequence of
+encodings, e1:T−1, concatenate them with ˜xm
+1:T , feed the result at each timestep into the same
+MLP, and take the result as a negative example Bernoulli logit. These outputs are used to
+compute the cross-entropy loss as written in Algorithm 1 at each timestep, which we average
+across time and across positive and negative examples to create the ﬁnal loss. This approach
+allows us to estimate the entire sequence of ratios {pθ(xt | yt+1:T )/pθ(xt)}T−1
+t=1 using a single
+RNN backwards pass.
+C.4
+The SIXO Bound Can Become Tight
+Proposition 1. (Reproduced from Section 3.3) Sharpness of the SIXO bound. Let
+p(x1:T , y1:T ) be a latent variable model with Markovian structure as deﬁned in Section 2, let Q
+be the set of possible sequences of proposal distributions indexed by parameters θ ∈Θ, and let R
+be the set of possible sequences of positive, integrable twist functions indexed by parameters ψ ∈
+Ψ. Assume that {p(xt | xt−1, y1:T )}T
+t=1 ∈Q and {p(yt+1:T | xt)}T−1
+t=1 ∈R. Finally, assume
+LSIXO(θ, ψ, y1:T ) has the unique optimizer θ∗, ψ∗= arg maxθ∈Θ,ψ∈Ψ LSIXO(θ, ψ, y1:T ).
+Then the following holds:
+1. qθ∗(xt | x1:t−1, y1:T ) = p(xt | x1:t−1, y1:T ) for t = 1, . . . , T,
+2. rψ∗(yt+1:T , xt) ∝p(yt+1:T | xt) up to a constant independent of xt for t = 1, . . . , T −1,
+3. LSIXO(θ∗, ψ∗, y1:T ) = log p(y1:T ) for any number of particles K ≥1.
+Proof. First we reproduce the proof in the main text that LSIXO(θ, ψ, y1:T ) ≤p(y1:T ) for any
+setting of θ, ψ. As previously, ﬁx rψ(xT ) = 1 and let bZSIXO(θ, ψ, y1:T ) be the normalizing
+constant estimator returned by SMC run with targets {p(x1:t, y1:t)rψ(yt+1:T , xt)}T
+t=1 and
+proposals {qθ(xt | x1:t−1, y1:T ))}T
+t=1. Then,
+LSIXO(θ, ψ, y1:T ) ≜E
+h
+log bZSIXO(θ, ψ, y1:T )
+i
+(31)
+≤log E
+h
+bZSIXO(θ, ψ, y1:T )
+i
+(32)
+= log p(y1:T ),
+(33)
+22
+
+where (32) holds by Jensen’s inequality and the concavity of log, and (33) holds by the
+unbiasedness of SMC’s marginal likelihood estimator.
+Because LSIXO(θ, ψ, y1:T ) ≤p(y1:T ) and we assume LSIXO(θ, ψ, y1:T ) has a unique
+optimizer, any setting of θ and ψ that causes the bound to hold with equality must be
+θ∗, ψ∗= arg maxθ,ψ LSIXO(θ, ψ, y1:T ). Thus, we conclude the proof by showing that the
+twists {p(yt+1:T | xt)}T−1
+t=1 and proposals {p(xt | x1:t−1, y1:T )}T
+t=1 cause the bound to hold
+with equality.
+We proceed by induction on t, the timestep in the SMC sweep. We will show that for
+t = 1, . . . , T, bZt = p(y1:T ). In proving this we will also show that for each t, wk
+t either equals
+1 or p(y1:T ) for k = 1, . . . , K, depending on whether resampling occurred.
+For t = 1 note that
+1. γ1(xk
+1) = p(xk
+1, y1)p(y2:T | xk
+1),
+2. γ0 ≜1,
+3. and q1(xk
+1) = p(x1 | y1:T ).
+Taken together this implies that the incremental weight αk
+1 is
+αk
+1 = p(xk
+1, y1)p(y2:T | xk
+1)
+p(xk
+1 | y1:T )
+= p(xk
+1, y1:T )
+p(xk
+1 | y1:T ) = p(y1:T )
+(34)
+which does not depend on k. Because wk
+0 ≜1, we have that wk
+1 = wk
+0αk
+1 = p(y1:T ) for all k.
+This in turn implies
+\
+Z1/Z0 =
+PK
+k=1 wk
+1
+PK
+k=1 wk
+0
+= Kp(y1:T )
+K
+= p(y1:T ),
+(35)
+which when combined with the fact that bZ0 ≜1 yields
+bZ1 = bZ0( \
+Z1/Z0) = p(y1:T ).
+(36)
+If resampling occurs at the end of step 1, all weights w1:K
+1
+will be set to 1. Thus we have
+shown that bZ1 = p(y1:T ) and w1:K
+1
+= p(y1:T ) or 1.
+Now assume that bZt−1 = p(y1:T ) and w1:K
+t−1 equals 1 or p(y1:T ). Again, we derive the
+incremental weights αk
+t by noting that
+1. γt(xk
+1:t) = p(xk
+1:t, y1:t)p(yt+1:T | xk
+t ),
+2. γt−1(xk
+1:t−1) = p(xk
+1:t−1, y1:t−1)p(yt:T | xk
+t−1),
+3. and qt(xk
+t ) = p(xk
+t | xk
+1:t−1, y1:T )
+23
+
+which yields αk
+t as
+αk
+t =
+p(xk
+1:t, y1:t)p(yt+1:T | xk
+t )
+p(xk
+1:t−1, y1:t−1)p(yt:T | xk
+t−1)p(xk
+t | xk
+1:t−1, y1:T )
+(37)
+=
+p(xk
+1:t, y1:T )
+p(xk
+1:t−1, y1:T )p(xk
+t | xk
+1:t−1, y1:T )
+(38)
+= p(xk
+1:t−1, y1:T )p(xk
+t | x1:t−1, y1:T )
+p(xk
+1:t−1, y1:T )p(xk
+t | xk
+1:t−1, y1:T )
+(39)
+= 1
+(40)
+for k = 1, . . . , K.
+Now there are two cases depending on the value of the weights at the previous timestep.
+If w1:K
+t−1 = 1, then wk
+t = wk
+t−1wk
+t = 1 for all k, implying that
+\
+Zt/Zt−1 = 1. Alternatively, if
+w1:K
+t−1 = p(y1:T ) then wk
+t = p(y1:T ) for all k which also implies that
+\
+Zt/Zt−1 = 1. Given that
+\
+Zt/Zt−1 = 1 in both cases, and that bZt−1 = p(y1:T ), we have that
+bZt = bZt−1( \
+Zt/Zt−1) = p(y1:T ).
+(41)
+Finally, if resampling occurs then the weights w1:K
+t
+will be set to 1. Thus we have shown
+that bZt = p(y1:T ) and w1:K
+t
+= p(y1:T ) or 1 for each t = 1, . . . , T.
+Note that we have incidentally shown that all weights are equal at each step of SMC
+for the optimal proposals and twisting functions. This implies that the variance of the
+importance weights is minimized (i.e. is 0), and if eﬀective sample size is used to trigger
+resampling, resampling will never occur.
+D
+Experiments
+Code for reproduction of all experiments is released here: https://github.com/lindermanlab/
+sixo. Links to Weights and Biases experimental logs are also contained in the GitHub repos-
+itory.
+D.1
+Gaussian Drift Diﬀusion
+D.1.1
+Model Details
+The one-dimensional Gaussian drift-diﬀusion process has joint distribution:
+pθ(x1:T , y1:T ) = pθ (x1:T , yT ) = pθ(x1)
+ T
+Y
+t=2
+pθ(xt | xt−1)
+!
+pθ(yT | xT ),
+= N (x1 ; α, 1)
+ T
+Y
+t=2
+N (xt ; xt−1 + α, 1)
+!
+N (yT ; xT + α, 1) ,
+where the free parameters of the model are θ = {α} ∈Θ = R, the state is xt ∈X = R, and
+the observed data are y1:T = yT ∈R. Training data are sampled from this joint distribution
+with α = 1. Note that the distributions we show in Figure 1 were generated with α = 0.
+24
+
+D.1.2
+Analytic Forms
+The tth marginal of the ﬁltering distribution for t < T is
+pθ(xt) = N(xt ; tα, t).
+(42)
+The tth marginal of the smoothing distributions can be derived as follows:
+p(xt | yT ) ∝p(xt)p(yT | xt),
+(43)
+= N (xt; tα, t) N (yT ; xt + α(T −t + 1), T −t + 1) ,
+= N (xt; tα, t) N (xt; yT −α(T −t + 1), T −t + 1) .
+(44)
+Noting that the product of two Gaussian densities is also Gaussian:
+N
+ x; µ1, σ2
+1
+
+N
+ x; µ2, σ2
+2
+
+∝N
+
+x; σ2
+2µ1 + σ2
+1µ2
+σ2
+1 + σ2
+2
+,
+σ2
+1σ2
+2
+σ2
+1 + σ2
+2
+
+,
+allows us to combine the two Gaussian distributions in (44):
+p(xt | yT ) ∝N
+
+xt; (T −t + 1)tα + t(yT −α(T −t + 1))
+t + (T −t + 1)
+t,
+t(T −t + 1)
+t + (T −t + 1)
+
+= N
+
+xt;
+t
+T + 1yT , t(T −t + 1)
+T + 1
+
+.
+Hence the smoothing distribution is a Gaussian distribution with analytically computable
+mean and variance terms.
+The ﬁltering and smoothing distributions are equal at t = T. It is interesting to note
+that for α =
+yT
+T+1, which is the maximum likelihood drift parameter for a single datapoint
+yT , the sequence of ﬁltering and smoothing distributions have the same means. However,
+the variances are diﬀerent for all t < T; in particular, the smoothing distribution variance
+peaks in the middle of the timeseries, whereas the variance of the ﬁltering distribution is
+monotonically increasing for t < T, and then drops at t = T.
+According to Proposition 1, we expect the proposal recovered by SIXO, qθt, to match the
+conditional of the smoothing distribution:
+qθ1(x1 | yT ) = pθ(x1 | yT )
+= N
+
+x1 ;
+yT
+T + 1,
+T
+T + 1
+
+for t = 1,
+qθt(xt | xt−1, yT ) = pθ(xt | xt−1, yT ) = N
+
+xt ; (T −t + 1)xt−1 + yT
+T −t + 2
+, T −t + 1
+T −t + 2
+
+otherwise .
+Note that the mean is an aﬃne function with bias equal to zero.
+Furthermore, we also expect the optimal twist distribution to be equal to the true
+lookahead distribution:
+rψt(yT | xt) = pθ(yT | xt) = N (yT ; xt + α(T −t + 1), T −t + 1)
+∀t ∈1, . . . , T −1.
+(45)
+25
+
+0
+50
+100
+150
+200
+250
+300
+350
+400
+Optimization step (1000s)
+10−4
+10−3
+10−2
+10−1
+100
+101
+102
+103
+Bound gap
+log p(y1:T ) −L128
+FIVO
+FIVO-b
+SIXO-b
+SIXO-u
+SIXO-a
+SIXO-DRE
+IWAE
+Figure 5: Convergence of the bound for all methods discussed in Section D.1. Of these
+lines, FIVO-b, SIXO-b and SIXO-a were omitted from Figure 2 the main text.
+D.1.3
+SIXO Variants for the Gaussian Drift Diﬀusion
+For all experiments we use a Gaussian proposal at each timestep, parameterized as qθt(xt |
+xt−1, yT ) = N(xt; ft(xt−1, yT ), σ2
+qt) where ft is a general aﬃne function of xt−1 and yT . There
+are therefore 4T −1 proposal parameters to learn (T biases, T yT coeﬃcients, T −1 xt−1
+coeﬃcients, and T variances σ2
+qt).
+We test four variants of SIXO:
+1. SIXO-u learns θ and ψ by gradient ascent on the uniﬁed bound given in (3) using the
+unbiased gradients (reparameterization and score-function gradients). We parameterize
+the twists as rt(yT , xt) = N(yT ; gt(xt), σ2
+rt) for t < T, where gt is a learnable aﬃne
+function and σ2
+rt is also learned.
+2. SIXO-DRE as deﬁned in Algorithm 1 learns θ by ascending the bound (3) using the
+biased reparameterization gradients as in (18). The twist parameters ψ are then ﬁt
+using a density ratio update. The twist is parameterized as an MLP that produces the
+coeﬃcients of a quadratic function over xt as a function of yT and t. This quadratic
+function is evaluated at xt to compute the log rψ value.
+3. SIXO-a (not included in Figure 2) uses the analytic form for the twist as a function of
+θ and yT (speciﬁed in (45)). There are no free parameters to learn for this twist, and
+θ is learned by ascending the bound (3) using the biased reparameterization gradients
+in (18).
+4. SIXO-b (not included in Figure 2) learns θ and ψ by gradient ascent on the uniﬁed
+bound given in (3) using biased reparameterization gradients (18). We parameterize
+the twists as rt(yT , xt) = N(yT ; gt(xt), σ2
+rt) for t < T, where gt is a learnable aﬃne
+function and σ2
+rt is also learned.
+Note that the true distributions lie within the variational families (assuming a suﬃciently
+expressive MLP for SIXO-DRE, which is not unreasonable). In all of these models we
+initialize the parameter α = 0.
+26
+
+0
+100
+200
+300
+400
+Optimization step (1000s)
+−0.2
+0.0
+0.2
+0.4
+0.6
+Prop y weight
+1
+3
+5
+7
+9
+True
+0
+100
+200
+300
+400
+Optimization step (1000s)
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Prop xt−1 weight
+0
+100
+200
+300
+400
+Optimization step (1000s)
+−0.50
+−0.25
+0.00
+0.25
+0.50
+Prop bias
+0
+100
+200
+300
+400
+Optimization step (1000s)
+0.4
+0.6
+0.8
+1.0
+Prop variance
+0
+100
+200
+300
+400
+Optimization step (1000s)
+5
+10
+15
+Twist aﬃne bias
+0
+100
+200
+300
+400
+Optimization step (1000s)
+5
+10
+15
+Twist variance
+0
+100
+200
+300
+400
+Optimization step (1000s)
+0.00
+0.25
+0.50
+0.75
+1.00
+Drift, α
+Figure 6: Convergence for all free parameters in the GDD experiment using SIXO-u. The
+drift parameter (α) is constant across time. Coloring of lines indicates the time t ∈1, . . . , 10.
+D.1.4
+Results
+We compare the four diﬀerent variants of SIXO to IWAE, FIVO with biased gradients, and
+FIVO with unbiased gradients. For clarity, we omitted some of these comparisons from
+27
+
+Figure 2 in the main text, but include them here in Figure 5. Individual seeds for each
+experiment were run using two CPU cores, 8Gb of memory, and had a runtime of no longer
+than ﬁve hours.
+The model drift α is initialized to zero, aﬃne function weights are initialized to zero,
+aﬃne function biases are initialized to zero, and σ2
+qt and σ2
+rt are initialized to one.
+In Figure 5 we show the convergence of the bound across all seven methods we considered.
+FIVO with unbiased gradients (FIVO) performs comparably to FIVO with biased gradients
+(FIVO-b), however, converges slightly more slowly. We ﬁnd that SIXO-b performed worse
+than all the other methods, similar to the results in [11]. We therefore omitted it from the
+main paper for brevity. However, this result motivated us to ﬁnd alternative methods.
+All of SIXO-u, SIXO-DRE and SIXO-a converge to the correct solution and achieve a
+tight variational bound (parameter convergence is shown in Figure 6 for SIXO-u). SIXO-u
+converges to a tight bound most slowly, but SIXO-DRE and SIXO-a converge quickly at a
+rate similar to IWAE. This result shows that SIXO is able to recover the optimal model,
+true posterior, and true twists, and that it can recover a tight variational bound. It also
+shows that SIXO-DRE converges in a rate commensurate with the best-case convergence of
+SIXO-a. Crucially, it shows that by using SIXO-DRE we can circumvent the need for the
+high-variance score-function gradient terms, and still recover the correct solution. Future
+work will investigate whether the use of a twist makes the reparameterization gradient less
+biased.
+Figures 1c and 1d show the lineages for two SMC sweeps: one using a model and proposal
+learned using FIVO, and one using a model, proposal and twist learned using SIXO-u.
+We resample at every timestep using systematic resampling. In each color we show the
+unweighted ﬁltering particles prior to resampling (i.e. the propagated particles) at time t,
+and then the smoothing particles after performing a backwards pass from that timestep. As
+such, we are showing the family of smoothing and predictive distributions. We see that FIVO
+proposes particles towards the observation, but that these particles are often preferentially
+resampled back towards the prior distribution. This results in gross particle degeneracy.
+In contrast, the lineages for SIXO are nearly perfect, with every particle being resampled
+exactly once.
+D.2
+Stochastic Volatility Model (SVM)
+D.2.1
+Model Details
+The SVM models an N-dimensional state-space is deﬁned as follows:
+pθ (x1:T , y1:T ) = pθ (x1) pθ (y1 | x1)
+T
+Y
+t=2
+pθ(xt | xt−1)pθ(yt | xt),
+(46)
+x1 ∼N (0, Q),
+xt = µ + φ (xt−1 −µ) + νt,
+yt = β exp
+xt
+2
+
+et,
+(47)
+where the states and observations are deﬁned as:
+x1:T = x1:T ∈X T = RT×N,
+y1:T = y1:T ∈YT = RT×N,
+(48)
+28
+
+the transition and observation noise terms are deﬁned as:
+νt ∼N
+ 0N, Q
+
+,
+et ∼N
+ 0N, 1N
+.
+(49)
+and all multiplications are performed element-wise. The model has free parameters deﬁned
+as:
+θ = {µ, φ, β, Q} ,
+where
+µ ∈RN,
+φ ∈[0, 1]N ,
+β ∈RN
++,
+Q ∈diag(RN
++),
+(50)
+such that there are 4N model parameters. The model learning objective is to recover the
+free parameters, θ, given observed data y. The data we consider are the monthly returns
+from N = 22 currencies over the period from 9/2007 to 8/2017, transformed into the log
+domain. As a result, X = Y = R119×22.
+D.2.2
+Results
+We use a ﬁxed proposal per timestep parameterized as a Gaussian perturbation to pθ as in
+[9],
+qθ(xt | xt−1, y1:T ) ∝pθ(xt | xt−1)N(xt; µt, Σt).
+(51)
+Thus the parameters speciﬁc to q are the means µt ∈RN and covariance matrices Σt ∈
+diag(RN
++) for t = 1, . . . , T.
+SIXO-q uses a parameterless quadrature twist, so we skip twist optimization and use
+biased reparameterization gradients of the SIXO bound to ﬁt the model and proposal. For
+the quadrature twist we use Gauss-Hermite quadrature with degree ﬁve.
+For SIXO-DRE, we model the twist using the backwards RNN method introduced in
+Section 3.2. The twist is parameterized with a one-layer RNN with 128 hidden units and
+a one-layer MLP with 128 hidden units. The twist is learned using the alternating DRE
+method described in Section 3.2. We generate a batch of 32,000 synthetic trajectories from
+the current model, and perform minibatch stochastic gradient descent using the ADAM
+optimizer [51] with a learning rate of 3 × 10−3 and a minibatch size of 64. We apply 1,000
+twist updates (corresponding to two epochs) and then apply 1,000 updates to the model and
+proposal. The model and proposal parameters are updated using the ADAM optimizer [51]
+with a learning rate of 1 × 10−4. We use four particles per SMC sweep, and average across
+four datasets per model and proposal update.
+Individual FIVO and SIXO-q seeds for each experiment were run using four CPU cores,
+24Gb of memory, and had a wallclock time of no longer than twenty four hours. SIXO-DRE
+had a longer runtime of ﬁve days, however, competitive results were achieved within two
+days.
+Train Bound Performance
+We compare three methods: FIVO (learning θ), SIXO-q
+(learning θ with a quadrature twist) and SIXO-DRE (learning θ and ψ using a DRE
+twist). All methods use the biased score-function gradients of (18). We show the median
+and quartiles across ﬁve random seeds. Each µn is initialized from N(0, 0.3) (with n ∈
+1, . . . 22). φn is learned in the unconstrained space R, and is transformed to [0, 1] by passing
+the raw φ through a hyperbolic tangent function. The unconstrained φn’s are initialized
+29
+
+from N(arctanh(0.1), 0.3), and log βn is initialized from N(log 1.0, 0.3). Finally, log Qn is
+initialized from N(log 1.0, 0.3). The train bound value we report is taken as the average train
+bound once converged. We also report L2048
+BPF as the bound evaluated using a BPF with 2,048
+particles. This tests the performance of the learned model opposed to inference performance.
+A one-way ANOVA [39] rejected the null hypothesis that the mean train bounds are
+equal (p < 0.0001), and a post-hoc Dunnett T3 test [52] found the mean SIXO-DRE bound
+to be the highest (p < 0.01 for all pairs). For the L2048
+BPF values, a one-way ANOVA failed to
+reject the null hypothesis that the train bounds are equal (p = 0.25 > 0.05), so all entries
+are bolded. This methodology was recommended in Sauder and DeMars [53].
+Test Set Performance
+We also report the performance on a held-out dataset constructed
+from the new data since Naesseth et al. [9] was published. The test L2048
+BPF we report is the
+bound evaluated using a BPF with 2,048 particles, averaged across all checkpoints after 75%
+of training. A one-way ANOVA rejected the null hypothesis that the mean test bounds are
+equal (p < 0.0001), and a post-hoc Dunnett T3 test found the mean SIXO-DRE bound to
+be the highest (p < 0.01 for all pairs).
+D.3
+Hodgkin-Huxley Model
+We provide a brief overview of the model here for completeness, but refer the reader to
+Chapter 5.6 of Dayan and Abbott [41] for more detailed information.
+D.3.1
+Model Details
+The HH model is a physiologically grounded model of neural action potentials [40] deﬁned
+through a set of four nonlinear diﬀerential equations. Each neuron is deﬁned by four state
+variables: the instantaneous membrane potential v(t) ∈R, the potassium channel activation
+n(t) ∈[0, 1], sodium channel activation m(t) ∈[0, 1], and sodium channel inactivation
+h(t) ∈[0, 1]. The channel states represent the aggregated probability that the given channel
+is active. The state evolves according to:
+Cm
+dv(t)
+dt
+= iext(t) −gL(v(t) −EL) −gKn4(v(t) −EK) −gNam3h(v(t) −ENa).
+(52)
+The membrane capacitance Cm is often deﬁned to be 1.0. The ﬁrst term, iext(t) is the
+externally injected current. The second term represents the net current through cell membrane
+due to the potential diﬀerence between the intracellular and extracellular mediums, often
+referred to as the leakage current. This current is a function of the membrane capacitance,
+gL, and the potential of the extracellular medium, EL, where the potential diﬀerence across
+the membrane is then v(t) −EL. The third term represents the net current through the
+membrane as a result of the potassium channels as a function of the channel state n(t), the
+channel capacitance gK, and the potassium reversal potential EK. The ﬁnal term represents
+the current through the membrane as a result of the sodium channel states, both m(t) and
+h(t), the sodium channel conductance gNa, and the sodium reversal potential ENa. The
+30
+
+channel states evolve according to:
+dn(t)
+dt
+= αn(v(t))(1 −n) −βn(v(t))n,
+(53)
+dm(t)
+dt
+= αm(v(t))(1 −n) −βm(v(t))m,
+(54)
+dh(t)
+dt
+= αh(v(t))(1 −n) −βh(v(t))h,
+(55)
+where αn, αm, αh, βn, βm, βh are all ﬁxed scalar functions of the membrane potential. We
+discretize this continuous-time diﬀerential equation into a discrete-time latent variable model
+by integrating using Euler integration with an integration timestep of 0.02ms (similarly to
+Huys and Paninski [44]). This deﬁnes the deterministic time-evolution of the neural state.
+We follow a similar approach as Huys and Paninski [44] and add Gaussian random noise
+to each of the four states at each timestep. The membrane potential is unconstrained,
+and so we can add noise directly. The gate states, however, are constrained to the range
+[0, 1]. Huys and Paninski [44] use truncated Gaussian noise to avoid pushing the state
+outside the constrained range. We use a diﬀerent approach and transform the constrained
+states into an unconstrained state by applying the inverse sigmoid function to the raw gate
+value. This has the eﬀect of modifying the variance of the perturbation in constrained
+space as a function of the state (heteroscedastic noise in constrained space). However, this
+hetereoscedasticity carries with it a favorable intuition. The magnitude of the noise term
+is reduced (after being pushed through a sigmoid) close the limits. This means that the
+same noise kernel provides smaller perturbations close to the extremes, while still retaining a
+larger permissible perturbations in the mid-range. We add zero-mean Gaussian noise to the
+potential with variance scaled by the integration timestep, σ2
+v = 9mVs−1 × 0.02s = 0.18mV.
+The unconstrained gate variables are perturbed by zero-mean Gaussian noise with variance
+also scaled by the integration timestep, σ2
+{n,m,h} = 0.1s−1 × 0.02s = 0.002. Observations are
+sampled from a Gaussian emission distribution centered on the current membrane potential
+with variance 25mV. Observations are generated every 50 timesteps. The model is integrated
+with a timestep of 0.02ms, corresponding to an acquisition rate of 1kHz.
+We initialize the potential according to a Gaussian distribution with mean equal to
+-65mV and a standard deviation of 25mV. The unconstrained gate variables are initialized
+from a Gaussian distribution with mean deﬁned by an estimate of the steady-state value
+x = sigmoid (αx(−65)/αx(−65)−βx(−65)), where x represents the n, m or h states.
+To iterate the model, we ﬁrst constrain the state by passing the gate variables through
+a sigmoid. The potential is already unconstrained and so requires no transform. We then
+iterate the model given the constrained state. The iterated state is then unconstrained by
+passing the gate states through the logit function (inverse of the sigmoid function). The noise
+term is then added to the iterated, unconstrained state. Observations are then generated
+by sampling from the emission distribution every 50 steps. We generate traces with 2,048
+timesteps, corresponding to approximately 40ms.
+D.3.2
+Results
+For the experiments presented in Section 5.3 we use a bootstrap proposal, i.e. qθ(xt |
+xt−1, y1:T ) = pθ(xt | xt−1). This was to focus on learning the twist and show that even
+31
+
+learning just a twist can markedly improve inference and model learning outcomes. Individual
+seeds for each experiment were run using eight CPU cores, 16Gb of memory, and had a
+runtime time of no longer than two days.
+Inference
+In Figure 3 we compare the inference performance of a BPF to that of SIXO
+with a DRE twist. Both models (and hence proposals) are identical. We use 128 particles
+in the forward (twisted) SMC sweep. To parameterize the twist we use a recurrent neural
+network (RNN) with 32 hidden units and a one-layer MLP head with 32 hidden units. This
+is learned using the DRE update described in Section 3.2. We use minibatched stochastic
+gradient descent with the ADAM optimizer [51], a learning rate of 0.01, and a minibatch
+size of 32. We sample 2,048 length T synthetic trajectories from the current model, from
+minibatches are constructed. To handle missing observations, we apply the RNN to just the
+observations, and then linearly interpolate the output of the RNN between observations on
+input to the head MLP. While the twist encoding input to the head MLP is dependent on the
+previous observation, this approach is still permitted under the twisted SMC framework, and
+dramatically reduces the cost of application by only processing valid observations, and, allows
+the twist to create meaningful encodings between observations without introducing more
+parameters. Investigating alternative twisting architectures for handling missing observations
+is an interesting avenue of future research.
+Model Learning
+For the experiments presented in Figure 4 and Table 2 in Section 5.3
+we learn just the constant external current input, iext in (52). We generate 10,000 training
+sequences, and evaluate on 30 sequences, both generated with iext = 13mV. We show median
+across 15 random seeds, with shaded regions showing the 10th to 90th deciles. Across the
+15 seeds, we deterministically initialize iext to a value uniformly spaced between 1.3µA and
+37.7µA, corresponding to a relative error of between −0.9 and 1.9. We report the train
+bound value as the average train loss once the loss had converged. We evaluate the test
+bound loss L256
+BPF using a bootstrap particle ﬁlter on the held-out validation sequences using
+256 particles.
+We use K = 4 particles per SMC sweep when evaluating the model and proposal gradients
+(c.f. Line 11 of Algorithm 1), and average across four sequences per parameter update. We
+found that the gradients were prone to shot noise, causing huge jumps in the parameter value
+and optimizer state. We therefore investigated using gradient clipping. We tested a range of
+values and found that clipping the model gradient magnitude to 50 eradicated these jumps
+in SIXO. We also tested clipping with FIVO, and found that while clipping removed the
+jumps and reduced the variance of the parameters recovered, it increased the bias relative to
+not using clipping (see Figure 4b). We report the performance of FIVO with and without
+clipping for fairness. We use the same twist architecture described above. We take 400 steps
+in the twist (equating to approximately six epochs) per 100 steps in the model.
+32
+

@@ -1,0 +1,1461 @@
+AUTOMATING NEAREST NEIGHBOR SEARCH CONFIG-
+URATION WITH CONSTRAINED OPTIMIZATION
+Philip Sun, Ruiqi Guo & Sanjiv Kumar
+Google Research
+New York, NY
+{sunphil,guorq,sanjivk}@google.com
+ABSTRACT
+The approximate nearest neighbor (ANN) search problem is fundamental to ef-
+ﬁciently serving many real-world machine learning applications. A number of
+techniques have been developed for ANN search that are efﬁcient, accurate, and
+scalable. However, such techniques typically have a number of parameters that
+affect the speed-recall tradeoff, and exhibit poor performance when such parame-
+ters aren’t properly set. Tuning these parameters has traditionally been a manual
+process, demanding in-depth knowledge of the underlying search algorithm. This
+is becoming an increasingly unrealistic demand as ANN search grows in popu-
+larity. To tackle this obstacle to ANN adoption, this work proposes a constrained
+optimization-based approach to tuning quantization-based ANN algorithms. Our
+technique takes just a desired search cost or recall as input, and then generates
+tunings that, empirically, are very close to the speed-recall Pareto frontier and give
+leading performance on standard benchmarks.
+1
+INTRODUCTION
+Efﬁcient nearest neighbor search is an integral part of approaches to numerous tasks in machine
+learning and information retrieval; it has been leveraged to effectively solve a number of challenges
+in recommender systems (Benzi et al., 2016; Cremonesi et al., 2010), coding theory (May & Ozerov,
+2015), multimodal search (Gfeller et al., 2017; Miech et al., 2021), and language modeling (Guu et al.,
+2020; Khandelwal et al., 2020; Kitaev et al., 2020). Vector search over the dense, high-dimensional
+embedding vectors generated from deep learning models has become especially important following
+the rapid rise in capabilities and performance of such models. Nearest neighbor search is also
+increasingly being used for assisting training tasks in ML (Lindgren et al., 2021; Yen et al., 2018).
+Formally, the nearest neighbor search problem is as follows: we are given an n-item dataset X ∈
+Rn×d composed of d-dimensional vectors, and a function for computing the distance between two
+vectors D : Rd × Rd 7→R. For a query vector q ∈Rd, our goal is to ﬁnd the indices of the k-nearest
+neighbors in the dataset to q:
+k-arg min
+i∈{1,...,n}
+D(q, Xi)
+Common choices of D include D(q, x) = −⟨q, x⟩for maximum inner product search (MIPS)
+and D(q, x) = ∥q −x∥2
+2 for Euclidean distance search. A linear-time scan over X solves the
+nearest neighbor search problem but doesn’t scale to the large dataset sizes often found in modern-day
+applications, hence necessitating the development of approximate nearest neighbor (ANN) algorithms.
+A number of approaches to the ANN problem have been successful in trading off a small search
+accuracy loss, measured in result recall, for a correspondingly large increase in search speed (Aumüller
+et al., 2020). However, these approaches rely on tuning a number of hyperparameters that adjust the
+tradeoff between speed and recall, and poor hyperparameter choices may result in performance far
+below what could be achievable with ideal hyperparameter tuning. This tuning problem becomes
+especially difﬁcult at the billions-scale, where the larger dataset size typically leads to a greater
+number of hyperparameters to tune. Existing approaches to tuning an ANN index, enumerated
+in Table 1, all suffer from some deﬁciency, such as using an excessive amount of computation
+1
+arXiv:2301.01702v2  [cs.LG]  22 Feb 2023
+
+Table 1: Our technique is the ﬁrst to use minimal computational cost and human involvement to
+conﬁgure an ANN index to perform very close to its speed-recall Pareto frontier.
+Method
+Computational
+Cost of Tuning
+Human
+Involvement
+Hyperparameter
+Quality
+Grid search
+High
+Low
+High
+Manual tuning
+Low
+High
+Medium
+Black-box optimizer
+Medium
+Low
+Medium
+Ours
+Low
+Low
+High
+during the tuning process, necessitating extensive human-in-the-loop expertise, or giving suboptimal
+hyperparameters.
+Mitigating these issues is becoming increasingly important with the growth in dataset sizes and in
+the popularity of the ANN-based retrieval paradigm. This paper describes how highly performant
+ANN indices may be created and tuned with minimal conﬁguration complexity to the end user. Our
+contributions are:
+• Deriving theoretically-grounded models for recall and search cost for quantization-based
+ANN algorithms, and presenting an efﬁcient Lagrange multipliers-based technique for
+optimizing either of these metrics with respect to the other.
+• Showing that on millions-scale datasets, the tunings from our technique give almost identical
+performance to optimal hyperparameter settings found through exhaustive grid search.
+• Achieving superior performance on track 1 of the billions-scale big-ann-benchmarks
+datasets using tunings from our technique over tunings generated by a black-box optimizer
+on the same ANN index, and over all existing benchmark submissions.
+Our constrained optimization approach is very general and we anticipate it can be extended to distance
+measures, quantization algorithms, and search paradigms beyond those explored in this paper.
+2
+RELATED WORK
+2.1
+ANN ALGORITHMS
+Literature surrounding the ANN problem is extensive, and many solutions have been proposed,
+drawing inspiration from a number of different ﬁelds. Below we give a brief outline of three families
+of approaches that have found empirical success and continued research interest, with an emphasis
+on the hyperparameters necessitated by each approach. Other approaches to ANN include sampling-
+based algorithms (Liu et al., 2019) and a variety of geometric data structures (Bozkaya & Ozsoyoglu,
+1997; Ram & Gray, 2012); we refer readers to Bhatia & Vandana (2010); RezaAbbasifard et al.
+(2014); Wang et al. (2014; 2021) for more comprehensive surveys.
+Hashing approaches
+Techniques under this family utilize locality sensitive hash (LSH) functions,
+which are functions that hash vectors with the property that more similar vectors are more likely to
+collide in hash space (Andoni & Razenshteyn, 2015; Datar et al., 2004; Shrivastava & Li, 2014). By
+hashing the query and looking up the resulting hash buckets, we may expect to ﬁnd vectors close to
+the query. Hashing algorithms are generally parameterized by the number and size of their hash tables.
+The random memory access patterns of LSH often lead to difﬁculties with efﬁcient implementation,
+and the theory that prescribes hyperparameters for LSH-based search generally cannot consider
+dataset-speciﬁc idiosyncrasies that allow for faster search than otherwise guaranteed for worst-case
+inputs; see Appendix A.1 for further investigation.
+Graph approaches
+These algorithms compute a (potentially approximate) nearest neighbor graph
+on X, where each element of X becomes a graph vertex and has directed edges towards its nearest
+neighbors. The nearest neighbors to q are computed by starting at some vertex and traversing edges
+2
+
+to vertices closer to q. These algorithms are parameterized by graph construction details, such as the
+number of edges; any post-construction adjustments, such as improving vertex degree distribution
+and graph diameter (Fu et al., 2019; Iwasaki & Miyazaki, 2018; Malkov & Yashunin, 2020); and
+query-time parameters for beam search and selecting the initial set of nodes for traversal.
+Quantization approaches
+These algorithms create a compressed form of the dataset ˜
+X; at query
+time, they return the points whose quantized representations are closest to the query. Speedups are
+generally proportional to the reduction in dataset size. These reductions can be several orders of
+magnitude, although coarser quantizations lead to greater recall loss. Quantization techniques include
+VQ, where each datapoint is assigned to the closest element in a codebook C, and a number of
+multi-codebook quantization techniques, where the datapoint is approximated as some aggregate
+(concatenation, addition, or otherwise) of the codebook element it was assigned to per-codebook
+(Babenko & Lempitsky, 2015; Guo et al., 2020; Jégou et al., 2011). Quantization-based approaches
+generally must be tuned on codebook size and the number of codebooks.
+Growth in parameterization complexity with respect to dataset size
+While the above ap-
+proaches may only each introduce a few hyperparameters, many of the best-performing ANN
+algorithms layer multiple approaches, leading to a higher-dimensional hyperparameter space much
+more difﬁcult to tune. For example, Chen et al. (2021) uses VQ, but also a graph-based approach to
+search over the VQ codebook. Other algorithms (Guo et al., 2020; Johnson et al., 2021), including
+what we discuss in this work, use VQ to perform a ﬁrst-pass pruning over the dataset and then a
+multi-codebook quantization to compute more accurate distance estimates.
+2.2
+ANN HYPERPARAMETER TUNING
+Tuning in low-dimensional hyperparameter spaces may be effectively handled with grid search;
+however, quantization-based ANN algorithms with few hyperparameters scale poorly with dataset
+size, as shown in Appendix A.8. In higher-dimensional ANN hyperparameter spaces, where grid
+search is computationally intractable, there are two predominant approaches to the tuning problem,
+each with their drawbacks. The ﬁrst is using heuristics to reduce the search space into one tractable
+with grid search, as in Criteo (2021) or Ren et al. (2020). These heuristics may perform well when set
+and adjusted by someone with expertise in the underlying ANN search algorithm implementation, but
+such supervision is often impractical or expensive; otherwise, these heuristics may lead to suboptimal
+hyperparameter choices.
+The second approach is to use black-box optimization techniques such as Bergstra et al. (2011)
+or Golovin et al. (2017) to select hyperparameters in the full-dimensionality tuning space. These
+algorithms, however, lack inductive biases from knowing the underlying ANN search problem and
+therefore may require a high number of samples before ﬁnding hyperparameter tunings that are
+near optimal. Measurement noise from variability in machine performance further compounds the
+challenges these black-box optimizers face.
+3
+PRELIMINARIES
+3.1
+LARGE-SCALE ONLINE APPROXIMATE NEAREST NEIGHBORS
+In this work we focus on the problem of tuning ANN algorithms for online search of large-scale
+datasets. In this scenario, the search algorithm must respond to an inﬁnite stream of latency-sensitive
+queries arriving at roughly constant frequency. This setting is common in recommender and semantic
+systems where ANN speed directly contributes to the end-user experience. We are given a sample set
+of queries, representative of the overall query distribution, with which we can tune our data structure.
+Large dataset size makes the linear scaling of exact brute-force search impractical, so approximate
+search algorithms must be used instead. These algorithms may be evaluated along two axes:
+1. Accuracy: quantiﬁed by recall@k, where k is the desired number of neighbors. Sometimes
+the c-approximation ratio, the ratio of the approximate and the true nearest-neighbor distance,
+is used instead; we correlate between this metric and recall in Appendix A.1.
+2. Search cost: typically quantiﬁed by the queries per second (QPS) a given server can handle.
+3
+
+An effective ANN solution maximizes accuracy while minimizing search cost.
+3.2
+VECTOR QUANTIZATION (VQ)
+The ANN algorithm we tune uses a hierarchical quantization index composed of vector quantization
+(VQ) and product quantization (PQ) layers. We ﬁrst give a brief review of VQ and PQ before
+describing how they are composed to produce a performant ANN search index.
+Vector-quantizing an input set of vectors X ∈Rn×d, which we denote V Q(X), produces a codebook
+C ∈Rc×d and codewords w ∈{1, 2, . . . , c}n. Each element of X is quantized to the closest
+codebook element in C, and the quantization assignments are stored in w. The quantized form of the
+ith element of X can therefore be computed as ˜
+Xi = Cwi.
+VQ may be used for ANN by computing the closest codebook elements to the query
+S := k-arg min
+i∈{1,2,...,c}
+D(q, Ci)
+and returning indices of datapoints belonging to those codebook elements, {j|wj ∈S}. This
+candidate set may also be further reﬁned by higher-bitrate distance calculations to produce a ﬁnal
+result set. In this manner, VQ can be interpreted as a pruning tree whose root stores C and has c
+children; the ith child contains the points {Xj|wj = i}; equivalently, this tree is an inverted index (or
+inverted ﬁle index, IVF) which maps each centroid to the datapoints belonging to the centroid.
+3.3
+PRODUCT QUANTIZATION (PQ)
+Product quantization divides the full d-dimensional vector space into K subspaces and quantizes
+each space separately. If we assume the subspaces are all equal in dimensionality, each covering
+l = ⌈d/K⌉dimensions, then PQ gives K codebooks C(1), . . . , C(K) and K codeword vectors
+w(1), . . . , w(K), with C(k) ∈Rck×l and w(k) ∈{1, . . . , ci}n where ck is the number of centroids in
+subspace k. The ith element can be recovered as the concatenation of {C(k)
+w(k)
+i |k ∈{1, . . . , K}}.
+For ANN search, VQ is generally performed with a large codebook whose size scales with n and
+whose size is signiﬁcant relative to the size of the codewords. In contrast, PQ is generally performed
+with a constant, small ck that allows for fast in-register SIMD lookups for each codebook element,
+and its storage cost is dominated by the codeword size.
+3.4
+ANN SEARCH WITH MULTI-LEVEL QUANTIZATION
+VQ and PQ both produce ﬁxed-bitrate encodings of the original dataset. However, in a generalization
+of Guo et al. (2020), we would like to allocate more bitrate to the vectors closer to the query, which
+we may achieve by using multiple quantization levels and using the lower-bitrate levels to select
+which portions of the higher-bitrate levels to evaluate.
+To generate these multiple levels, we start with the original dataset X and vector-quantize it, resulting
+in a smaller d-dimensional dataset of codewords C. We may recursively apply VQ to C for arbitrarily
+many levels. X and all C are product-quantized as well. As a concrete example, Figure 6 describes
+the ﬁve-quantization-level setups used in Section 5.2.
+This procedure results in a set of quantizations ˜
+X1, . . . , ˜
+Xm of progressively higher bitrate. Algorithm
+1 performs ANN using these quantizations and a length-m vector of search hyperparameters t, which
+controls how quickly the candidate set of neighbors is narrowed down while iterating through the
+quantization levels. Our goal is to ﬁnd t that give excellent tradeoffs between search speed and recall.
+4
+METHOD
+The following sections derive proxy metrics for ANN recall and search latency as a function of
+the tuning t, and then describe a Lagrange multipliers-based approach to efﬁciently computing t to
+optimize for a given speed-recall tradeoff.
+4
+
+Algorithm 1 Quantization-Based ANN
+1: procedure QUANTIZEDSEARCH( ˜
+X, t, q)
+▷Computes the tm nearest neighbors to q
+2:
+S0 ←{1, . . . , n}
+3:
+for i ←1 to m do
+▷Iterate over quantizations in ascending bitrate order
+4:
+Si ←ti-arg min
+j∈Si−1
+D(q, ˜X(i)
+j )
+▷Narrow candidate set to ti elements, using ˜
+X (i)
+5:
+end for
+6:
+return Sm
+7: end procedure
+4.1
+PROXY LOSS FOR ANN RECALL
+For a given query set Q and hyperparameter tuning t, the recall may be computed by simply
+performing approximate search over Q and computing the recall empirically. However, such an
+approach has no underlying mathematical structure that permits efﬁcient optimization over t. Below
+we approximate this empirical recall in a manner amenable to our constrained optimization approach.
+First ﬁx the dataset X and all quantizations ˜
+X (i). Deﬁne functions S0(q, t), . . . , Sm(q, t) to denote
+the various S computed by Algorithm 1 for query q and tuning t, and let G(q) be the set of ground-
+truth nearest neighbors for q. Note our recall equals |Sm(q, t) ∩G(q)|
+|G(q)|
+for a given query q and tuning
+t. We can decompose this into a telescoping product and multiply it among all queries in Q to derive
+the following expression for geometric-mean recall:
+GeometricMeanRecall(Q, t) =
+Y
+q∈Q
+m
+Y
+i=1
+ |Si(q, t) ∩G(q)|
+|Si−1(q, t) ∩G(q)|
+1/|Q|
+,
+(1)
+where the telescoping decomposition takes advantage of the fact that |S0(q, t) ∩G(q)| = |G(q)| due
+to S0 containing all datapoint indices. We choose the geometric mean, despite the arithmetic mean’s
+more frequent use in aggregating recall over a query set, because the geometric mean allows for the
+decomposition in log-space that we perform below. Note that the arithmetic mean is bounded from
+below by the geometric mean.
+Maximizing Equation 1 is equivalent to minimizing its negative logarithm:
+L(Q, t) = −1
+|Q|
+X
+q∈Q
+m
+X
+i=1
+log
+|Si(q, t) ∩G(q)|
+|Si−1(q, t) ∩G(q)|
+=
+m
+X
+i=1
+Eq∈Q
+
+−log
+|Si(q, t) ∩G(q)|
+|Si−1(q, t) ∩G(q)|
+
+(2)
+Now we focus on the inner quantity inside the logarithm and how to compute it efﬁciently. The
+chief problem is that Si(q, t) has an implicit dependency on Si−1(q, t) because Si−1 is the candidate
+set from which we compute quantized distances using ˜
+X (i) in Algorithm 1. This results in Si(q, t)
+depending on all t1, . . . , ti and not just ti itself, making it difﬁcult to efﬁciently evaluate. To resolve
+this, deﬁne the single-layer candidate set
+S′
+i(q, ti) = ti-arg min
+j∈{1,...,n}
+D(q, ˜
+X (i)
+j )
+(3)
+which computes the closest ti neighbors to q according to only ˜
+X (i), irrespective of other quantizations
+or their tuning settings. We leverage this deﬁnition by rewriting our cardinality ratio as
+|Si(q, t) ∩G(q)|
+|Si−1(q, t) ∩G(q)| =
+P
+g∈G(q) 1g∈Si(q,t)
+P
+g∈G(q) 1g∈Si−1(q,t)
+(4)
+5
+
+and making the approximation 1g∈Si(q,t) ≈1g∈Si−1(q,t)1g∈S′
+i(q,ti). This is roughly equivalent
+to assuming most near-neighbors to q are included in Si−1(q, t); see Appendix A.2 for further
+discussion. If we furthermore assume zero covariance1 between 1g∈Si−1(q,t) and 1g∈S′
+i(q,ti), then
+we can transform the sum of products into a product of sums:
+X
+g∈G(q)
+1g∈Si−1(q,t)1g∈S′
+i(q,ti) ≈
+
+
+1
+|G(q)|
+X
+g∈G(q)
+1g∈Si−1(q,t)
+
+
+
+X
+g∈G(q)
+1g∈S′
+i(q,ti)
+
+.
+Combining this result from Equations 2 and 4, our ﬁnal loss function is Pm
+i=1 Li(Q, ti), with the
+per-quantization loss Li deﬁned as
+Li(Q, ti) = Eq∈Q
+
+−log |S′
+i(q, ti) ∩G(q)|
+|G(q)|
+
+.
+(5)
+See Appendix A.4 for how Li may be efﬁciently computed over Q for all i ∈{1, . . . , m}, ti ∈
+{1, . . . , n}, resulting in a matrix L ∈Rm×n. This allows us to compute the loss for any tuning t by
+summing m elements from L.
+4.2
+PROXY METRIC FOR ANN SEARCH COST
+Similar to ANN recall, search cost may be directly measured empirically, but below we present a
+simple yet effective search cost proxy compatible with our Lagrange optimization method.
+Let | ˜
+X (i)| denote the storage footprint of ˜
+X (i). At quantization level i, for i < m, selecting the top
+top ti candidates necessarily implies that a ti/n proportion of ˜
+X (i+1) will need to be accessed in
+the next level. Meanwhile, ˜
+X (1) is always fully searched because it’s encountered at the beginning
+of the search process, where the algorithm has no prior on what points are closest to q. From these
+observations, we can model the cost of quantization-based ANN search with a tuning t as
+J(t) ≜
+1
+|X| ·
+ 
+| ˜
+X (1)| +
+m−1
+X
+i=1
+ti
+n · | ˜
+X (i+1)|
+!
+.
+(6)
+J gives the ratio of memory accesses performed per-query when performing approximate search
+with tuning t to the number of memory accesses performed by exact brute-force search. This gives
+a good approximation to real-world search cost because memory bandwidth is the bottleneck for
+quantization-based ANN in the non-batched case. We emphasize that this cost model is effective for
+comparing amongst tunings for a quantization-based ANN index, which is sufﬁcient for our purposes,
+but likely lacks the power to compare performance among completely different ANN approaches, like
+graph-based solutions. Differences in memory read size, memory request queue depth, amenability
+to vectorization, and numerous other characteristics have a large impact on overall performance but
+are not captured in this model. Our model is, however, compatible with query batching, which we
+discuss further in Appendix A.3.
+4.3
+CONVEXIFICATION OF THE LOSS
+We take the convex hull of each per-quantization loss Li before passing it into the constrained
+optimization procedure. This results in a better-behaved optimization result but is also justiﬁed from
+an ANN algorithm perspective. For any quantization level i, consider some two choices of ti that
+lead to loss and cost contributions of (l1, j1) and (l2, j2). Any (loss, cost) tuple on the line segment
+between these two points can be achieved via a randomized algorithm that picks between our two
+choices of ti with the appropriate weighting, which implies the entire convex hull is achievable.
+Empirically, we ﬁnd that Li is extremely close to convex already, so this is more of a theoretical
+safeguard than a practical concern.
+1Note that Si ⊆Si−1 so this is emphatically false for 1g∈Si−1(q,t) and 1g∈Si(q,t), but with 1g∈S′
+i(q,ti) we
+may reasonably assume little correlation with 1g∈Si−1(q,t).
+6
+
+4.4
+CONSTRAINED OPTIMIZATION
+Formally, our tuning problem of maximizing recall with a search cost limit Jmax can be phrased as
+arg min
+t∈[0,n]m
+m
+X
+i=1
+Li(ti)
+s.t.
+J(t) ≤Jmax
+t1 ≥. . . ≥tm.
+The objective function is a sum of convex functions and therefore convex itself, while the constraints
+are linear and strictly feasible, so strong duality holds. We can therefore utilize the Lagrangian
+arg min
+t∈[0,n]m
+−λJ(t) +
+m
+X
+i=1
+Li(ti)
+s.t.
+t1 ≥. . . ≥tm.
+to ﬁnd exact solutions to the constrained optimization, using λ to adjust the recall-cost tradeoff. We
+show in Appendix A.5 an algorithm that uses O(nm) preprocessing time to solve the minimization
+for a given value of λ in O(m log n) time.
+Furthermore, because the objective function is a sum of m functions, each a convex hull deﬁned
+by n points, the Pareto frontier itself will be piecewise, composed of at most nm points. It follows
+then that there are at most nm relevant λ that result in different optimization results, namely those
+obtained by taking the consecutive differences among each Li and dividing by | ˜
+X (i+1)|/n|X|. By
+performing binary search among these candidate λ, we can ﬁnd the minimum-cost tuning for a given
+loss target, or the minimum-loss tuning for a given cost constraint, in O(m log n log nm) time.
+In practice, even for very large datasets, m < 10, so this routine runs very quickly. The constrained
+optimizations used to generate the tunings in Section 5.2 ran in under one second on a Xeon W-2135;
+computation of L contributed marginally to the indexing runtime, described further in Appendix A.6.
+5
+EXPERIMENTS
+5.1
+MILLION-SCALE BENCHMARKS AND COMPARISON TO GRID SEARCH
+ 0
+ 2000
+ 4000
+ 6000
+ 8000
+ 10000
+ 12000
+ 0.86  0.88  0.9  0.92  0.94  0.96  0.98
+ 1
+Speed (Queries per Second)
+Accuracy (Recall@10)
+ScaNN + Optimal
+(Grid-Searched) Tunings
+ScaNN + Ours
+Figure 1: Our technique’s tunings compared
+to grid-searched tunings, applied to ScaNN
+on Glove1M.
+To see how closely our algorithm’s resulting hyperpa-
+rameter settings approach the true optimum, we com-
+pare its output to tunings found through grid search.
+We compare against the grid-searched parameters
+used by ScaNN (Guo et al., 2020) in its leading per-
+formance on the public Glove1M benchmark from
+Aumüller et al. (2020). As shown in Figure 1 be-
+low, our method’s tunings are almost exactly on the
+speed-recall frontier.
+While the resulting tunings are of roughly equivalent
+quality, grid search takes far longer to identify such
+tunings; it searched 210 conﬁgurations in 22 minutes.
+In comparison, on the same machine, our method
+took 53 seconds to compute L and run the constrained
+optimization to generate tunings.
+5.2
+BILLION-SCALE BENCHMARKS
+We now proceed to larger-scale datasets, where the tuning space grows signiﬁcantly; the following
+benchmarks use a ﬁve-level quantization index (see Appendix A.6.1 for more details), resulting
+7
+
+ 0
+ 10000
+ 20000
+ 30000
+ 40000
+ 50000
+ 60000
+ 70000
+ 80000
+ 90000
+ 100000
+ 0.5
+ 0.55
+ 0.6
+ 0.65
+ 0.7
+ 0.75
+ 0.8
+Speed (Queries per Second)
+Accuracy (Recall@10)
+FAISS
+KST
+Puck
+Team 11
+Ours
+(a) DEEP1B
+ 0
+ 10000
+ 20000
+ 30000
+ 40000
+ 50000
+ 60000
+ 70000
+ 80000
+ 0.6
+ 0.65
+ 0.7
+ 0.75
+ 0.8
+ 0.85
+Speed (Queries per Second)
+Accuracy (Recall@10)
+FAISS
+KST
+Puck
+Team 11
+Ours
+(b) Microsoft Turing-ANNS
+ 0
+ 10000
+ 20000
+ 30000
+ 40000
+ 50000
+ 60000
+ 70000
+ 80000
+ 0.05
+ 0.1
+ 0.15
+ 0.2
+ 0.25
+ 0.3
+ 0.35
+ 0.4
+Speed (Queries per Second)
+Accuracy (Recall@10)
+FAISS
+Puck
+Ours
+(c) Yandex Text-to-Image
+Figure 2: Speed-recall tradeoffs of our tuning algorithm plus ANN search implementation, compared
+to others from track 1 of the standardized https://big-ann-benchmarks.com datasets.
+in a four-dimensional hyperparameter space. Even with very optimistic assumptions, this gives
+hundreds of thousands of tunings to grid search over, which is computationally intractable, so we
+compare to heuristic, hand-tuned, and black-box optimizer settings instead. Here we use our own
+implementation of a multi-level quantization ANN index, and benchmark on three datasets from
+big-ann-benchmarks.com (Simhadri et al., 2022), following the experimental setup stipulated
+by track 1 of the competition; see Appendix A.6 for more details. Our results are shown in Figure 2.
+We ﬁnd that even in this much more complex hyperparameter space, our technique manages to ﬁnd
+settings that make excellent speed-recall tradeoffs, resulting in leading performance on these datasets.
+5.2.1
+COMPARISON AGAINST BLACK-BOX OPTIMIZERS
+ 0
+ 10000
+ 20000
+ 30000
+ 40000
+ 50000
+ 60000
+ 70000
+ 80000
+ 90000
+ 100000
+ 0.5
+ 0.55
+ 0.6
+ 0.65
+ 0.7
+ 0.75
+ 0.8
+Speed (Queries per Second)
+Accuracy (Recall@10)
+Vizier Trials
+Ours
+Figure 3: On DEEP1B, our hyperparameter
+tunings achieve signiﬁcantly better speed-
+recall tradeoffs than those found by Vizier.
+To see if black-box optimizers can effectively tune
+quantization-based ANN indices, we used Vizier
+(Golovin et al., 2017) to tune the same DEEP1B in-
+dex used above. Our Vizier setup involved an in-the-
+loop ANN index serving online requests, with Vizier
+generating candidate conﬁgurations, measuring their
+resulting recall and throughput, and then using those
+measurements to inform further candidate selections.
+We ran the Vizier study for 6 hours, during which it con-
+ducted over 1800 trials; their recall and performance
+measurements are plotted to the right in Figure 3.
+We can see that Vizier found several effective tunings
+close to the Pareto frontier of our technique, but then
+failed to interpolate or extrapolate from those tunings.
+Our technique not only generated better tunings, but
+did so using less compute; notably, the computation of
+statistics Li and the constrained optimization procedure
+were done with low-priority, preemptible, batch com-
+pute resources, while in contrast Vizier requires instances of online services in a carefully controlled
+environment in order to get realistic and low-variance throughput measurements.
+5.3
+RECALL AND COST MODEL ACCURACY
+We desire linear, predictable relationships between the modeled and the corresponding real-world
+values for both recall and search cost. This is important both so that the optimization can produce
+tunings that are effective in practice, and so that users can easily interpret and apply the results.
+In Figure 4, we take the DEEP1B hyperparameter tunings used above in Section 5.2 and plot their
+respective modeled recalls against empirical recall@10, and modeled search costs against measured
+reciprocal throughput. Recall was modeled as exp(−P Li) while J was simply used for cost.
+We can conclude from the square of their sample Pearson correlation coefﬁcients (r2) that both
+relationships between analytical values and their empirical measurements are highly linear.
+8
+
+0.2
+0.3
+0.4
+0.5
+0.5
+0.6
+0.7
+0.8
+r2 = 99.7%
+Modeled Recall
+Empirical Recall@10
+0.2
+0.4
+0.6
+0.8
+0.1
+0.2
+0.3
+r2 = 99.8%
+Modeled Cost
+1 / Throughput (ms/query)
+Figure 4: Modeled costs and recalls have a highly linear relationship with their true values.
+5.4
+OUT-OF-SAMPLE QUERY PERFORMANCE
+Our hyperparameter tunings were optimized based
+on statistics calculated on a query sample Q, but
+in order to fulﬁll their purpose, these tunings must
+generalize and provide good performance and re-
+call on the overall query stream. We test gener-
+alization capability by randomly splitting the 104
+queries in the DEEP1B dataset into two equal-sized
+halves Q1 and Q2. Then we compare the result-
+ing Pareto frontiers of training on Q1 and testing
+on Q2 (out-of-sample), versus training and testing
+both on Q2 (in-sample). The resulting Pareto fron-
+tiers, shown in Figure 5, are near-indistinguishable
+and within the range of measurement error from
+machine performance ﬂuctuations, indicating excel-
+lent generalization. Qualitatively, the in-sample and
+out-of-sample tuning parameters differ only very
+slightly, suggesting our optimization is robust.
+0.55
+0.60
+0.65
+0.70
+0.75
+0.80
+Recall@10
+5000
+10000
+15000
+20000
+25000
+30000
+Queries per Second
+In-Sample
+Out-of-Sample
+Figure 5: Speed-recall frontiers for tunings
+derived from in-sample and out-of-sample
+query sets on the DEEP1B dataset.
+5.5
+ADDITIONAL EXPERIMENTS
+In Appendix A.7 we analyze the effects of query sample size and ﬁnd even a small (1000) query
+sample is sufﬁcient to provide effective tuning results. Appendix A.8 shows that grid-searching
+a shallow quantization index (similar to what was done in Section 5.1) fails to perform well on
+billion-scale datasets.
+6
+CONCLUSION
+As adoption of nearest neighbor search increases, so does the importance of providing ANN frame-
+works capable of providing good performance even to non-experts unfamiliar with the inner details
+of ANN algorithms. We believe our work makes a signiﬁcant step towards this goal by providing
+a theoretically grounded, computationally efﬁcient, and empirically successful method for tuning
+quantization-based ANN algorithms. However, our tuning model still relies on the user to pick the
+VQ codebook size, because VQ indexing is a prerequisite needed to compute the statistics with which
+we generates tunings from. A model for how VQ codebook size impacts these statistics would allow
+for a completely hands-off, efﬁcient, ANN solution. Additional work could reﬁne the search cost
+model to more accurately reﬂect caches, account for network costs in distributed ANN solutions,
+and support alternative storage technologies such as ﬂash. In general, we are also optimistic that the
+strategy of computing ofﬂine statistics from a query sample to model online ANN search behavior
+may generalize to non-quantization-based ANN algorithms as well.
+9
+
+ACKNOWLEDGMENTS
+We would like to thank David Applegate, Sara Ahmadian, and Aaron Archer for generously providing
+their expertise in the ﬁeld of optimization.
+REFERENCES
+Alexandr Andoni and Ilya Razenshteyn. Optimal data-dependent hashing for approximate near
+neighbors. In Proceedings of the Forty-Seventh Annual ACM Symposium on Theory of Computing,
+STOC ’15, pp. 793–801, New York, NY, USA, 2015. Association for Computing Machinery.
+ISBN 9781450335362. doi: 10.1145/2746539.2746553. URL https://doi.org/10.1145/
+2746539.2746553.
+Martin Aumüller, Erik Bernhardsson, and Alexander Faithfull.
+Ann-benchmarks: A bench-
+marking tool for approximate nearest neighbor algorithms. Information Systems, 87:101374,
+2020. ISSN 0306-4379. doi: https://doi.org/10.1016/j.is.2019.02.006. URL https://www.
+sciencedirect.com/science/article/pii/S0306437918303685.
+Artem Babenko and Victor Lempitsky. Tree quantization for large-scale similarity search and
+classiﬁcation. In Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition
+(CVPR), June 2015.
+Kirell Benzi, Vassiiis Kalofolias, Xavier Bresson, and Pierre Vandergheynst. Song recommendation
+with non-negative matrix factorization and graph total variation. In 2016 IEEE International
+Conference on Acoustics, Speech and Signal Processing (ICASSP), pp. 2439–2443, 2016. doi:
+10.1109/ICASSP.2016.7472115.
+James Bergstra, Rémi Bardenet, Yoshua Bengio, and Balázs Kégl.
+Algorithms for hyper-
+parameter optimization. In J. Shawe-Taylor, R. Zemel, P. Bartlett, F. Pereira, and K.Q. Wein-
+berger (eds.), Advances in Neural Information Processing Systems, volume 24. Curran Asso-
+ciates, Inc., 2011. URL https://proceedings.neurips.cc/paper/2011/file/
+86e8f7ab32cfd12577bc2619bc635690-Paper.pdf.
+Nitin Bhatia and Vandana. Survey of nearest neighbor techniques. International Journal of Computer
+Science and Information Security, 8, 07 2010.
+Tolga Bozkaya and Meral Ozsoyoglu. Distance-based indexing for high-dimensional metric spaces.
+In Proceedings of the 1997 ACM SIGMOD International Conference on Management of Data,
+SIGMOD ’97, pp. 357–368, New York, NY, USA, 1997. Association for Computing Machinery.
+ISBN 0897919114. doi: 10.1145/253260.253345. URL https://doi.org/10.1145/
+253260.253345.
+Qi Chen, Bing Zhao, Haidong Wang, Mingqin Li, Chuanjie Liu, Zengzhong Li, Mao Yang, and
+Jingdong Wang. Spann: Highly-efﬁcient billion-scale approximate nearest neighborhood search.
+In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman Vaughan (eds.), Ad-
+vances in Neural Information Processing Systems, volume 34, pp. 5199–5212. Curran Asso-
+ciates, Inc., 2021. URL https://proceedings.neurips.cc/paper/2021/file/
+299dc35e747eb77177d9cea10a802da2-Paper.pdf.
+Paolo Cremonesi, Yehuda Koren, and Roberto Turrin. Performance of recommender algorithms on
+top-n recommendation tasks. In Proceedings of the Fourth ACM Conference on Recommender
+Systems, RecSys ’10, pp. 39–46, New York, NY, USA, 2010. Association for Computing Machinery.
+ISBN 9781605589060. doi: 10.1145/1864708.1864721. URL https://doi.org/10.1145/
+1864708.1864721.
+Criteo. Autofaiss: Automatically create faiss knn indices with the most optimal similarity search
+parameters., 2021. URL https://github.com/criteo/autofaiss.
+Mayur Datar, Nicole Immorlica, Piotr Indyk, and Vahab S. Mirrokni. Locality-sensitive hashing
+scheme based on p-stable distributions. In Proceedings of the Twentieth Annual Symposium
+on Computational Geometry, SCG ’04, pp. 253–262, New York, NY, USA, 2004. Association
+for Computing Machinery. ISBN 1581138857. doi: 10.1145/997817.997857. URL https:
+//doi.org/10.1145/997817.997857.
+10
+
+Cong Fu, Chao Xiang, Changxu Wang, and Deng Cai. Fast approximate nearest neighbor search with
+the navigating spreading-out graph. Proc. VLDB Endow., 12(5):461–474, jan 2019. ISSN 2150-
+8097. doi: 10.14778/3303753.3303754. URL https://doi.org/10.14778/3303753.
+3303754.
+Beat Gfeller, Blaise Aguera-Arcas, Dominik Roblek, James David Lyon, Julian James Odell, Kevin
+Kilgour, Marvin Ritter, Matt Shariﬁ, Mihajlo Velimirovi´c, Ruiqi Guo, and Sanjiv Kumar. Now
+playing: Continuous low-power music recognition. In NIPS 2017 Workshop: Machine Learning
+on the Phone, 2017.
+Daniel Golovin, Benjamin Solnik, Subhodeep Moitra, Greg Kochanski, John Karro, and D. Sculley.
+Google vizier: A service for black-box optimization. In Proceedings of the 23rd ACM SIGKDD
+International Conference on Knowledge Discovery and Data Mining, KDD ’17, pp. 1487–1495,
+New York, NY, USA, 2017. Association for Computing Machinery. ISBN 9781450348874. doi:
+10.1145/3097983.3098043. URL https://doi.org/10.1145/3097983.3098043.
+Ruiqi Guo, Philip Sun, Erik Lindgren, Quan Geng, David Simcha, Felix Chern, and Sanjiv Kumar.
+Accelerating large-scale inference with anisotropic vector quantization. In Hal Daumé III and Aarti
+Singh (eds.), Proceedings of the 37th International Conference on Machine Learning, volume 119
+of Proceedings of Machine Learning Research, pp. 3887–3896. PMLR, 13–18 Jul 2020. URL
+https://proceedings.mlr.press/v119/guo20h.html.
+Kelvin Guu, Kenton Lee, Zora Tung, Panupong Pasupat, and Ming-Wei Chang. Realm: Retrieval-
+augmented language model pre-training. In Proceedings of the 37th International Conference on
+Machine Learning, ICML’20. JMLR.org, 2020.
+Masajiro Iwasaki and Daisuke Miyazaki. Optimization of indexing based on k-nearest neighbor
+graph for proximity search in high-dimensional data. CoRR, abs/1810.07355, 2018. URL http:
+//arxiv.org/abs/1810.07355.
+Jeff Johnson, Matthijs Douze, and Hervé Jégou. Billion-scale similarity search with gpus. IEEE
+Transactions on Big Data, 7(3):535–547, 2021. doi: 10.1109/TBDATA.2019.2921572.
+Herve Jégou, Matthijs Douze, and Cordelia Schmid. Product quantization for nearest neighbor search.
+IEEE Transactions on Pattern Analysis and Machine Intelligence, 33(1):117–128, 2011. doi:
+10.1109/TPAMI.2010.57.
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke Zettlemoyer, and Mike Lewis. Generalization
+through memorization: Nearest neighbor language models. In 8th International Conference on
+Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020. OpenReview.net,
+2020. URL https://openreview.net/forum?id=HklBjCEKvH.
+Nikita Kitaev, Lukasz Kaiser, and Anselm Levskaya. Reformer: The efﬁcient transformer. In
+8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia,
+April 26-30, 2020. OpenReview.net, 2020. URL https://openreview.net/forum?id=
+rkgNKkHtvB.
+Erik Lindgren, Sashank Reddi, Ruiqi Guo, and Sanjiv Kumar. Efﬁcient training of retrieval models
+using negative cache. In M. Ranzato, A. Beygelzimer, Y. Dauphin, P.S. Liang, and J. Wortman
+Vaughan (eds.), Advances in Neural Information Processing Systems, volume 34, pp. 4134–
+4146. Curran Associates, Inc., 2021. URL https://proceedings.neurips.cc/paper/
+2021/file/2175f8c5cd9604f6b1e576b252d4c86e-Paper.pdf.
+Rui Liu, Tianyi Wu, and Barzan Mozafari. A bandit approach to maximum inner product search.
+Proceedings of the AAAI Conference on Artiﬁcial Intelligence, 33(01):4376–4383, Jul. 2019.
+doi: 10.1609/aaai.v33i01.33014376. URL https://ojs.aaai.org/index.php/AAAI/
+article/view/4348.
+Yu A. Malkov and D. A. Yashunin. Efﬁcient and robust approximate nearest neighbor search
+using hierarchical navigable small world graphs. IEEE Trans. Pattern Anal. Mach. Intell., 42
+(4):824–836, apr 2020. ISSN 0162-8828. doi: 10.1109/TPAMI.2018.2889473. URL https:
+//doi.org/10.1109/TPAMI.2018.2889473.
+11
+
+Alexander May and Ilya Ozerov. On computing nearest neighbors with applications to decoding
+of binary linear codes. In Elisabeth Oswald and Marc Fischlin (eds.), Advances in Cryptology –
+EUROCRYPT 2015, pp. 203–228, Berlin, Heidelberg, 2015. Springer Berlin Heidelberg. ISBN
+978-3-662-46800-5.
+Antoine Miech, Jean-Baptiste Alayrac, Ivan Laptev, Josef Sivic, and Andrew Zisserman. Thinking
+fast and slow: Efﬁcient text-to-visual retrieval with transformers. In Proceedings of the IEEE/CVF
+Conference on Computer Vision and Pattern Recognition (CVPR), pp. 9826–9836, June 2021.
+Parikshit Ram and Alexander G. Gray.
+Maximum inner-product search using cone trees.
+In
+Proceedings of the 18th ACM SIGKDD International Conference on Knowledge Discovery
+and Data Mining, KDD ’12, pp. 931–939, New York, NY, USA, 2012. Association for Com-
+puting Machinery. ISBN 9781450314626. doi: 10.1145/2339530.2339677. URL https:
+//doi.org/10.1145/2339530.2339677.
+Jie Ren, Minjia Zhang, and Dong Li. Hm-ann: Efﬁcient billion-point nearest neighbor search on
+heterogeneous memory. In H. Larochelle, M. Ranzato, R. Hadsell, M.F. Balcan, and H. Lin (eds.),
+Advances in Neural Information Processing Systems, volume 33, pp. 10672–10684. Curran As-
+sociates, Inc., 2020. URL https://proceedings.neurips.cc/paper/2020/file/
+788d986905533aba051261497ecffcbb-Paper.pdf.
+Mohammad RezaAbbasifard, Bijan Ghahremani, and Hassan Naderi. A Survey on Nearest Neighbor
+Search Methods. International Journal of Computer Applications, 95(25):39–52, June 2014. doi:
+10.5120/16754-7073.
+Anshumali Shrivastava and Ping Li. Asymmetric lsh (alsh) for sublinear time maximum inner
+product search (mips). In Z. Ghahramani, M. Welling, C. Cortes, N. Lawrence, and K.Q. Wein-
+berger (eds.), Advances in Neural Information Processing Systems, volume 27. Curran Asso-
+ciates, Inc., 2014. URL https://proceedings.neurips.cc/paper/2014/file/
+310ce61c90f3a46e340ee8257bc70e93-Paper.pdf.
+Harsha Vardhan Simhadri, George Williams, Martin Aumüller, Matthijs Douze, Artem Babenko,
+Dmitry Baranchuk, Qi Chen, Lucas Hosseini, Ravishankar Krishnaswamy, Gopal Srinivasa,
+Suhas Jayaram Subramanya, and Jingdong Wang. Results of the neurips’21 challenge on billion-
+scale approximate nearest neighbor search, 2022. URL https://arxiv.org/abs/2205.
+03763.
+Jingdong Wang, Heng Tao Shen, Jingkuan Song, and Jianqiu Ji. Hashing for similarity search: A
+survey. CoRR, abs/1408.2927, 2014. URL http://arxiv.org/abs/1408.2927.
+Mengzhao Wang, Xiaoliang Xu, Qiang Yue, and Yuxiang Wang. A comprehensive survey and
+experimental comparison of graph-based approximate nearest neighbor search. Proc. VLDB
+Endow., 14(11):1964–1978, jul 2021. ISSN 2150-8097. doi: 10.14778/3476249.3476255. URL
+https://doi.org/10.14778/3476249.3476255.
+Ian En-Hsu Yen, Satyen Kale, Felix Yu, Daniel Holtmann-Rice, Sanjiv Kumar, and Pradeep Raviku-
+mar. Loss decomposition for fast learning in large output spaces. In Jennifer Dy and Andreas
+Krause (eds.), Proceedings of the 35th International Conference on Machine Learning, volume 80
+of Proceedings of Machine Learning Research, pp. 5640–5649. PMLR, 10–15 Jul 2018. URL
+https://proceedings.mlr.press/v80/yen18a.html.
+12
+
+A
+APPENDIX
+A.1
+LSH GUARANTEES IN PRACTICE
+LSH based approaches to nearest neighbor search provide a number of rigorous guarantees regarding
+memory usage and query time complexity as a function of the approximation factor c, deﬁned as
+follows: if the true nearest neighbor is a distance of d from the query, the approximate algorithm is
+considered to have succeeded if it returns a point whose distance to the query is at most cd.
+LSH algorithms are capable of prescribing hyperparameter settings (size and number of hash tables)
+to provide optimal worst-case performance for a given value of c. To see what these hyperparameter
+settings would imply for a given recall, we take a 90% recall@10 setting for Glove1M in Section 5.1
+and compute the resulting c for each query, giving us 104 ratios. In Table 2 below, we plot various
+statistics of these ratios and their implications for the resulting ANN hyperparameters, using the
+results from Andoni & Razenshteyn (2015):
+Table 2: Statistics on empirically measured c
+Statistic on c
+Value of c
+ρ = 1/(2c2 −1)
+Space Complexity
+Estimated Space
+for Glove1M
+Mean
+1.00262
+0.98962
+O(n1.99 + nd)
+1.2TB
+Median
+1
+1
+O(n2 + nd)
+1.4TB
+75th Percentile
+1
+1
+O(n2 + nd)
+1.4TB
+90th Percentile
+1
+1
+O(n2 + nd)
+1.4TB
+99th Percentile
+1.07024
+0.77470
+O(n1.77 + nd)
+60GB
+We see that even if we take the 99th percentile c value, this leads to hash table hyperparameters that
+result in over 60GB of memory usage, under the conservative assumption that the constant factor for
+the n1.77 term is one byte. This is 128 times the size of the original dataset and already somewhat
+impractical; for billions-scale datasets, this would be completely intractable.
+While LSH may perform better in practice on this dataset than what the theory guarantees, and may
+not need such high memory consumption to reach this level of accuracy, such a result would imply
+that the hyperparameters for hashing-based ANN algorithms are difﬁcult to tune and model, not
+unlike the hyperparameter-tuning challenges that other ANN algorithms face.
+A.2
+FACTORIZED RECALL ASSUMPTION
+Here we describe in detail the approximation 1g∈Si(q,t) ≈1g∈Si−1(q,t)1g∈S′
+i(q,ti) used to simplify
+Equation 4. The event g ∈Si(q, t) is equivalent to requiring both g ∈Si−1(q, t) and ﬁnding fewer
+than ti points closer to q than datapoint g according to quantization i, which we can express as:
+1g∈Si(q,t) = 1g∈Si−1(q,t)1
+
+
+
+X
+j∈Si−1(q,t)
+1D(q, ˜
+X (i)
+j
+)<D(q, ˜
+X (i)
+g
+) < ti
+
+
+.
+(7)
+Now deﬁne ˆSi−1(q, t) to be {1, . . . , n} \ Si−1(q, t), and consider some element j ∈ˆSi−1(q, t). For
+the following section, we assume g ∈Si−1(q, t), which implies D(q, ˜
+X (i−1)
+g
+) < D(q, ˜
+X (i−1)
+j
+). We
+split our analysis into two cases:
+1. j ̸∈G(q); this is by far the common case, where quantization i −1 correctly removed a
+non-nearest-neighbor from the candidate set. This means quantization i −1 has already
+ranked the relative distances of j and g correctly; given that quantization i is higher bitrate
+than i−1 and is therefore even less likely to mis-rank the relative distances, we know almost
+surely that D(q, ˜
+X (i)
+g ) < D(q, ˜
+X (i)
+j ).
+2. j ∈G(q); quantization i −1 has dropped a nearest neighbor. If we assume j and g
+are picked uniformly without replacement from G(q), then with the original dataset X,
+13
+
+P[D(q, Xg) < D(q, Xj)] = 1/2. However, at quantization ˜
+X (i), we approximate that
+P[D(q, ˜
+X (i)
+g ) < D(q, ˜
+X (i)
+j )] = 1 with the following justiﬁcations:
+• Given that D(q, ˜
+X (i−1)
+g
+) < D(q, ˜
+X (i−1)
+j
+), g is likely closer to q than j is, so the
+uniform sampling model used above for g and j leads to an underestimated probability.
+• Even if j is in fact the closer neighbor, the hierarchical nature of multi-layer quantization
+training implies that there is some correlation between distance mis-rankings among the
+different quantization layers. If D(q, ˜
+X (i−1)
+g
+) < D(q, ˜
+X (i−1)
+j
+) then there is a higher
+chance that D(q, ˜
+X (i)
+g ) < D(q, ˜
+X (i)
+j ).
+Combining the results from our two cases, we see that if g ∈Si−1(q, t), then the number of elements
+in ˆSi−1(q, t) that will rank closer to q than g according to ˜
+X (i) is approximately zero:
+1g∈Si−1(q,t)
+X
+j∈ˆ
+Si−1(q,t)
+1D(q, ˜
+X (i)
+j
+)<D(q, ˜
+X (i)
+g
+) ≈0.
+We can add this expression to Equation 7 and utilize the deﬁnition from Equation 3 to conclude
+1g∈Si(q,t) ≈1g∈Si−1(q,t)1
+
+
+
+X
+j∈Si−1(q,t)∪ˆ
+Si−1(q,t)
+1D(q, ˜
+X (i)
+j
+)<D(q, ˜
+X (i)
+g
+) < ti
+
+
+
+= 1g∈Si−1(q,t)1g∈S′
+i(q,ti).
+A.3
+EXTENSION OF COST MODEL TO BATCHED QUERYING
+The main speedup from query batching in quantization-based ANN algorithms arises from the fact that
+the same quantized data may be reused to score multiple queries. This conserves memory bandwidth,
+resulting in better performance, because memory bandwidth is scarce relative to arithmetic throughput
+in modern hardware. To account for this in our cost model, we ﬁrst rewrite Equation 6 as
+J(t) ≜
+1
+|X| ·
+ 
+| ˜
+X (1)| +
+m−1
+X
+i=1
+ti
+n · | ˜
+X (i+1)|
+!
+=
+1
+|X|
+m
+X
+i=1
+αi| ˜
+X (i)|
+where αi is the proportion of ˜
+X (i) that is searched; α1 = 1 and αi = ti−1/n for i > 1. The
+amount of memory bandwidth consumed in searching this quantization level for a batch of size B is
+approximately min(1, αiB)| ˜
+X (i)|, while the number of arithmetic operations performed is αiB| ˜
+X (i)|.
+Applying the rooﬂine model to this algorithm, where we are bandwidth-bound in the small-batch
+regime and compute-bound in the large-batch regime, gives the following new cost model:
+J(t, B) ≜
+1
+|X|
+m
+X
+i=1
+max(αiB/ρ, min(1, αiB))| ˜
+X (i)|
+where ρ is the ratio of the hardware’s arithmetic performance to memory bandwidth. In practice,
+query batching is of limited utility in large-scale ANN because αi is so small that the algorithm will
+still be bandwidth-limited, resulting in no performance boost.
+A.4
+SINGLE-LAYER CANDIDATE SET RECALL CURVE COMPUTATION
+Our goal is to efﬁciently compute Li from Equation 5, reproduced below:
+14
+
+Li(Q, ti) = Eq∈Q
+
+−log |S′
+i(q, ti) ∩G(q)|
+|G(q)|
+
+.
+We want to compute this quantity for all ti ∈{1, . . . , n} and for all quantization levels. As a
+prerequisite, we ﬁrst require the ground truth G(q) for all q ∈Q. Note this ground truth is required to
+compute the recall of any ANN algorithm and therefore should be computed regardless of whether
+our technique is used. We can store the ground truth results in a matrix G ∈{1, . . . , n}nq×k, where
+n is the number of elements in the dataset, nq is the number of elements in the Q, and k is the number
+of neighbors we want to retrieve per query.
+Now for each ground truth element, we compute its distance from the query for every dataset
+quantization. This may be expressed as computing U ∈Rnq×m×k where Ua,b,c = D(Qa, ˜
+X (b)
+Ga,c).
+We then sort each Ua,b so that Ua,b,c < Ua,b,c+1 for all c ∈{1, . . . , k −1}. From U we then compute
+a matrix V ∈Nnq×m×k where Va,b,c stores the number of distances between query Qa and ˜
+X (b) that
+are less than Ma,b,c:
+Va,b,c =
+n
+X
+i=1
+1D(Qa, ˜
+X (b)
+i
+)<Ma,b,c.
+Note that because Ua,b was sorted, Va,b will be sorted as well. The entry Va,b,c indicates the search
+depths at which recall for query Qa with quantization ˜
+X (b) increase. For example, if Va,b = [1, 3, 8],
+we can conclude that recall for this query-quantization combination will be 0 when returning only
+the top 1 index, 1/3 when returning the top 2 or 3 indices, 2/3 when returning the top 3 through 7
+indices, and 1 when returning the top 8 or more indices. Once we have V , it is a simple matter of
+taking logarithms and aggregating over queries to compute Li.
+The computational bottleneck to this routine is computing V ; we must compute the query-dataset
+distance for all queries over all dataset quantizations, which takes O
+
+nq
+Pm
+i=1 | ˜
+X (i)|
+
+time, where
+| ˜
+X (i)| denotes the memory footprint of quantization i. For each distance we must then decide how
+many of Ma,b it is less than, which takes O(log k) time per distance using binary search. We can
+estimate the number of distances as O(mn), although this is an overestimate because VQ-quantized
+layers will result in fewer than n distances being materialized. Overall, this gives our routine a
+runtime of
+O
+ 
+nq
+m
+X
+i=1
+| ˜
+X (i)| + nqmn log k
+!
+.
+To analyze this expression further, let | ˜
+X (i)| = n · d · ri, where ri is the compression ratio for
+quantization i. Our runtime can then be expressed as O(nqn(d Pm
+i=1 ri + m log k)); the ﬁrst term
+tends to dominate due to the presence of d.
+This routine is relatively cheap; to compare, the computation of ground truth nearest neighbors, which
+is generally done as part of any ANN indexing routine, takes O(nqnd) time. Assuming as above that
+the ﬁrst term of our runtime dominates, our routine is a multiplicative factor of Pm
+i=1 ri as expensive,
+which in practice with typical quantization hierarchies is below 2.
+A.5
+FAST MINIMIZATION ALGORITHM FOR DYNAMIC LAGRANGE MULTIPLIERS
+Our goal is to quickly perform the optimization
+arg min
+t∈[0,n]m
+−λJ(t) +
+m
+X
+i=1
+Li(ti)
+s.t.
+t1 ≥. . . ≥tm.
+15
+
+quickly for dynamic values of λ, with all other inputs constant.
+We ﬁrst describe the zero-
+preprocessing, O(nm) time dynamic programming solution to this problem, which we then optimize
+to arrive at our ﬁnal O(m log n) approach.
+A.5.1
+BASIC DYNAMIC PROGRAMMING APPROACH
+For a ﬁxed λ, our optimization is equivalent to selecting non-increasing indices t1, . . . , tm such that
+Pm
+i=1 Mi,ti is minimized, where the matrix M ∈Rm×n is deﬁned as Mi,j = Li(j) −λJi(j). Now
+we deﬁne our dynamic programming subproblem as selecting the ﬁrst a indices t1, . . . , ta such that
+all indices are at least equal to b. We can store these subproblem answers in another matrix M ′:
+M ′
+a,b ≜
+min
+t∈[b,n]a
+a
+X
+i=1
+Mi,ti
+s.t.
+t1 ≥. . . ≥ta.
+Using the state transition M ′
+a,b = min(M ′
+a,b+1, Ma,b + M ′
+a−1,b) allows us to compute all of M ′ and
+receive the resulting minimum, located at M ′
+m,n, in O(nm) time. The approach may be augmented
+with cost and history matrices so that J(t), P Li, and the selected indices ti may be recovered as
+well.
+A.5.2
+FASTER ALGORITHM LEVERAGING CONVEXITY
+Recall that all Li are convex, and J is linear, so every row of M is convex. Inductively, we can see
+that this leads to the rows of M ′ being convex as well, which we take advantage of to accelerate
+our algorithm. First, deﬁne j∗(i) as the rightmost index in row i achieving the row-wise minimum
+in M ′; j∗(i) = max{j : M ′
+i,j = mink M ′
+i,k}. Due to the convexity of M ′, we know that M ′
+i,j is
+strictly increasing with respect to j for all j > j∗(i). Combined with this equivalent expression for
+computing M ′,
+M ′
+a,b =
+min
+j∈{b,...,n} Ma,j + M ′
+a−1,j
+(8)
+it’s clear that M ′
+i is equivalent to Mi + M ′
+i−1 in the column range [j∗(i), n]. Meanwhile, M ′
+i,j =
+M ′
+i,j∗(i) for j < j∗(i).
+Now let’s inductively assume that M ′
+i−1 is composed of a number of piecewise components, where the
+kth component equals the sum of the most recent rk rows of M plus a constant ck and is responsible
+for the columns j ∈[lk, rk]. From Equation 8 we can see that upon the transition from Mi−1 to M ′
+i,
+all pieces to the right of j∗(i) will be incremented by Mi. All pieces left of j∗(i) will be replaced
+with a constant offset equalling Mi,j∗(i), maintaining our inductive hypothesis. The base case for this
+hypothesis is also easily veriﬁed, as we see M ′
+1 equals M1 in the range j ∈[j∗(1), n], and left of that
+range it equals the constant M ′
+1,j∗(1).
+This realization allows for faster approaches to our minimization problem by allowing M ′ to be
+implicitly represented rather than explicitly computed. We maintain the set of piecewise components
+as we traverse from row 1 to m. At each row, we have to ﬁnd j∗(i) and update our set of components
+accordingly. The search for j∗(i) may be done efﬁciently by taking advantage of the convexity of M ′
+via binary search. We ﬁrst binary search over our components to ﬁnd the one containing the global
+minimum, and then binary searching among the indices belonging to that component. Computing
+the value within a component may be done in O(1) time once a preﬁx sum array over L and J are
+created; these data structures allow contiguous sums over M with dynamic λ. The component list
+update then takes O(1) amortized cost per row, because only one component is added per row.
+There are at most min(m + 1, n) components and any component may have a range of at most n
+indices, so the resulting minimization takes O(m log n) time. Calculating the preﬁx sums over L and
+J result in O(mn) preprocessing time for this algorithm.
+16
+
+˜
+X1: Level 2 PQ
+4 · 104 × 12 bytes; ∼480KB
+˜
+X2: Level 2 Centroids (int8)
+4 · 104 × 96 bytes; ∼3.84MB
+˜
+X3: Level 1 PQ
+4 · 106 × 16 bytes; ∼64MB
+˜
+X4: Level 1 Centroids (int8)
+4 · 106 × 96 bytes; ∼384MB
+˜
+X5: Dataset PQ
+109 × 48 bytes; ∼48GB
+Dataset (int8, not stored)
+109 × 96 bytes; ∼96GB
+(a) DEEP1B
+˜
+X1: Level 2 PQ
+4 · 104 × 12.5 bytes; ∼500KB
+˜
+X2: Level 2 Centroids (int8)
+4 · 104 × 100 bytes; ∼4MB
+˜
+X3: Level 1 PQ
+4 · 106 × 17 bytes; ∼68MB
+˜
+X4: Level 1 Centroids (int8)
+4 · 106 × 100 bytes; ∼400MB
+˜
+X5: Dataset PQ
+109 × 50 bytes; ∼50GB
+Dataset (int8, not stored)
+109 × 100 bytes; ∼100GB
+(b) Microsoft Turing-ANNS
+˜
+X1: Level 2 PQ
+4 · 104 × 25 bytes; ∼1MB
+˜
+X2: Level 2 Centroids (int8)
+4 · 104 × 200 bytes; ∼8MB
+˜
+X3: Level 1 PQ
+4 · 106 × 34 bytes; ∼136MB
+˜
+X4: Level 1 Centroids (int8)
+4 · 106 × 200 bytes; ∼800MB
+˜
+X5: Dataset PQ
+109 × 50 bytes; ∼50GB
+Dataset (int8, not stored)
+109 × 200 bytes; ∼200GB
+(c) Yandex Text-to-Image
+Figure 6: Multi-level quantization hierarchies used for the three billions-scale datasets of Section 5.2.
+A.6
+BILLION-SCALE SEARCH EXPERIMENTAL SETUP DETAILS
+Track 1 of the https://big-ann-benchmarks.com competition stipulates that:
+• Query-time benchmarking is done on Azure VMs with 32 vCPUs and 64GB RAM.
+• Indexing takes place on Azure VMs with 64vCPUs, 128GB RAM, and 4TB SSD, and must
+ﬁnish within 4 days.
+Our query-time serving was performed on 16 physical cores from an Intel Cascade Lake-generation
+CPU, and peak memory usage was measured to be under 58GB. Azure counts one physical core as
+equal to 2 vCPUs, so our setup matches the competition requirements.
+For indexing time, our index was constructed via a distributed computing pipeline. For DEEP1B, the
+pipeline ran in approximately 1.5 hours and in total consumed approximately 538.0 vCPU-hours of
+compute power. Approximately 16.3 vCPU-hours, or 2.7% of the overall indexing job’s resource
+consumption, was spent on computing L for use in our convex optimization routine. Other datasets
+were comparable in runtime. They were all signiﬁcantly under the 6144 vCPU-hours available under
+the competition speciﬁcations, and furthermore the VQ and PQ training involved in the pipeline have
+low peak memory and disk requirements, so our indexing procedure comfortably qualiﬁes under the
+competition rules.
+A.6.1
+HIERARCHICAL QUANTIZATION INDEX DETAILS
+The three diagrams below describe in detail the quantization hierarchy used for the three billions-scale
+datasets in Section 5.2. We would like to emphasize that all three datasets used the same VQ and
+PQ settings–the datasets are ﬁrst quantized to 4 × 106 centroids, and then again to 4 × 104 centroids.
+The PQ was performed with 16 centers (4 bits) per subspace, 4 dimensions per subspace at the X1
+level, and 3 dimensions per subspace (rounding up) at the X3 level. Only the Yandex Text-to-Image
+dataset differs at the X5 level with its PQ setting (using 2 dimensions per subspace instead of 1), but
+this was only to ﬁt the higher-dimensional dataset into the same RAM footprint.
+Even though our technique cannot set these VQ and PQ parameters, the fact that we can achieve
+excellent performance on all three datasets using the same VQ and PQ parameters, despite these
+datasets giving drastically different speed/recall Pareto frontiers, suggests the VQ and PQ parameters
+are not as difﬁcult a part of the tuning problem and have more predictable good settings than the
+hyperparameters our technique deals with.
+17
+
+A.7
+IMPACT OF QUERY SAMPLE SIZE ON HYPERPARAMETER TUNING QUALITY
+0.68
+0.70
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+Recall@10
+15000
+20000
+25000
+30000
+35000
+40000
+45000
+50000
+55000
+Queries per Second
+100 Queries
+1000 Queries
+10000 Queries
+Figure 7: Achieved search throughput and recall for tunings generated from different query sample
+sizes on the Microsoft Turing-ANNS billion-scale dataset.
+A larger query sample should lead to our optimization ﬁnding better hyperparameter tunings, but
+would also lead to greater cost in computing L, whose runtime is linear in the query sample size.
+In this section, we explicitly measure the effect of increasing query sample size by taking the 105
+queries from the MS-Turing dataset of big-ann-benchmarks, holding out 104 queries as a test
+set, and sampling subsets of 100, 1000, and 10000 queries from the remaining 9 × 104 queries. For
+each subset size, nine samples were taken, all disjoint from other subsets of the same size.
+For each query subset, we run our constrained optimization technique to generate low, medium, and
+high search cost ANN algorithm hyperparameter tunings, and measure the resulting recall and search
+throughput on the holdout query set. The search cost targets for the low, medium, and high settings
+were J(t) = 2 × 10−6, 5 × 10−6, and 1.2 × 10−5, respectively. The resulting recalls and throughputs
+are plotted in Figure 7.
+We can see that increasing the query sample size from 100 to 1000 leads to considerably less variance,
+with the resulting hyperparameters more consistently approaching the global cost-recall Pareto
+frontier. However, increasing the sample size further from 1000 to 10000 has very marginal impact.
+The query sample size was kept at 1000 for the experiments in Section 5.2, and is reﬂected in the
+vCPU-hour measurement in Appendix A.6.
+A.8
+PERFORMANCE OF FEW-LEVEL QUANTIZATION HIERARCHIES ON DEEP1B
+In Section 5.2 we use a ﬁve-level quantization hierarchy to search the DEEP1B, Microsoft Turing-
+ANNS, and Yandex Text-to-Image datasets from big-ann-benchmarks. Our hyperparameter
+tuning technique was necessary because the four-dimensional hyperparameter search space was
+impractically large for grid search. If we had built an ANN search index with fewer quantization
+levels, a simpler grid search approach could be used to ﬁnd effective hyperparameters; in this section,
+we conﬁrm that such shallow search indices perform poorly on DEEP1B, thereby ruling out grid
+search as a viable option.
+To test this, we take the original quantization hierarchy, described in Figure 6, and modify it in two
+ways. In one, we keep only the top-level 4 × 104 VQ centroids and remove the intermediate layer of
+4 × 106 centroids, to create the Shallow-Small quantization index; in the other, we remove the
+top-level centroids and only keep the 4 × 106 centroids from the middle layer of the hierarchy. These
+two modiﬁed quantization indices are illustrated in Figure 8.
+18
+
+˜
+X1: Level 1 PQ
+4 · 104 × 12 bytes; ∼480KB
+˜
+X2: Level 1 Centroids (int8)
+4 · 104 × 96 bytes; ∼3.84MB
+˜
+X3: Dataset PQ
+109 × 48 bytes; ∼48GB
+Dataset (int8, not stored)
+109 × 96 bytes; ∼96GB
+(a) Shallow-Small quantization index
+˜
+X1: Level 1 PQ
+4 · 106 × 16 bytes; ∼64MB
+˜
+X2: Level 1 Centroids (int8)
+4 · 106 × 96 bytes; ∼384MB
+˜
+X3: Dataset PQ
+109 × 48 bytes; ∼48GB
+Dataset (int8, not stored)
+109 × 96 bytes; ∼96GB
+(b) Shallow-Large quantization index
+Figure 8: The two quantization hierarchies we compare in this experiment against the original one
+used in Section 5.2 and described in Figure 6.
+The Shallow-Small and Shallow-Large indices both have three quantization levels and
+therefore a two-dimensional hyperparameter search space. We use grid search to explore this space,
+and plot in Figure 9 the resulting speed-recall Pareto frontiers against the original frontier from
+Section 5.2.
+We see that both Shallow-Small and Shallow-Large perform extremely poorly relative to the
+original ﬁve-layer index. Qualitatively, Shallow-Small has too many datapoints assigned to each
+of its 4 × 104 centroids, which implies the search cost of further searching any centroid is high; in
+addition, any given datapoint is unlikely to be quantized well by its centroid (due to the relatively low
+number of centroids), so the quality of results also tends to be low. Meanwhile, Shallow-Large
+has so many centroids that it always spends a large ﬁxed cost on level 1 PQ distance computation.
+ 0
+ 10000
+ 20000
+ 30000
+ 40000
+ 50000
+ 60000
+ 70000
+ 80000
+ 90000
+ 100000
+ 0.5
+ 0.55
+ 0.6
+ 0.65
+ 0.7
+ 0.75
+ 0.8
+Speed (Queries per Second)
+Accuracy (Recall@10)
+Shallow-Small
+Shallow-Large
+Original
+Figure 9: Both three-level quantization indices perform very poorly relative to the original ﬁve-layer
+quantization index on DEEP1B.
+19
+

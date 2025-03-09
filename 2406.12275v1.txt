@@ -1,0 +1,1447 @@
+VoCo-LLaMA: Towards Vision Compression with
+Large Language Models
+Xubing Ye1†, Yukang Gan2, Xiaoke Huang3, Yixiao Ge2∗, Ying Shan2, Yansong Tang1∗
+1Tsinghua Shenzhen International Graduate School, Tsinghua University
+2ARC Lab, Tencent PCG
+3UC Santa Cruz
+{yxb23@mails.,tang.yansong@sz.}tsinghua.edu.cn
+{brucegan,yixiaoge,yingsshan}@tencent.com
+xhuan192@ucsc.edu
+Abstract
+Vision-Language Models (VLMs) have achieved remarkable success in various
+multi-modal tasks, but they are often bottlenecked by the limited context window
+and high computational cost of processing high-resolution image inputs and videos.
+Vision compression can alleviate this problem by reducing the vision token count.
+Previous approaches compress vision tokens with external modules and force LLMs
+to understand the compressed ones, leading to visual information loss. However,
+the LLMs’ understanding paradigm of vision tokens is not fully utilised in the
+compression learning process. We propose VoCo-LLaMA, the first approach to
+compress vision tokens using LLMs. By introducing Vision Compression tokens
+during the vision instruction tuning phase and leveraging attention distillation,
+our method distill how LLMs comprehend vision tokens into their processing of
+VoCo tokens. VoCo-LLaMA facilitates effective vision compression and improves
+the computational efficiency during the inference stage. Specifically, our method
+achieves minimal performance loss with a compression ratio of 576×, resulting in
+up to 94.8% fewer FLOPs and 69.6% acceleration in inference time. Furthermore,
+through continuous training using time-series compressed token sequences of video
+frames, VoCo-LLaMA demonstrates the ability to understand temporal correlations,
+outperforming previous methods on popular video question-answering benchmarks.
+Our approach presents a promising way to unlock the full potential of VLMs’
+contextual window, enabling more scalable multi-modal applications. The project
+page, along with the associated code, can be accessed via the following link.
+1
+Introduction
+The advent of visual-language models [1–10] has led to significant advancements in visual under-
+standing. Particularly, high-resolution image encoding [7, 8] and the incorporation of more video
+frames [9, 10] have been shown to enhance the capabilities of both large visual-language models and
+large video-language models, respectively. However, the large number of vision tokens occupies a
+substantial portion of the valuable context window of the large language model, leading to expensive
+computational costs, as shown in Figure 1 (a). For instance, when using high-resolution image
+inputs in LLaVA-1.6 [7], a single image with a resolution of 672 × 672 is divided into four smaller
+patches, each encoded with a 336 × 336 resolution input. This process yields an image representation
+consisting of 2304 vision tokens, occupying over half of the context length. Furthermore, as the
+number of input images increases, the context window for text will be further bottlenecked. For
+example, Vicuna-1.5 [11] can only handle approximately 7 frames (7 × 576 = 4032 tokens) within
+†Work was done when the author interned at ARC Lab, Tencent PCG. ∗Corresponding author.
+Preprint. Under review.
+arXiv:2406.12275v1  [cs.CV]  18 Jun 2024
+
+Language Model
+Vision Tokens
+…
+VoCo
+c) VoCo-LLaMA
+b) Previous method
+a) VLMs
+Text Tokens
+…
+Text Tokens
+Vision Tokens
+…
+…
+Vision tokens length
+Text
+Vision tokens length
+Language Model
+LLM ctx length
+High-Resolution Image Input
+…
+LLM ctx length
+Video
+Input
+Text
+Truncated
+Major ctx proportion
+𝑝𝑦  𝑐𝑜𝑚𝑝𝑟𝑒𝑠𝑠(𝒱), 𝒯)
+𝑝!"#" 𝑦  𝑉𝑜𝐶𝑜(𝒱), 𝒯)
+𝑝𝑦  𝒱, 𝒯)
+Distill
+/
+Pooling
+Q-Former
+Linear
+𝒱
+𝒯
+𝒱
+𝒯
+Figure 1: (a) VLMs are bottlenecked by the limited context window when processing high-resolution
+images and videos. (b) Previous methods exploit Q-Former [1] or average pooling [12] to "compress"
+vision tokens with substantial loss. (c) Illustration of VoCo-LLaMA, which empowers LLM to
+compress vision tokens and understand compressed tokens via intrinsic token distillation.
+its 4k context length, given away the text inputs. [9, 10] investigate the efficacy of extending the
+context length to the million-level mark to mitigate this issue, but this approach necessitates expensive
+computational resources (e.g., [9] requires over 1000 v4 TPUs) and engineering efforts in data
+preparation and framework development.
+Effective representation of visual information within limited context length is crucial for addressing
+the challenges. A promising approach is to reduce the number of vision tokens representing an
+image, ideally to just a handful or even a single token. As illustrated in Figure 1 (b), previous
+methods [1, 3, 4, 6, 12, 13] have exploited the use of Q-Former [1] or straight-forward pooling
+operations to "compress" the encoded vision tokens. These methods compress the vision tokens
+with external modules and force LLMs to understand the compressed ones. This may disrupt the
+established paradigm of how LLMs comprehend original uncompressed vision tokens and bring loss
+of visual information. However, LLMs with uncompressed vision token input have already possessed
+visual understanding capabilities. Therefore, a more intuitive approach of vision compression is to
+distill how LLMs understand vision tokens into their processing of compressed tokens.
+We propose VoCo-LLaMA, the first vision compression method that exploits the inherent functionality
+of large language models. As demonstrated in Figure 1 (c), we introduce Vision Compression (VoCo)
+tokens between visual and text tokens. By simply modifying the attention mechanism, we first isolate
+the visual and text tokens by inserting VoCo tokens. Subsequently, we establish an exclusive
+interaction pathway between the visual and text tokens via VoCo tokens. This facilitates the LLM
+itself to compress and distill the parsing vision tokens, specifically the transformer activations on top
+of them, into compact VoCo tokens. Benefiting from this compression strategy, our method achieves
+modality alignment without the specialized text-vision cross-modal fusion module design [1, 12].
+Our method can learn vision compression through standard visual instruction tuning, eliminating the
+need for incurring additional training phase. Furthermore, when handling multiple repetitive visual
+inputs in the inference stage, VoCo-LLaMA enables caching and reusing compressed transformer
+activations, improving computational efficiency and reducing storage requirements for caching. VoCo-
+LLaMA can achieve a 576× compression rate (compressing 576 vision tokens into a single VoCo
+token) while maintaining 83.7% performance. Additionally, we observe a reduction in inference
+computation costs, with up to 99.8% in cache storage, 94.8% FLOPs and 69.6% in inference time.
+2
+
+To further investigate the efficacy of our proposed method in handling video input, we utilize the time-
+series VoCo token sequence obtained by compressing video frames to further explore the temporal
+modeling capabilities of VoCo-LLaMA. Without any additional designs, VoCo-LLaMA outperforms
+existing vision compression methods on common video question-answering benchmarks, with each
+video frame compressed into an equal number of tokens.
+2
+Related Work
+LLMs and Text Compression. In recent years, large language models (LLMs) have sparked a
+technological revolution. As the scale of training data and model size continue to expand, mod-
+els [11, 14–20] have demonstrated exceptional capabilities in understanding and generating language,
+showcasing the powerful abilities of LLMs in handling complex language tasks. In particular, models
+such as the LLaMA series [17, 18, 20], Vicuna [11], and Mistral [19] have emerged as foundational
+models or main components in many research works. However, the limited context window size in
+LLMs has long been a widely discussed topic in the natural language processing field. Compressing
+text to conserve valuable window length has been proven to be an efficient approach. Long-standing
+works, including [21–25], focus on storing text representations in transformers to achieve dense infor-
+mation representation. [26, 27] have demonstrated the effectiveness of distilling long text information
+into prompt-free student models. [28] has made significant progress in compressing information in
+long contexts by learning soft prompts. In a similar vein, recent studies [29–31] have explored the
+potential applications of compressing text in large language models. Although the context length
+limitation is a likewise pervasive challenge in vision-language models, the discussion of compressing
+visual information has been relatively understudied compared to the language model domain. Our
+work pioneers the use of LLMs’ learning capabilities to compress and distill information in vision
+tokens, aiming to bridging this gap in the field of VLMs.
+VLMs and Vision Compression. The success of LLMs has inspired significant progress in vision
+language models (VLMs). By integrating visual encoders with LLMs, VLMs can effectively achieve
+cross-modal understanding and other visual language tasks through modality alignment and instruc-
+tion tuning. Previous methods [1–8, 13, 32] have substantiated the success of this training paradigm
+in visual understanding. The successful application of VLMs on images has also been rapidly
+extended to the video domain [9, 10, 12, 33–39]. With the input of higher-resolution images [7, 8]
+and more video frames [9, 10], VLMs can capture rich visual information for understanding and
+generation. However, as the number of vision tokens representing an input image increases, they
+take up a significant portion of the limited context window of language models, and can even exceed
+it. To address this, previous methods [1, 3, 4, 6, 13] have largely employed Q-Former [1], which
+maps images to fixed-length tokens in the language embedding space through learnable queries,
+compressing visual information. A more recent approach [12] has applied average pooling with a
+learnable linear layer to compress visual features through multi-stage training strategy. Although
+these methods perform moderately well at lower compression multiples, they cause a significant
+loss of valuable visual information when the number of compressed tokens reduces. VoCo-LLaMA
+distills the approach of LLMs in understanding vision tokens into their processing of compressed
+tokens, significantly reducing information loss during the vision compression process.
+3
+Method
+We first introduce VoCo-LLaMA, a large language model capable of compressing lengthy vision
+tokens into compact VoCo tokens through attention distillation, which enables the efficient repre-
+sentation of visual information. Then, we build upon these compressed tokens to continue training
+VoCo-LLaMA, enabling our model to capture temporal dependencies within video data.
+3.1
+Vision Compression
+Given a paired image and text input, we follow the design of most vision-language models (VLMs)
+and encode the image into a sequence of vision tokens V = {V1, . . . , Vn}, where n is the number of
+the output patches from the visual encoder. Similarly, the text input is encoded into a sequence of
+text tokens T = {T1, . . . , Tm}. Consider an original, unmodified standard vision-language model
+(denoted as V LMo), exemplified by LLaVA [2], depicted in Figure 2 (a). During visual instruction
+3
+
+…
+…
+VoCo
+Language Model
+…
+…
+𝑝!"#" 𝑦  𝑉𝑜𝐶𝑜𝒱, 𝒯)
+b) VoCo-LLaMA
+a) VLMs
+Text Tokens
+Vision Tokens
+…
+…
+Language Model
+…
+…
+𝑝!$%! 𝑦  𝒱, 𝒯)
+𝒱
+Vision Tokens 𝒱
+𝒯
+Text Tokens 𝒯
+𝑉!
+𝑉"
+𝑉#
+𝑉#$!
+𝑉!
+𝑉"
+𝑉#
+𝑉#$!
+𝑇!
+𝑇%
+𝑇!
+𝑇%
+Figure 2: Illustration of the VoCo-LLaMA framework. Based on standard VLMs (a), VoCo-LLaMA
+(b) first isolate visual and text tokens by injecting VoCo tokens, and then establishes a dedicated
+interaction pathway between the two modalities via VoCo tokens, enabling the distillation and
+compression of vision tokens into the transformer activations upon the compact VoCo tokens.
+tuning, V LMo leverages both vision tokens V and text tokens T to predict the output y through
+self-regression, and learns the distribution pV LMo(y | V, T ). For image compression models, our
+goal is to employ a compact set of compressed tokens C to efficiently represent the sparse vision
+token set V. Additionally, we aim to generate outputs that closely approximates the outputs of the
+original model V LMo when presented with identical image and text inputs.
+Specifically speaking, with an image encoded as vision tokens V, we formulate the image compression
+distillation process as learning a compression model V LMc that generates the output y conditioned on
+the compressed tokens C and the text tokens T . This is achieved by learning a probability distribution
+pV LMc(y | C, T ). The optimization objective of V LMc is to minimize the loss function:
+L(V LMo, V LMc) = EV,T [DKL(pV LMo(y | V, T ) || pV LMc(y | C, T ))]
+(1)
+With above distillation objective, how to further distill the information within the vision tokens V
+into the compressed token C is the key of vision compression.
+3.2
+VoCo-LLaMA
+As illustrated in Figure 2 (b), we propose VoCo-LLaMA, which introduces special Vision
+Compression (VoCo) tokens to leverage the LLM’s ability to compress and understand the com-
+pression representations of images. The input sequence to the large language model is formed by
+concatenating the vision tokens, the special V oCo tokens, and the text tokens, yielding a sequence:
+X = (V, V oCo, T ) = (V0, . . . , Vn, V oCo, T0, . . . , Tm)
+(2)
+In the training phase, we employ a two-stage attention mechanism. Initially, we impose a constraint
+on the text tokens, explicitly preventing them from attending to the original vision tokens, while
+forcing them to exclusively attend to the compressed and distilled VoCo tokens. Subsequently, the
+vision tokens are subjected to continuous attention from the VoCo tokens due to the casual transformer.
+This deliberate design ensures that the text tokens solely capture the distilled visual information
+encoded in the VoCo tokens, rather than directly interacting with the original vision tokens, achieving
+compressing distillation from vision tokens to compressed tokens.
+The compression process of VoCo-LLaMA can be elegantly implemented by strategically modifying
+the attention mask. Specifically, we set the attention weights between the text tokens and the vision
+tokens to False, effectively rendering the text tokens "isolated" to the vision tokens. Formally, let
+M ∈R(m+n+1)×(m+n+1) denote the attention mask, where Mij = True if token i attends to token
+j, and Mij = False otherwise. We define the modified attention mask as:
+Mij =
+
+
+
+True,
+if i ∈T and j ∈V oCo,
+False,
+if i ∈T and j ∈V,
+True,
+otherwise.
+(3)
+4
+
+It is worth noting that our modification to the attention mask is based on the casual attention
+mask implementation in decoder-only models (e.g. LLaMA [17]), which is initialized as a lower-
+left triangular matrix. In practice, VoCo-LLaMA can be effectively trained under the standard
+supervised fine-tuning paradigm, leveraging the abundant image-text data readily available in VLMs.
+Furthermore, the VoCo token can be compactly represented as a set of transformer activations,
+allowing them to be cached to enhance inference efficiency.
+VoCo-LLaMA enables the large language models to learn the compression process of vision tokens,
+V oCo(V), while simultaneously learning to understand the compressed VoCo tokens, i.e., learning the
+distribution pV oCo(y | V oCo(V), T ). With VoCo-LLaMA, the optimization objective in Equation (2)
+can be further defined as:
+L(V LMo, V oCo) = EV,T [DKL(pV LMo(y | V, T ) || pV oCo(y | V oCo(V), T ))]
+(4)
+Moreover, our design affords an additional advantage: the VoCo tokens exclusively interact with the
+input text during the compression process, establishing a seamless pathway between the visual and text
+modalities. Consequently, this enables us to effortlessly align the compressed visual information with
+the text modality, eliminating the need for the specialized text-vision aware cross-modal alignment
+module design[1, 12].
+3.3
+Temporal Modeling
+Text
+…
+VoCo-LLaMA
+…
+…
+…
+Video
+𝑽𝒐𝑪𝒐𝒏
+𝑽𝒐𝑪𝒐𝒕
+Vision
+Compress
+Figure 3: Extension of VoCo-LLaMA to video
+domain: Capturing temporal correlations among
+the sequential VoCo tokens.
+When giving a sequence of video frames V id =
+{V1, . . . , Vk} and a corresponding text input,
+VoCo-LLaMA, as introduced in Section 3.2,
+could serve as a vision encoding compressor
+to encode each frame. As shown in Figure 3, we
+obtain the compressed representation V oCot for
+each frame with the video frame tokens Vt and
+the compression token V oCo. This yields a se-
+quence of compressed video tokens, denoted by
+F = {V oCo1, . . . , V oCok}.
+By harnessing the current capabilities of VoCo-
+LLaMA to interpret tokens derived from com-
+pressing individual frames, we can further en-
+hance its functionality to handle temporal in-
+puts. Specifically, we adopt a continue training
+process on VoCo-LLaMA by utilizing the time-
+series compressed token sequences F, enabling
+it to capture and comprehend the temporal correlations among the compressed video tokens. With the
+inclusion of text tokens T , VoCo-LLaMA learns the distribution p(y | F, T ). This training strategy
+builds upon existing image compression capabilities and allows VoCo-LLaMA to focus on temporal
+modeling, thereby streamlining the video understanding process.
+3.4
+Implementation Details
+Regarding the training strategy and data, as mentioned earlier in Section 3.2, VoCo-LLaMA only
+requires learning to insert and compress VoCo tokens during the vision instruction tuning stage. We
+follow the common VLMs [2, 7] to encode the image input into vision tokens with vision encoder and
+a linear projector. We employ the pre-trained CLIP-ViT-L [40] as our visual encoder. For pre-trained
+large language models, we utilize Vicuna-7B [11]. Without introducing VoCo tokens, we first align
+the visual encoder and language model using the LLaVA-filtered CC3M [41] dataset with visual
+encoder and language model keeping frozen. During the instruction tuning phase of VoCo-LLaMA,
+incorporating multiple image understanding tasks is crucial for learning a scalable image compression
+model. Therefore, we construct the instruction pairs inspired by [12] using [7]. For video tuning, we
+further utilize WebVid [42] and the QA-pairs of Video-ChatGPT [39].
+We conducted experiments on several common compression strategies with the same training setting
+and data for comparison. For the compression strategy with Q-Former, we employ the architecture
+in [1] and configure the query number to one, resulting in a single compression token. For the
+5
+
+compression strategy with average pooling, we follow the design of the single content token in [12],
+as illustrated in Figure 1 (b). For more details on the implementation, please refer to the Appendix A.
+4
+Experiments
+4.1
+Datasets
+In this work, we conduct experiments on several common visual understanding benchmarks for vision
+compression. In particular, we report results on GQA [43], MMB (MMBench) [44], MME [45],
+POPE [46], SEED-Bench [47], SQAI (Image-based setting in ScienceQA) [48] and VQAv2 (VQA
+V2) [49]. By observing the model’s performance on these image understanding benchmarks before
+and after compression (i.e. with initial vision tokens / VoCo tokens), we can observe the effects
+of the visual information loss that occurs during the vision compression process. We evaluate the
+performance on these visual understanding benchmarks in accordance with the details outlined in [2].
+As for the video domain, we evaluate the zero-shot performance on several video question-answering
+benchmarks. MSVD-QA [50] is a video QA dataset consisting of 1,970 video clips with 50,505 QA
+pairs, built upon the Microsoft Research Video Description Corpus [51]. MSRVTT-QA [50] is a
+large-scale video QA dataset featuring 10K videos and 243K QA pairs with complex scenes, based
+on the MSR-VTT dataset [52]. ActivityNet-QA [53] is a fully annotated video QA dataset containing
+58K QA pairs derived from 5,800 complex web videos from the ActivityNet dataset [54].
+4.2
+Vision Compression Configuration
+In the primary experiment of vision compression, we present the results of compressing all vision
+tokens of an image into a single VoCo token. To rigorously quantify the performance loss of VoCo-
+LLaMA during compression, we designed two comparative training settings: the Upper Bound model,
+which represents the best compression performance. The ideal case for a visual compression model is
+to obtain the same visual understanding capability as the upper bound model. And the Lower Bound
+model, which represents the worst compression performance.
+The initialization model is trained by integrating VoCo tokens in a manner analogous to VoCo-
+LLaMA, without modifying the attention mask strategy. During inference, we employ a standard
+causal attention mask. This setting effectively controls for performance fluctuations induced by
+the introduction of additional special tokens. In contrast, the random compression model is trained
+under identical settings as the initialization model. During inference, we restrict the visibility
+of text tokens to only the VoCo token, isolating the visual information. This setup represents a
+scenario without vision compression training, providing a baseline for evaluating. Based on the
+performance boundary model, the compression retention rate can be subsequently calculated as
+(result of VoCo-LLaMA −Lower Bound)/(Upper Bound −Lower Bound).
+4.3
+Results
+Vision Compression. Table 1 presents the results of VoCo-LLaMA on vision compression. To
+explore the maximum potential of our method, we report the highest achievable compression ratio,
+which compresses vision tokens into a single VoCo token. We report results of our compression
+model on various common visual understanding benchmarks, as well as the compression retention
+rates defined based on upper and lower bound models introduced in Section 4.2. It can be observed
+that our method preserves the original visual information to a large extent, even at an extremely high
+compression ratio of 576×. Specifically, we achieved an average compression retention rate of 83.7%
+across seven widely used benchmarks. Especially on MMBench, POPE and VQAv2, our method
+retained more than 85% of the performance during compression. The results indicate that VoCo-
+LLaMA can effectively compress vision tokens. Moreover, our method consistently outperforms the
+performance lower bound model of random compression across all benchmarks. This demonstrates
+that the advantages of VoCo-LLaMA, such as significant reductions in context length and improved
+calculation efficiency, outweigh any potential performance loss caused by compression.
+We additionally compare our method with previous common learning-based approaches (i.e., Q-
+Former and average pooling) for vision token compression. Our method significantly outperforms
+previous methods across all benchmarks. Specifically, we observe an improvement of 19.6% in
+average compression retention rate, surpassing the average pooling compression strategy. In contrast,
+6
+
+Table 1: Comparison with previous approaches on vision compression using common visual under-
+standing benchmarks. All methods compress 576 vision tokens (from (336/14)2 = 576) into one.
+We further report the compression performance bounds and retention rate mentioned in Section 3.4.
+Method
+Token
+GQA
+MMB
+MME
+POPE
+SEED
+SQAI
+VQAv2 Avg.
+Upper Bound
+576
+61.1
+64.0
+1487.2
+85.0
+57.9
+66.5
+77.7
+-
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+VoCo-LLaMA
+1
+57.0
+58.8
+1323.3
+81.4
+53.7
+65.4
+72.3
+-
+82.5%
+87.5%
+81.2%
+88.4%
+80.0%
+81.0%
+85.2%
+83.7%
+Avg. Pool [12]
+1
+52.9
+55.5
+1210.3
+79.1
+50.3
+62.2
+65.0
+-
++ Linear
+65.0%
+79.6%
+68.1%
+81.0%
+63.8%
+25.8%
+65.2%
+64.1%
+Q-Former [1]
+1
+51.1
+51.7
+1079.7
+77.3
+47.2
+62.7
+63.4
+-
+57.3%
+70.5%
+53.2%
+75.2%
+49.0%
+34.5%
+60.8%
+57.2%
+Lower Bound
+1
+37.7
+22.3
+617.3
+53.9
+36.9
+60.7
+41.2
+-
+0%
+0%
+0%
+0%
+0%
+0%
+0%
+0%
+Token
+MMB GQA
+VQAv2 SEED Avg.
+576
+64.0
+61.1
+77.7
+57.9
+100%
+128
+61.0
+59.8
+76.9
+59.1
+97.7%
+64
+60.5
+60.4
+75.4
+56.3
+93.7%
+32
+59.4
+60.2
+75.3
+56.2
+92.6%
+16
+58.6
+59.4
+75.4
+56.2
+91.3%
+8
+58.7
+59.2
+75.3
+56.3
+91.3%
+4
+60.4
+58.4
+74.5
+56.0
+90.4%
+2
+60.1
+57.7
+73.5
+55.0
+87.8%
+1
+58.8
+57.0
+72.3
+53.7
+83.8%
+1
+22.3
+37.7
+41.2
+36.9
+0%
+Table 2: Effect of VoCo tokens count on sev-
+eral widely used benchmarks. The number of
+VoCo tokens increases from 1 to 128. Green and
+red represent the compression Upper and Lower
+Bound, respectively.
+0 %
+70 %
+80 %
+90 %
+100 %
+1
+2
+4
+8
+16
+32
+64
+128
+U.B.
+L.B.
+Ours
+Number of VoCo tokens
+Compression retention rate
+Compression ratio
+576x
+144x
+72x
+36x
+18x
+9x 4.5x
+Figure 4: Overall trend of compression perfor-
+mance with increasing token count. We report
+the average compression retention rate across all
+benchmarks listed in Table 1.
+while Q-Former has demonstrated impressive capabilities in capturing visual features with 32 queries,
+its performance undergoes a substantial decline when the query count is reduced to a single digit.
+This proves that the compression method of VoCo-LLaMA, which utilizes the knowledge distillation
+from large language models itself, maintains more valuable vision information than that of average
+pooling or query-based compression.
+Number of VoCo tokens. We evaluate the impact of the number of VoCo tokens on vision com-
+pression performance. As shown in Table 2, we report the results of VoCo-LLaMA on four widely
+used benchmarks as the number of VoCo tokens increases from 1 to 128, along with the average
+compression retention rates across four benchmarks. Figure 4 illustrates the trend of compression
+performance retention as the number of VoCo tokens varies, where the green and red lines represent
+the upper and lower bounds of compression performance, respectively. We adopted the same training
+settings and data as in the main experiments.
+It can be observed that as the number of VoCo tokens grows, the overall compression performance of
+the model shows an upward trend. Increasing the number of tokens within the range of fewer than 10
+tokens results in a significant improvement in compression performance. Finally, when conducting
+128 VoCo tokens, the model achieves an average compression performance retention rate of 97.7%,
+indicating that the performance loss due to compression is almost negligible when compressing into
+7
+
+Table 3: Comparison with previous state-of-the-art vision compression method and the ablation study
+of “context” token with the same training setting and visual encoder employed. VoCo token count are
+referred to as content token count in the table. The input resolution is set to 224 for fair comparison.
+Method
+context content
+GQA
+POPE
+SQAI
+VQAT
+LLaMA-VID [12]
+1
+16
+58.2
+83.1
+67.4
+50.8
+1
+4
+56.2
+83.5
+68.7
+49.1
+1
+1
+55.5
+83.1
+68.8
+49.0
+VoCo-LLaMA
+0
+1
+58.3
+85.0
+69.5
+52.7
+VoCo-LLaMA + context [12]
+1
+1
+58.5
+85.6
+69.2
+52.7
+Table 4: Efficiency analysis of VoCo-LLaMA including cache storage memory, CUDA times and the
+FLOPs. ∆denotes the reduction ratio of each metric.
+Method
+Token
+KV Cache
+Storage
+∆
+CUDA
+∆
+FLOPs
+∆
+Length
+Memory (MB)
+Time (ms) ↓
+(T) ↓
+Baseline
+576
+-
+-
+-
+440.5
+-
+9.6
+-
+Full Caching
+576
+576
+302.4
+-
+154.9
+64.8%
+1.2
+87.5%
+VoCo-LLaMA
+1
+1
+0.525
+99.8%
+134.0
+69.6%
+0.5
+94.8%
+more than 100 tokens. Interestingly, we observe that when training with 128 VoCo tokens, the result
+on the SEED-Bench exceeds the initial performance upper bound of the model.
+Method of Compression. We compare our method with LLaMA-VID on vision compression,
+specifically evaluating its full model that utilizes both context and content tokens. For a fair compar-
+ison, VoCo-LLaMA is trained under the exact same settings and applied the same visual encoder,
+EVA-G [55], in this experiment. As shown in Table 3, our method outperforms the previous approach
+across the board when using a single content compression token, even surpassing the performance of
+LLaMA-VID when it uses multiple context tokens. In particular, we could observe an improvement
+of 2.8 and 3.7 on GQA and VQAT benchmarks, respectively. Additionally, we examine the role of
+context tokens, which facilitate cross-modal interactions between vision tokens and text, in VoCo-
+LLaMA. The impact of context tokens is not as significant as demonstrated in LLaMA-VID, possibly
+as VoCo-LLaMA’s inherent design already facilitates cross-modal alignment.
+Inference Efficiency. VoCo-LLaMA can bring significant efficiency and storage gains during the
+inference phase. Due to our model’s design, the representation of compressed image (i.e., transformer
+activations on top of VoCo tokens) can be stored and repeatedly utilized in the form of a KV cache.
+We conduct a comparative analysis of CUDA time, FLOPs, and KV Cache storage size during
+the inference process, and compare our method with the baseline method and the full caching
+method. The baseline method, as its name suggests, does not employ any caching strategy and
+directly encodes and infers images. In contrast, the full caching method stores the uncompressed
+transformer activations upon all vision tokens as KV caches. More specifically, we follow the
+approach of [56], storing the keys and values of each transformer layer. As displayed in Table 4, we
+conduct an inference efficiency analysis of three methods on a single NVIDIA A100-SXM4-40GB
+using identical lengths of text prompts and single-image inputs. Compared to the baseline model
+without caching strategy, VoCo-LLaMA achieves a significant reduction of 69.6% in CUDA time and
+94.8% in FLOPs by caching compressed tokens with a KV Cache of length one. Relative to the full
+caching strategy, our method save 99.8% of cache storage while achieving lower CUDA time and
+FLOPs, demonstrating the inference efficiency gains brought by our vision compression approach.
+Please refer to Appendix B for further discussion and details for inference efficiency.
+Video Understanding. We further evaluate the performance of VoCo-LLaMA on three widely used
+video understanding benchmarks, reporting results for input image resolutions of 224 and 336, respec-
+tively. First, we discuss the video understanding methods that utilize vision compression. Ensuring
+fair comparison, we adopted the same compression ratio as previous method [12], compressing each
+video frame into 2 VoCo tokens for training and inference in the video understanding model. Our
+method consistently outperforms previous video compression methods across all three benchmarks.
+8
+
+Table 5: Comparison with leading video understanding methods, with and without vision compression,
+on three zero-shot video QA datasets. ActivityNet-QA is abbreviated as ANet-QA in this table.
+Method
+Visual
+Res.
+Image
+MSVD-QA
+MSRVTT-QA
+ANet-QA
+Encoder
+Token
+Acc
+Score
+Acc
+Score
+Acc
+Score
+Methods w/o Vision Compression
+FrozenBiLM [57]
+CLIP-L
+224
+256
+32.3
+-
+16.8
+-
+24.7
+-
+Video-LLaMA [35]
+EVA-G
+224
+256
+51.6
+2.5
+29.6
+1.8
+12.4
+1.1
+LLaMA-Adapter [58]
+-
+224
+-
+54.9
+3.1
+43.8
+2.7
+34.2
+2.7
+VideoChat [36]
+-
+224
+-
+56.3
+2.8
+45.0
+2.5
+26.5
+2.2
+Video-ChatGPT [39]
+CLIP-L
+224
+256
+64.9
+3.3
+49.3
+2.8
+35.2
+2.7
+BT-ADapter [37]
+CLIP-L
+-
+-
+67.5
+3.7
+57.0
+3.2
+45.7
+3.2
+Vista-LLaMA [59]
+EVA-G
+224
+256
+65.3
+3.6
+60.5
+3.3
+48.3
+3.3
+Chat-UniVi [34]
+CLIP-L
+224
+256
+69.3
+3.7
+55.0
+3.1
+46.1
+3.3
+Methods w/ Vision Compression
+LLaMA-VID [12]
+EVA-G
+224
+2
+69.7
+3.7
+57.7
+3.2
+47.4
+3.3
+VoCo-LLaMA
+CLIP-L
+224
+2
+72.3
+3.9
+61.1
+3.5
+47.9
+3.4
+336
+2
+72.6
+3.9
+61.2
+3.5
+47.9
+3.4
+224
+8
+73.4
+3.9
+62.0
+3.5
+48.5
+3.4
+336
+8
+73.5
+3.9
+62.3
+3.5
+48.6
+3.4
+Specifically, on the MSVD-QA and MSRVTT-QA datasets, VoCo-LLaMA achieved accuracies of
+72.3% and 61.1%, respectively, corresponding to absolute gains of 3.7% and 5.9% over the previous
+best methods. Moreover, our method achieves the highest scores of 3.9 and 3.5, respectively.
+In comparison to video understanding methods that do not employ vision compression, our approach,
+which represents each video frame with a mere 2 VoCo tokens, demonstrates strong competitiveness
+against methods that utilize 256 or more vision tokens per frame. To further explore the potential of
+VoCo-LLaMA, we opted to compress video frames into the number of VoCo tokens that exhibited
+the optimal compression performance within the 0 order of magnitude (i.e., 8 tokens). Notably, as
+we increase the number of tokens, our method effectively leverages additional visual information,
+resulting in improved performance. We also analyse the performance loss caused by the use of vision
+compression in video domain, as detailed in the Appendix D. In summary, VoCo-LLaMA capitalizes
+on the strengths of its efficient vision compression to achieve robust performance on video data, all
+while bypassing the intricate temporal modeling designs.
+5
+Limitations
+VoCo-LLaMA presents a novel solution for vision compression, but several limitations remain.
+Our training paradigm, while effective in enabling the model to comprehend compression tokens,
+inadvertently diminishes its ability to understand uncompressed vision tokens. Moreover, our model
+struggles to effectively handle tokens with diverse fine-grained compression levels. Addressing these
+limitations could unlock the door to infinite-length input visual-language models.
+6
+Conclusion
+In this paper, we propose VoCo-LLaMA, the first approach to compress visual information using
+large language models. By distilling the LLM’s understanding of vision tokens into a compact
+representation, we achieve efficient compression of vision tokens. Our method can compress hundreds
+of vision tokens into a single VoCo token, while minimizing visual information loss. VoCo-LLaMA
+significantly reduces cache storage and boosts efficiency during the inference stage. Moreover, our
+method exhibits exceptional performance in learning temporal understanding on video data with
+continuous training, showcasing its promising potential. In summary, our approach offers a promising
+solution for fully utilise the limited and valuable context window of VLMs, making them more
+scalable and efficient for various multi-modal applications.
+9
+
+References
+[1] Junnan Li, Dongxu Li, Silvio Savarese, and Steven Hoi. BLIP-2: bootstrapping language-image
+pre-training with frozen image encoders and large language models. In ICML, 2023.
+[2] Haotian Liu, Chunyuan Li, Qingyang Wu, and Yong Jae Lee. Visual instruction tuning. In
+NeurIPS, 2023.
+[3] Deyao Zhu, Jun Chen, Xiaoqian Shen, Xiang Li, and Mohamed Elhoseiny. Minigpt-4: En-
+hancing vision-language understanding with advanced large language models. arXiv preprint
+arXiv:2304.10592, 2023.
+[4] Zhengxiao Du, Yujie Qian, Xiao Liu, Ming Ding, Jiezhong Qiu, Zhilin Yang, and Jie Tang.
+Glm: General language model pretraining with autoregressive blank infilling. In Proceedings of
+the 60th Annual Meeting of the Association for Computational Linguistics (Volume 1: Long
+Papers), pages 320–335, 2022.
+[5] Jinze Bai, Shuai Bai, Shusheng Yang, Shijie Wang, Sinan Tan, Peng Wang, Junyang Lin, Chang
+Zhou, and Jingren Zhou. Qwen-vl: A versatile vision-language model for understanding,
+localization, text reading, and beyond. arXiv preprint arXiv:2308.12966, 2023.
+[6] Pan Zhang, Xiaoyi Dong, Bin Wang, Yuhang Cao, Chao Xu, Linke Ouyang, Zhiyuan Zhao,
+Shuangrui Ding, Songyang Zhang, Haodong Duan, Wenwei Zhang, Hang Yan, Xinyue Zhang,
+Wei Li, Jingwen Li, Kai Chen, Conghui He, Xingcheng Zhang, Yu Qiao, Dahua Lin, and
+Jiaqi Wang. Internlm-xcomposer: A vision-language large model for advanced text-image
+comprehension and composition. arXiv preprint arXiv:2309.15112, 2023.
+[7] Haotian Liu, Chunyuan Li, Yuheng Li, and Yong Jae Lee. Improved baselines with visual
+instruction tuning, 2023.
+[8] Rohan Bavishi, Erich Elsen, Curtis Hawthorne, Maxwell Nye, Augustus Odena, Arushi Somani,
+and Sa˘gnak Ta¸sırlar. Introducing our multimodal models, 2023.
+[9] Hao Liu, Wilson Yan, Matei Zaharia, and Pieter Abbeel. World model on million-length video
+and language with ringattention. arXiv preprint, 2024.
+[10] Gemini Team, Machel Reid, Nikolay Savinov, Denis Teplyashin, Dmitry, Lepikhin, Timothy
+Lillicrap, Jean baptiste Alayrac, Radu Soricut, Angeliki Lazaridou, Orhan Firat, Julian Schrit-
+twieser, Ioannis Antonoglou, Rohan Anil, Sebastian Borgeaud, Andrew Dai, Katie Millican,
+Ethan Dyer, Mia Glaese, and et al. Gemini 1.5: Unlocking multimodal understanding across
+millions of tokens of context, 2024.
+[11] Wei-Lin Chiang, Zhuohan Li, Zi Lin, Ying Sheng, Zhanghao Wu, Hao Zhang, Lianmin Zheng,
+Siyuan Zhuang, Yonghao Zhuang, Joseph E. Gonzalez, Ion Stoica, and Eric P. Xing. Vicuna:
+An open-source chatbot impressing gpt-4 with 90%* chatgpt quality, March 2023.
+[12] Yanwei Li, Chengyao Wang, and Jiaya Jia. Llama-vid: An image is worth 2 tokens in large
+language models. arXiv preprint arXiv:2311.17043, 2023.
+[13] Wenliang Dai, Junnan Li, Dongxu Li, Anthony Meng Huat Tiong, Junqi Zhao, Weisheng
+Wang, Boyang Li, Pascale Fung, and Steven Hoi. Instructblip: Towards general-purpose
+vision-language models with instruction tuning, 2023.
+[14] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, and et al. Language models
+are few-shot learners, 2020.
+[15] OpenAI. Gpt-4 technical report. arXiv:2303.08774, 2023.
+[16] BigScience Workshop, :, Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana
+Ili´c, Daniel Hesslow, and et al. Bloom: A 176b-parameter open-access multilingual language
+model, 2023.
+10
+
+[17] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timo-
+thée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, Aurelien Rodriguez,
+Armand Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and efficient foundation
+language models, 2023.
+[18] Hugo Touvron, Louis Martin, Kevin Stone, Peter Albert, Amjad Almahairi, Yasmine Babaei,
+Nikolay Bashlykov, Soumya Batra, Prajjwal Bhargava, Shruti Bhosale, Dan Bikel, Lukas
+Blecher, Cristian Canton Ferrer, Moya Chen, Guillem Cucurull, and et al. Llama 2: Open
+foundation and fine-tuned chat models, 2023.
+[19] Albert Q. Jiang, Alexandre Sablayrolles, Arthur Mensch, Chris Bamford, Devendra Singh
+Chaplot, Diego de las Casas, Florian Bressand, Gianna Lengyel, Guillaume Lample, Lucile
+Saulnier, and et al. Mistral 7b, 2023.
+[20] Wei Huang, Xudong Ma, Haotong Qin, Xingyu Zheng, Chengtao Lv, Hong Chen, Jie Luo,
+Xiaojuan Qi, Xianglong Liu, and Michele Magno. How good are low-bit quantized llama3
+models? an empirical study, 2024.
+[21] Zihang Dai, Zhilin Yang, Yiming Yang, Jaime Carbonell, Quoc Le, and Ruslan Salakhutdinov.
+Transformer-XL: Attentive language models beyond a fixed-length context. In Proceedings of
+the 57th Annual Meeting of the Association for Computational Linguistics, pages 2978–2988,
+Florence, Italy, July 2019. Association for Computational Linguistics.
+[22] Peter J. Liu, Mohammad Saleh, Etienne Pot, Ben Goodrich, Ryan Sepassi, Lukasz Kaiser, and
+Noam Shazeer. Generating wikipedia by summarizing long sequences, 2018.
+[23] Jack W. Rae, Anna Potapenko, Siddhant M. Jayakumar, and Timothy P. Lillicrap. Compressive
+transformers for long-range sequence modelling. ArXiv, abs/1911.05507, 2019.
+[24] Yuhuai Wu, Markus N. Rabe, DeLesley Hutchins, and Christian Szegedy. Memorizing trans-
+formers, 2022.
+[25] Hang Zhang, Yeyun Gong, Yelong Shen, Weisheng Li, Jiancheng Lv, Nan Duan, and Weizhu
+Chen. Poolingformer: Long document modeling with pooling attention. In International
+Conference on Machine Learning, 2021.
+[26] Amanda Askell, Yuntao Bai, Anna Chen, Dawn Drain, Deep Ganguli, Tom Henighan, Andy
+Jones, Nicholas Joseph, Benjamin Mann, and et al. A general language assistant as a laboratory
+for alignment. ArXiv, abs/2112.00861, 2021.
+[27] Charles Burton Snell, Dan Klein, and Ruiqi Zhong. Learning by distilling context. ArXiv,
+abs/2209.15189, 2022.
+[28] David Wingate, Mohammad Shoeybi, and Taylor Sorensen. Prompt compression and contrastive
+conditioning for controllability and toxicity reduction in language models. In Findings of the
+Association for Computational Linguistics: EMNLP 2022, pages 5621–5634, December 2022.
+[29] Alexis Chevalier, Alexander Wettig, Anirudh Ajith, and Danqi Chen. Adapting language models
+to compress contexts. In Houda Bouamor, Juan Pino, and Kalika Bali, editors, Proceedings of
+the 2023 Conference on Empirical Methods in Natural Language Processing, pages 3829–3846,
+Singapore, December 2023. Association for Computational Linguistics.
+[30] Jesse Mu, Xiang Lisa Li, and Noah Goodman. Learning to compress prompts with gist tokens,
+2024.
+[31] Tao Ge, Hu Jing, Lei Wang, Xun Wang, Si-Qing Chen, and Furu Wei. In-context autoencoder
+for context compression in a large language model. In The Twelfth International Conference on
+Learning Representations, 2024.
+[32] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson,
+Karel Lenc, Arthur Mensch, Katie Millican, and et al. Flamingo: a visual language model for
+few-shot learning, 2022.
+11
+
+[33] Bin Huang, Xin Wang, Hong Chen, Zihan Song, and Wenwu Zhu. Vtimellm: Empower llm to
+grasp video moments, 2023.
+[34] Peng Jin, Ryuichi Takanobu, Wancai Zhang, Xiaochun Cao, and Li Yuan. Chat-univi: Unified
+visual representation empowers large language models with image and video understanding,
+2024.
+[35] Hang Zhang, Xin Li, and Lidong Bing. Video-llama: An instruction-tuned audio-visual language
+model for video understanding. arXiv preprint arXiv:2306.02858, 2023.
+[36] Kunchang Li, Yinan He, Yi Wang, Yizhuo Li, Wenhai Wang, Ping Luo, Yali Wang, Limin Wang,
+and Yu Qiao. Videochat: Chat-centric video understanding. arXiv preprint arXiv:2305.06355,
+2023.
+[37] Ruyang Liu, Chen Li, Yixiao Ge, Ying Shan, Thomas H Li, and Ge Li. One for all: Video
+conversation is feasible without video instruction tuning. arXiv preprint arXiv:2309.15785,
+2023.
+[38] Ruipu Luo, Ziwang Zhao, Min Yang, Junwei Dong, Da Li, Pengcheng Lu, Tao Wang, Linmei
+Hu, Minghui Qiu, and Zhongyu Wei. Valley: Video assistant with large language model
+enhanced ability, 2023.
+[39] Muhammad Maaz, Hanoona Rasheed, Salman Khan, and Fahad Shahbaz Khan. Video-chatgpt:
+Towards detailed video understanding via large vision and language models. arXiv:2306.05424,
+2023.
+[40] Alec Radford, Jong Wook Kim, Chris Hallacy, A. Ramesh, Gabriel Goh, Sandhini Agar-
+wal, Girish Sastry, Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen Krueger, and Ilya
+Sutskever. Learning transferable visual models from natural language supervision. In ICML,
+2021.
+[41] Piyush Sharma, Nan Ding, Sebastian Goodman, and Radu Soricut. Conceptual captions: A
+cleaned, hypernymed, image alt-text dataset for automatic image captioning. In Proceedings of
+ACL, 2018.
+[42] Max Bain, Arsha Nagrani, Gül Varol, and Andrew Zisserman. Frozen in time: A joint video
+and image encoder for end-to-end retrieval. In IEEE International Conference on Computer
+Vision, 2021.
+[43] Drew A Hudson and Christopher D Manning. Gqa: A new dataset for real-world visual
+reasoning and compositional question answering. Conference on Computer Vision and Pattern
+Recognition (CVPR), 2019.
+[44] Yuan Liu, Haodong Duan, Yuanhan Zhang, Bo Li, Songyang Zhang, Wangbo Zhao, Yike Yuan,
+Jiaqi Wang, Conghui He, Ziwei Liu, Kai Chen, and Dahua Lin. Mmbench: Is your multi-modal
+model an all-around player? arXiv:2307.06281, 2023.
+[45] Chaoyou Fu, Peixian Chen, Yunhang Shen, Yulei Qin, Mengdan Zhang, Xu Lin, Jinrui Yang,
+Xiawu Zheng, Ke Li, Xing Sun, Yunsheng Wu, and Rongrong Ji. Mme: A comprehensive
+evaluation benchmark for multimodal large language models. arXiv preprint arXiv:2306.13394,
+2023.
+[46] Yifan Li, Yifan Du, Kun Zhou, Jinpeng Wang, Wayne Xin Zhao, and Ji-Rong Wen. Evaluating
+object hallucination in large vision-language models. In The 2023 Conference on Empirical
+Methods in Natural Language Processing, 2023.
+[47] Bohao Li, Rui Wang, Guangzhi Wang, Yuying Ge, Yixiao Ge, and Ying Shan.
+Seed-
+bench: Benchmarking multimodal llms with generative comprehension.
+arXiv preprint
+arXiv:2307.16125, 2023.
+[48] Pan Lu, Swaroop Mishra, Tony Xia, Liang Qiu, Kai-Wei Chang, Song-Chun Zhu, Oyvind
+Tafjord, Peter Clark, and Ashwin Kalyan. Learn to explain: Multimodal reasoning via thought
+chains for science question answering. In The 36th Conference on Neural Information Process-
+ing Systems (NeurIPS), 2022.
+12
+
+[49] Yash Goyal, Tejas Khot, Douglas Summers-Stay, Dhruv Batra, and Devi Parikh. Making the V
+in VQA matter: Elevating the role of image understanding in Visual Question Answering. In
+Conference on Computer Vision and Pattern Recognition (CVPR), 2017.
+[50] Dejing Xu, Zhou Zhao, Jun Xiao, Fei Wu, Hanwang Zhang, Xiangnan He, and Yueting Zhuang.
+Video question answering via gradually refined attention over appearance and motion. In ACM
+Multimedia, 2017.
+[51] David L Chen and William B Dolan. Collecting highly parallel data for paraphrase evaluation.
+In Proceedings of the 49th Annual Meeting of the Association for Computational Linguistics:
+Human Language Technologies-Volume 1, pages 190–200. Association for Computational
+Linguistics, 2011.
+[52] Jun Xu, Tao Mei, Ting Yao, and Yong Rui. Msr-vtt: A large video description dataset for
+bridging video and language. In Proceedings of the IEEE conference on computer vision and
+pattern recognition, pages 5288–5296, 2016.
+[53] Zhou Yu, Dejing Xu, Jun Yu, Ting Yu, Zhou Zhao, Yueting Zhuang, and Dacheng Tao.
+Activitynet-qa: A dataset for understanding complex web videos via question answering.
+In AAAI, pages 9127–9134, 2019.
+[54] Tanmay Gupta and Aniruddha Kembhavi. Visual programming: Compositional visual reasoning
+without training. ArXiv, abs/2211.11559, 2022.
+[55] Yuxin Fang, Wen Wang, Binhui Xie, Quan Sun, Ledell Wu, Xinggang Wang, Tiejun Huang,
+Xinlong Wang, and Yue Cao. Eva: Exploring the limits of masked visual representation learning
+at scale. arXiv preprint arXiv:2211.07636, 2022.
+[56] Reiner Pope, Sholto Douglas, Aakanksha Chowdhery, Jacob Devlin, James Bradbury, Anselm
+Levskaya, Jonathan Heek, Kefan Xiao, Shivani Agrawal, and Jeff Dean. Efficiently scaling
+transformer inference, 2022.
+[57] Antoine Yang, Antoine Miech, Josef Sivic, Ivan Laptev, and Cordelia Schmid. Zero-shot video
+question answering via frozen bidirectional language models. In NeurIPS, 2022.
+[58] Renrui Zhang, Jiaming Han, Chris Liu, Peng Gao, Aojun Zhou, Xiangfei Hu, Shilin Yan, Pan
+Lu, Hongsheng Li, and Yu Qiao. Llama-adapter: Efficient fine-tuning of language models with
+zero-init attention. arXiv preprint arXiv:2303.16199, 2023.
+[59] Fan Ma, Xiaojie Jin, Heng Wang, Yuchen Xian, Jiashi Feng, and Yi Yang. Vista-llama: Reliable
+video narrator via equal distance to visual tokens, 2023.
+[60] Bowen Peng, Jeffrey Quesnelle, Honglu Fan, and Enrico Shippole. Yarn: Efficient context
+window extension of large language models, 2023.
+13
+
+A
+Additional Implement Details
+A.1
+Experiment Details
+We elaborate on the training details and hyperparameter design of VoCo-LLaMA during the training
+process. Since our method only requires introducing VoCo tokens during the visual instruction
+tuning stage, the hyperparameters reported are specific to the fine-tuning stage. We followed [2, 7] to
+configure the majority of the model parameters. Table 6 provides a detailed list of hyperparameters
+involved in the model training phase. Under the aforementioned parameter settings, VoCo-LLaMA is
+fine-tuned on 8 NVIDIA A100-SXM4-40GB GPUs.
+Table 6: Hyperparameters of VoCo-LLaMA.
+Hyperparameter
+Value
+Overall batch size
+128
+Learning rate
+2e-5
+LR Scheduler
+Cosine decay
+DeepSpeed ZeRO Stage
+ZeRO-3
+Optimizer
+AdamW
+Warmup ratio
+0.03
+Epoch
+2
+Weight decay
+0
+Precision
+bf16
+A.2
+Instruction Tuning Details
+In this subsection, we delve into the design of instructions and special tokens for VoCo-LLaMA during
+the instruction tuning stage, illustrating the details with concrete examples. As shown in Listing 1, by
+leveraging the pre-trained language model Vicuna[11] as the foundation for our method, we ensured
+a consistent system prompt and dialogue design to prevent the model from learning or adapting to
+new instruction formats during fine-tuning.
+Furthermore, the VoCo-LLaMA architecture necessitates organizing the input sequence in a specific
+order, i.e., vision tokens, VoCo tokens, and text tokens. However, demonstrated in Listing 1 [Common
+VLM], the standard "Conversation" and "Input" formats reveal that the special token <image> and
+its corresponding encoded <Vision Tokens> are situated in the middle of the dialogue sequence. To
+address this, we made modifications to align them in [VoCo-LLaMA]. We relocated the special token
+<image> to the forefront of the input prompt and appended the <VoCo Tokens> for compression.
+Concurrently, we refined the system prompt to accommodate the adjusted vision token position,
+thereby enabling the LLM to better comprehend and model the location of vision token.
+B
+Inference Efficiency Details
+B.1
+CUDA Time
+We present a comparative efficiency analysis of VoCo-LLaMA, the baseline and full-caching strategies
+during the inference phase in Table 4. Here, we provide additional details on the CUDA time
+measurement during the inference phase. We primarily consider the following components that
+contribute to the reported CUDA time: image encoding time (if applicable), kv cache load time
+(if applicable), and transformers forward time. We exclude other computational times that are not
+dependent on the model itself and the caching strategy, such as model loading time, from the CUDA
+time measurement. For the baseline model, which is a regular visual language model, the inference
+process requires additional visual information encoding, and, due to the lack of caching, the model
+must compute the transformer activations and generate text on all tokens (uncompressed visual and
+textual tokens) during inference.
+14
+
+Listing 1: The instructions and special tokens details during the visual instruction tuning.
+[Common VLM]
+System prompt:
+A chat between a curious user and an artificial intelligence assistant.
+The assistant gives helpful, detailed, and polite answers to the user’s
+questions.
+Conversation:
+USER: What is the man doing in the image?\n<image>
+ASSISTANT: The man is sitting in a chair, possibly at his computer, with
+a bird (a parrot) on his shoulder.
+USER: Is there any other animal present in the image?
+ASSISTANT: Yes, there is a cat in the image, which the man is petting
+while sitting at his computer.
+Input:
+A chat between a curious user and an artificial intelligence assistant.
+The assistant gives helpful, detailed, and polite answers to the user’s
+questions.
+USER: What is the man doing in the image?\n<Vision Tokens>
+ASSISTANT: The man is sitting in a chair, possibly at his computer, with
+a bird (a parrot) on his shoulder.
+USER: Is there any other animal present in the image?
+ASSISTANT: Yes, there is a cat in the image, which the man is petting
+while sitting at his computer.
+...
+[VoCo-LLaMA]
+System prompt:
+<image>\n<VoCo Tokens>\n A chat between a curious user and an artificial
+intelligence assistant of the given image. The assistant gives helpful,
+detailed, and polite answers to the user’s questions.
+Conversation:
+USER: What is the man doing in the image?
+ASSISTANT: The man is sitting in a chair, possibly at his computer, with
+a bird (a parrot) on his shoulder.
+USER: Is there any other animal present in the image?
+ASSISTANT: Yes, there is a cat in the image, which the man is petting
+while sitting at his computer.
+Input:
+<Vision Tokens>\n<VoCo Tokens>\n A chat between a curious user and an
+artificial intelligence assistant of the given image. The assistant gives
+helpful, detailed, and polite answers to the user’s questions.
+USER: What is the man doing in the image?
+ASSISTANT: The man is sitting in a chair, possibly at his computer, with
+a bird (a parrot) on his shoulder.
+USER: Is there any other animal present in the image?
+ASSISTANT: Yes, there is a cat in the image, which the man is petting
+while sitting at his computer.
+...
+Compared to the Full Caching strategy, the improvement in CUDA time achieved by VoCo-LLaMA
+can be attributed to two primary factors: Firstly, the time required to load the kv cache is significantly
+reduced, owing to the smaller storage size and shorter read time resulting from the 576× compression
+multiplier achieved by our approach. Secondly, the transformers forward time is also improved,
+although this is largely dependent on the length of the new input token (i.e., text token), which is
+identical in both cases. However, VoCo-LLaMA’s shorter prefix enables more efficient computation,
+leading to faster processing times. Notably, since both approaches cache transformer activations on
+top of vision tokens or compressed tokens, the image encoding duration is not a contributing factor to
+the overall CUDA time.
+15
+
+B.2
+Storage Memory and FLOPs
+The storage memory reported in Table 4 corresponds to the full transformer activations on top of the
+vision tokens or compressed VoCo tokens. This also refers to the size of the kv cache loaded during
+the inference process. Notably, the storage precision is bf16, which is consistent with the precision
+used in our training process.
+C
+Implementation Code
+Listing 2 presents the concrete implementation of introducing VoCo tokens and the attention mask
+mechanism in VoCo-LLaMA, corresponding to Equations (2) and (3). To facilitate reader understand-
+ing, we provide a brief code snippet implemented using PyTorch, accompanied by annotations.
+Listing 2: Training of Python Pytorch code for matrix multiplication, based on llava
+import torch
+# Example procedure for the VoCo-LLaMA training process.
+class VoCoTrainingExample():
+def __init__(self, ImageEncoder, Tokenizer, Embedding):
+"""
+ImageEncoder represents the visual encoder and subsequent linear layer.
+Tokenizer represents a textual tokeniser in the large language model.
+Embedding is used to transform the token after tokenize into embedding.
+"""
+self.encode_images = ImageEncoder
+self.tokenizer_token = Tokenizer
+self.embed_tokens = Embedding
+def forward(prompt: str, voco_num: int, image: torch.Tensor)
+"""
+Forward function in the main function, we show the core code of VoCo token introduced
+in Section 3.2.
+We simplify by replacing the 4D attention mask used in the actual implementation with
+a 2D attention mask.
+To make it easier for the reader to understand, we only briefly show the key parts.
+Args:
+prompt: a string containing the system prompt, question and other text inputs,
+(batch_size, L).
+voco_num: number of VoCo tokens inserted.
+image: a tensor of input image, (batch_size, 3, 336, 336).
+"""
+# ...
+# Encode image into vision tokens, with the shape of (batch_size, 576, hidden_size)
+image_features = self.encode_images(images)
+# Insert VoCo tokens between vision tokens and text tokens.
+# The embedded prompt is with the shape of (batch_size, voco_num + L, hidden_size)
+prompt = "<VoCo>" * voco_num + prompt
+prompt_ids = self.tokenizer_token(prompt)
+prompt_embeds = self.embed_tokens(prompt_ids)
+# We save the index of VoCo token to calculate the attention mask.
+voco_idx = [image_features.shape[1] + i for i in range(voco_num)]
+# Corresponds to equation (2) in the paper.
+# The input embedding is arranged: [vision tokens, VoCo, text tokens] with the shape
+of (batch_size, 576 + voco_num + L, hidden_size)
+input_embeds = torch.cat((image_features, prompt_embeds), dim=1)
+# Constructing the standard causal attention mask in models of decoder-only.
+# More specifically, it is a lower triangular matrix.
+attention_mask = torch.full(input_embeds.shape[1], input_embeds.shape[1])
+attention_mask = torch.tril(attention_mask)
+# Constructing VoCo distillation attention mask, according to equation (3).
+# Due to the default casual mask setting, we only need to modify the part with the
+value of False.
+# i.e., keep the text token invisible to the vision token
+attention_mask[voco_idx[-1], :voco_idx[0]] = False
+# ...
+16
+
+Table 7: Video compression analysis of VoCo-LLaMA using common video QA benchmarks. We
+compress 256 vision tokens (from (224/14)2 = 256) into one and we further report the compression
+performance bounds and retention rate.
+Method
+Token
+MSVD-QA
+MSRVTT-QA
+ANet-QA
+Avg.
+Acc
+Score
+Acc
+Score
+Acc
+Score
+Upper Bound
+256
+68.8
+3.7
+57.3
+3.2
+46.5
+3.3
+-
+100%
+100%
+100%
+100%
+100%
+100%
+100%
+VoCo-LLaMA
+1
+68.1
+3.7
+56.6
+3.1
+45.9
+3.3
+-
+97.2%
+100%
+97.5%
+92.3%
+97.1%
+100%
+97.4%
+Lower Bound
+1
+43.5
+2.2
+29.4
+1.9
+25.9
+2.2
+-
+0%
+0%
+0%
+0%
+0%
+0%
+0%
+D
+Video Compression Analysis
+We have analyzed the vision compression performance in Table 1, and in this subsection, we further
+analyze and discuss the video compression performance. The setup of the boundary model is similar
+to the one described in Section 4.2, with the exception that the vision token input from a single image
+is replaced by a sequence of vision tokens from multiple video frames. Considering methods such
+as [34], our final setup samples 32 frames of a video during both training and inference phases. To
+ensure that the context window of the boundary model can accommodate the input length of the video
+frame sequences, we employ a 224×224 resolution input for the frames and enlarged the context
+window of its language model by a factor of four using [60].
+As shown in Table 7, VoCo-LLaMA achieves nearly lossless compression of video frames at a rate
+of 256×, achieving an average compression multiplier of 97.4% on three widely-used video QA
+benchmarks. As the input image count increases, the vision compression operation of VoCo-LLaMA
+can reduce the total length of the vision token, mitigate the loss of information at a distance, and
+bring further gains to visual understanding.
+E
+Visualized Examples of Output
+Figure 5 illustrates the visualized examples of VoCo-LLaMA for vision compression. We compare our
+approach, which employs a single VoCo token, with the Upper Bound model described in Section 4.2
+(denoted as U.B. throughout the figure). Correct responses are highlighted in green, while incorrect
+responses are marked in red. We further show some of the failure cases. For questions that require
+attention to finer details of the input image, such as the third question in the second case, VoCo-
+LLaMA sometimes produces incorrect descriptions. Notably, when the VoCo token count increases
+to 8, these erroneous outputs are significantly improved, as the compression retention rate rises.
+F
+Broader Impacts
+Our research relates to the Large Language Models and Large Vision Language Models. Although
+the training data we employ is public and compliant, there are potential negative societal impacts to
+consider. One possible concern is the generation of unintended or malicious outputs, which could
+be used to spread disinformation. To mitigate these risks, we propose that future work focus on
+developing mechanisms for monitoring and detecting misuse, as well as implementing gated release
+strategies for models to ensure they are used responsibly.
+17
+
+2
+User: What is the man in the suit doing in the image? 
+U.B. (576 tokens): A. Standing with his arms crossed.
+VoCo-LLaMA (1 token): C. Taking a picture.
+A: Standing with his arms crossed
+B: Holding a cell phone
+C: Taking a picture
+D: Talking to someone
+User: How many people are present in the image?
+U.B. (576 tokens): B: 2.
+VoCo-LLaMA (1 token): B: 2.
+A: 1
+B: 2
+C: 3
+D: 4
+User: Where is the black writing located in the image?
+U.B. (576 tokens): A: On a white wall.
+VoCo-LLaMA (1 token): A: On a white wall.
+A: On a white wall
+B: On the man's suit
+C: On the floor
+D: On the woman's dress
+User: What is the woman holding in hands in the 
+image?
+U.B. (576 tokens): 
+The woman is holding a handbag in the image.
+VoCo-LLaMA (1 token): The woman is holding 
+a purse in her hands in the image.
+User: What is the main event taking place in the image?
+U.B. (576 tokens): 
+B: A crowd of people watching a live music performance.
+VoCo-LLaMA (1 token): 
+B: A crowd of people watching a live music performance.
+A: A group of people playing soccer in a park
+B: A crowd of people watching a live music performance
+C: A group of people attending a political rally
+D: A performer playing music while people pass by
+U.B. (576 tokens): 
+The audience is looking at the stage 
+where the band is performing.
+VoCo-LLaMA (1 token): 
+The audience is looking at a stage where 
+a band is performing.
+User: Where is the audience looking in 
+the image?
+U.B. (576 tokens): 
+The image depicts an outdoor event, possibly a festival or concert, with a large crowd of people 
+gathered in front of a building. Several people are sitting in lawn chairs, while others are standing 
+around, enjoying the live music. A man is playing a guitar on a stage, and a woman is singing into a 
+microphone.There are multiple chairs scattered throughout the scene, with some people sitting in them 
+and others standing nearby. 
+VoCo-LLaMA (1 token): 
+The image depicts a lively outdoor event where a man is performing on stage, playing the guitar and 
+singing. A crowd of people, including at least 13 individuals, is gathered around to watch the 
+performance. Some of the spectators are standing closer to the stage, while others are further back, 
+enjoying the show from a distance.The setting appears to be a casual outdoor gathering, with a bench
+visible in the background. The audience members are engaged in the performance, creating a warm and 
+inviting atmosphere. 
+User: What’s happening in the scene?
+VoCo-LLaMA (8 tokens): 
+The image depicts a lively outdoor event, possibly a concert or festival, with a large crowd of people 
+gathered in front of a building. Many individuals are sitting in lawn chairs, spread across the scene, 
+while others are standing and enjoying the event. There are several people playing musical instruments, 
+with one person playing a guitar in the center of the scene. Another person is playing an instrument 
+towards the right side of the image. In addition to the performers, there are various other attendees 
+scattered throughout the scene, engaging in conversations and enjoying the atmosphere. 
+User: What is the painting in the image? Please describe it.
+U.B. (576 tokens): 
+The painting in the image is a painting of a dog, specifically a dachshund, dressed in a Renaissance-
+style dress. The dog is wearing a long dress, a hat, and a necklace, giving it the appearance of a human 
+figure. The painting is a unique and creative representation of a dog in a historical context.
+VoCo-LLaMA (1 token): 
+The painting in the image is a parody of a famous painting, featuring a dog in a human-like pose. The 
+dog is wearing a tie and appears to be sitting on a chair, giving the impression of a human figure. The 
+painting is a humorous and creative take on the original artwork.
+Figure 5: Examples of instructions and model outputs demonstrating the vision compression capabili-
+ties of VoCo-LLaMA. Green and red represent the correct and incorrect responses, respectively.
+18
+

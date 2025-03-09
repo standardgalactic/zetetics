@@ -1,0 +1,1622 @@
+Unlimiformer: Long-Range Transformers with Unlimited Length Input
+Amanda Bertsch and Uri Alon and Graham Neubig and Matthew R. Gormley
+Carnegie Mellon University, USA
+{abertsch,ualon,gneubig,mgormley}@cs.cmu.edu
+Abstract
+Transformer-based models typically have a
+predeﬁned bound to their input length, because
+of their need to potentially attend to every to-
+ken in the input.
+In this work, we propose
+Unlimiformer: a general approach that can
+wrap any existing pretrained encoder-decoder
+transformer, and ofﬂoad the attention compu-
+tation across all layers to a single k-nearest-
+neighbor index; this index can be kept on ei-
+ther the GPU or CPU memory and queried in
+sub-linear time. This way, we can index ex-
+tremely long input sequences, while every at-
+tention head in every decoder layer retrieves
+its top-k keys, instead of attending to every
+key. We demonstrate Unlimiformer’s efﬁcacy
+on several long-document and multi-document
+summarization benchmarks, showing that it
+can summarize even 350k token-long inputs
+from the BookSum dataset, without any input
+truncation at test time. Unlimiformer improves
+pretrained models such as BART (Lewis et al.,
+2020a) and Longformer (Beltagy et al., 2020a)
+by extending them to unlimited inputs without
+additional learned weights and without modi-
+fying their code. We make our code and mod-
+els publicly available1.
+1
+Introduction
+Transformers (Vaswani et al., 2017) are the domi-
+nant sequence-to-sequence architecture. Pretrained
+transformers generally have a context window of
+512 (e.g. BERT (Devlin et al., 2019)) or 1024 to-
+kens (e.g. BART (Lewis et al., 2020b)), which
+are sufﬁcient lengths for many current conditional
+generation datasets (XSum; Narayan et al., 2018)
+(CNN/DM; Nallapati et al., 2016).
+For inputs between 1k and 16k tokens, special-
+ized long-context models have been developed.
+These models employ clever techniques to spar-
+sify or approximate attention (e.g. Longformer
+1https://github.com/abertsch72/unlimiformer
+XSum (Avg)
+CNN/DM (Avg)
+ArXiv (Avg)
+GovReport (Avg)
+WikiSum (Avg)
+NarrativeQA (Avg)
+BookSum (Avg)
+NarrativeQA (Max)
+BookSum (Max)
+WikiSum (Max)
+103
+104
+105
+Input tokens
+16384 tokens
+4096 tokens
+1024 tokens
+Figure 1: Long-range transformers can avoid input
+truncation in some datasets; however, there are datasets
+with inputs many times longer than these models’ max-
+imum input length. The dotted lines represent three
+common maximum input lengths for models; the bars
+are the average or maximum input length in each
+dataset, as indicated. Averages for datasets from Koh
+et al. (2022).
+(Beltagy et al., 2020b), Performers (Choroman-
+ski et al., 2020)), allowing the maximum input
+length to quadruple while remaining computation-
+ally feasible. Datasets in this length include most
+long-document summarization or question answer-
+ing datasets, such as arXiv summarization (Cohan
+et al., 2018).
+But 16,384 is not the upper limit for the length of
+context required for generation: tasks that involve
+long narratives, such as book summarization (Kry´s-
+ci´nski et al., 2021) or narrative question-answering
+(Koˇciský et al., 2018), often have inputs exceeding
+100k tokens. A challenge set for Wikipedia arti-
+cle generation (Liu* et al., 2018) contains inputs
+longer than 500k tokens. Open-domain tasks in
+generative question answering could conceivably
+synthesize information from even larger inputs, e.g.
+arXiv:2305.01625v1  [cs.CL]  2 May 2023
+
+Input:
+Datastore of one long input
+Retrieved 
+hidden states
+query
+kNN Search
+Encoder
+a
+b
+c
+d
+e
+f
+a
+b
+c
+d
+e
+f
+Encode chunks
+Cross attention
+Decoder Layer
+Figure 2: In this example, the encoder’s maximum input length is 2 tokens. A 6-token input is encoded in chunks
+and stored in the datastore. We inject Unlimiformer into each decoder layer prior to cross-attention. In Unlim-
+iformer, we perform kNN search to select a 2-token context for each attention head from the datastore; then,
+cross-attention is computed using keys and values from the entire input sequence.
+answering a question about the aggregate prop-
+erties of all living person articles on Wikipedia.
+Figure 1 shows the size of several popular sum-
+marization and question answering datasets, plot-
+ted against common context window lengths; the
+longest inputs are more than 34 times longer than
+Longformer’s context window.
+In these extremely-long-input cases, vanilla
+transformers cannot be feasibly scaled, as naïve
+attention has quadratic complexity. Long-input
+transformers, though more efﬁcient than standard
+transformers, require signiﬁcant computational re-
+sources, which increase with increased context win-
+dow size. Additionally, increasing the context win-
+dow necessitates re-training the model from scratch
+with a new context window size, which is compu-
+tationally and environmentally costly.
+We introduce Unlimiformer, a retrieval-based
+method which augments pretrained language mod-
+els to accept inputs of unbounded length at test time.
+Unlimiformer can be injected into any existing
+encoder-decoder transformer to permit unbounded
+inputs. Given a long input sequence, Unlimiformer
+constructs a datastore over the hidden states of all
+input tokens. Then, the decoder’s standard cross-
+attention queries the datastore, and attends to the
+top-k input tokens. The datastore can be stored in
+either GPU or CPU memory and admits sublinear
+queries.
+Unlimiformer can be applied directly over a
+trained model, and can improve an existing check-
+point without any further training. When ﬁnetun-
+ing Unlimiformer, performance is further improved.
+We demonstrate that Unlimiformer can be applied
+to multiple base models, such as BART (Lewis
+et al., 2020a) or PRIMERA (Xiao et al., 2022),
+without adding weights and without re-training.
+Across a variety of long-range seq2seq datasets,
+Unlimiformer not only performs better on these
+datasets than strong long-range transformers such
+as Longformer (Beltagy et al., 2020b), SLED (Ivgi
+et al., 2022) and Memorizing Transformers (Wu
+et al., 2022), but we also ﬁnd that Unlimiformer
+can be applied on top of a Longformer-encoder-
+decoder model for further improvement.
+2
+Unlimiformer
+Transformers are limited in their maximum input
+length because of the ﬁxed size of the encoder con-
+text window. However, at different points in de-
+coding, different information may be relevant; also,
+different attention heads may be attending to differ-
+ent types of information (Clark et al., 2019). Thus,
+a ﬁxed context window may waste effort on tokens
+that an attention head does not attend strongly to.
+Unlimiformer allows each head to choose a sep-
+arate context window from the full-length input at
+each decoding step. This is formalized by injecting
+an Unlimiformer lookup into the decoder: prior
+to cross-attention, the model performs a k-nearest
+neighbor (kNN) search in an external datastore
+to choose a set of per-decoder-layer per-attention-
+head tokens to attend to.
+2.1
+Encoding
+To encode an input sequence that is longer than the
+model’s context window, we encode overlapping
+chunks of the input, following Ivgi et al. (2022),
+keeping only the middle half of the outputs from
+each chunk, to ensure that the encodings have suf-
+
+ﬁcient context on both sides. Finally, we index the
+encoded inputs in a datastore, using a library such
+as Faiss (Johnson et al., 2019).
+2.2
+Retrieval-augmented cross-attention
+In standard cross-attention, a transformer decoder
+attends to the encoder’s last hidden states, where
+the encoder usually truncates the input and encodes
+only the k ﬁrst tokens in the input sequence.
+Instead of attending only to this k-token preﬁx
+of the input, we retrieve the top-k hidden states
+from a much longer input sequence for each cross-
+attention head, and attend only to these top-k. This
+allows retrieving keys from the entire input se-
+quence instead of truncating. Our approach is also
+cheaper, in computation and GPU-memory, than
+attending to all input tokens, while usually preserv-
+ing more than 99% of the attention mass.
+Figure 2 displays our generic changes to any
+sequence-to-sequence transformer’s architecture.
+The full input is encoded using the encoder in
+chunks and stored in a datastore; then, the datastore
+of encoded hidden states is queried at each decod-
+ing step. The kNN search step is non-parametric
+and can be injected into any pretrained seq2seq
+transformer. The search step reformulates attention
+for space efﬁciency as detailed below.
+2.3
+Attention reformulation
+The use of a datastore for the encoded tokens, pio-
+neered by Wu et al. (2022), increases the maximum
+input length signiﬁcantly. However, this naïve ap-
+proach requires constructing separate datastores for
+the attention keys and values at each layer and each
+head, for a total of 2 × L × H datastores, where L
+is the number of decoder layers and H is the num-
+ber of attention heads.2 A separate datastore for
+each attention head in each decoder layer would be
+both time-intensive to create and space-intensive to
+store. So, not surprisingly, Wu et al. (2022) apply
+their memory layer to only a single decoder layer.
+Instead, we present a different order of comput-
+ing the well-known transformer attention formula,
+which allows us to store a single datastore across
+all attention heads and all decoder layers.
+The standard cross-attention calculation for a
+2See Memorizing Transformers’ ofﬁcial implementa-
+tion
+at
+https://github.com/google-research/meliad/blob/
+main/transformer/memory_factory.py#L78-L79
+and
+https://github.com/google-research/meliad/blob/main/
+transformer/memory_layer.py#L334-L339
+single head in a transformer is:
+Attn(Q, K, V ) = softmax
+QKT
+√dk
+
+V
+(1)
+where Q is the product of the decoder state and the
+query weight matrix, and K, V are the product of
+the last encoder hidden state with the key and value
+weight matrices respectively. Our goal is to retrieve
+a set of keys Kbest that maximize QKT , with the
+size of Kbest ﬁxed to the size of the model’s con-
+text window, and then perform normal attention
+computation over Kbest.
+Let hd be the decoder state and he be the last
+encoder layer’s hidden state. We can refactor the
+transformer’s attention computation as follows:3
+QKT = (hdWq) (heWk)⊤
+(2)
+= (hdWq) W ⊤
+k he⊤
+=
+
+hdWqW ⊤
+k
+
+he⊤
+Thus, the retrieval step can be formulated as choos-
+ing the encoder hidden states he that maximize
+ hdWqW ⊤
+k
+
+he⊤. This rewriting has two major
+advantages: ﬁrst, there is no need to store the keys
+for each head and layer separately: we can store
+a single datastore of the hidden states states he
+only, and just project the queries to hdWqW ⊤
+k us-
+ing head-speciﬁc Wq and Wk; second, the values
+can be calculated trivially given he, so there is no
+need to store the values in a separate datastore than
+the keys (or compute them at all) before decoding.
+Thus, rather than constructing 2 × L × H datas-
+tores and retrieving from every datastore during
+each decoding step, we construct a single datastore
+and retrieve from it by just projecting the decoder
+hidden states to per-head hdWqW ⊤
+k .
+This reformulation has not, to our knowledge,
+been performed before in retrieval-augmented at-
+tention. This allows the application of retrieval-
+augmented attention at each head and layer with
+negligible increase in time and space required. In
+contrast to Memorizing Transformers’s single-layer
+retrieval augmentation, which requires construct-
+ing two datastores and retrieves the same tokens
+for each attention head, Unlimiformer uses one
+datastore and allows retrieval augmentation over
+any number of layer and individualized retrieval
+per-head.
+3For brevity, we omit the linear layers’ bias term, because
+the softmax function is invariant to adding the same constant
+to all inputs.
+
+Method name
+Training-time input
+total # tokens in
+example seen at
+training time
+Validation-time input
+(e.g. early stopping)
+Test-time input
+Baseline
+1024
+1024
+1024
+1024
++test Unlimiformer
+1024
+1024
+1024
+unlimited
++early stop w/ Unlimiformer
+1024
+1024
+unlimited
+unlimited
+Train chunked +test Unlimiformer
+1024
+all
+unlimited
+unlimited
+SLED (Ivgi et al., 2022)
+16k
+16k
+16k
+16k
+Longformer (Beltagy et al., 2020a)
+16k
+16k
+16k
+16k
+Random-encoded training
+8-16k
+8-16k
+unlimited
+unlimited
+Retrieval training
+8-16k
+8-16k
+unlimited
+unlimited
+Alternating training
+8-16k
+8-16k
+unlimited
+unlimited
+Table 1: A comparison of the training methodologies using BART (context window size 1024) as a running exam-
+ple. The dashed line separates methods that are approximately the same training-time cost as the baseline from
+those that require signiﬁcant additional compute.
+3
+Training Methods
+The method as described can be used, at test time,
+on any already-trained model. Next, we turn our
+focus to training methodologies to further improve
+the performance of Unlimiformer. Table 1 sum-
+marizes and contrasts the methodologies described
+below, and Appendix A contains further implemen-
+tation details.
+3.1
+Low (additional-) Cost Training Methods
+We ﬁrst consider training strategies that do not re-
+quire signiﬁcant additional compute as compared
+to the standard ﬁnetuning regime.
++test Unlimiformer: As the simplest case, we use
+a standard ﬁne-tuning regime, where the input
+is truncated during training. At inference time
+only, we inject Unlimiformer into the trained
+model to process full-length inputs.
++early stop w/ Unlimiformer: We train without
+Unlimiformer, but when we evaluate the
+model for early stopping, we use Unlimi-
+former for generation on the validation set.
+This results in choosing a slightly different
+checkpoint to stop training at; the additional
+computational cost here is minor, and comes
+only from the application of Unlimiformer
+during inference over the validation set.
+Train chunked +test Unlimiformer: As
+a
+data
+augmentation strategy, we split each training
+example into chunks of the context-window
+size, and treat each chunk as its own training
+example. This is orthogonal to the Unlimi-
+former model, but has the advantage that all
+embeddings from the full-length training ex-
+ample are back-propagated into during train-
+ing, instead of truncated—albeit across sev-
+eral examples. We apply early stopping with
+Unlimiformer.
+3.2
+Long-range Training Methods
+We also consider training Unlimiformer directly,
+which introduces additional computational cost.
+Random-encoded training: At each training step,
+the full (longer-than-context-window) training
+example is encoded in chunks; then, the keys
+for each decoder layer are chosen randomly
+from the encoded hidden states. This weakly
+simulates a nearest-neighbors search, but is
+computationally cheaper.
+Retrieval training: At each training step, the keys
+for each decoder head and layer are selected
+using a kNN search. This is not exact if the
+inputs are longer than 16k tokens, as memory
+requirements at training-time require the trun-
+cation of the input; however, this is closest to
+the test-time computation.
+Alternating training: To gain the beneﬁts of each,
+we alternate epochs of Random-encoded train-
+ing and Retrieval training. The use of ran-
+dom neighbors increases the likelihood that
+all tokens will be chosen as keys occasion-
+ally, while retrieval training is identical to the
+test-time setting for most inputs.
+4
+Experimental Settings
+4.1
+Datasets
+We experiment with three long-document summa-
+rization datasets with varying domains and prop-
+erties.
+Table 2 contains summary statistics for
+
+Avg # tokens
+Dataset
+Domain
+# examples
+Input
+Output
+Input length distribution
+GovReport
+Government
+19,402
+9,616
+597
+74
+303192
+SummScreen
+TV shows
+4,348
+8,987
+137
+2365
+22635
+BookSum
+Literature
+436
+143,301
+1294
+19406
+354006
+Table 2: Dataset statistics. The last column is a visualization of the distribution of input example lengths in each
+dataset; the histogram is binned by powers of 2, with the minimum and maximum input size displayed on either
+end.
+Base model
+Training method
+ROUGE 1 / 2 / L / BERTScore
+GovReport
+SummScreen
+BARTbase
+Standard ﬁnetuning
+48.7 / 19.2 / 22.8 / 64.3
+29.7 / 6.2 / 17.7 / 56.3
+BARTbase
++test SLED (Ivgi et al., 2022)
+45.8 / 16.1 / 20.2 / 62.7
+27.5 / 5.5 / 16.7 / 55.9
+BARTbase
++test Unlimiformer
+49.7 / 19.6 / 22.0 / 64.8
+30.9 / 6.5 / 18.2 / 57.5
+BARTbase
++early stop w/ Unlimiformer
+51.0 / 20.5 / 21.5 / 65.1
+32.1 / 6.8 / 18.6 / 57.6
+BARTbase
+Train chunked
+46.2 / 17.8 / 21.7 / 63.3
+28.1 / 5.6 / 17.0 / 55.6
+BARTbase
++test Unlimiformer
+53.4 / 22.5 / 22.5 / 66.0
+29.3 / 6.6 / 17.6 / 57.0
+PRIMERA
+Standard ﬁnetuning
+55.1 / 23.9 / 25.9 / 67.0
+32.3 / 7.1 / 18.3 / 57.1
+PRIMERA
++test Unlimiformer
+56.5 / 24.8 / 26.3 / 67.7
+33.3 / 7.7 / 19.1 / 57.6
+Table 3: Test results on long-document datasets, for low-cost training methods: the training costs are no higher
+than standard ﬁnetuning that truncates the inputs according to the model’s max input size. The best metric in every
+dataset and every training category is marked in bold.
+each dataset. GovReport and SummScreen are in-
+cluded in the Scrolls benchmark (Shaham et al.,
+2022) . We report ROUGE 1/2/L (Lin, 2004) and
+BERTScore F1 (Zhang et al., 2019).
+GovReport (Huang et al., 2021) is a long-
+document summarization dataset where the task
+is to write the executive summary of a US govern-
+ment report.
+SummScreen (Chen et al., 2022) is a long-
+document summarization dataset where the task
+is to write the recap of a TV show episode, pro-
+vided the transcript of the episode as input.
+BookSum (Kry´sci´nski et al., 2021) is a long-
+document summarization dataset of public-domain
+works of literature. BookSum has paragraph, chap-
+ter, and book-level settings; we consider only the
+BOOKSUM-Book setting, where the task is to gen-
+erate a book-level summary given the full text of
+the novel as input.
+4.2
+Baselines
+BART (base) (Lewis et al., 2020b) is a pretrained
+seq2seq model (139M parameters), commonly
+used for summarization tasks. Its maximum input
+sequence length is 1024 tokens.
+PRIMERA (Xiao et al., 2022) is a Longformer-
+Encoder-Decoder (LEDlarge;
+Beltagy et al.,
+2020b) (447M parameters), pretrained speciﬁcally
+for multi-document summarization. Its maximum
+input length is 4096 tokens; in the encoder, the
+global attention is sparse over the full sequence
+with dense local attention in a 1024-token window.
+SLED (Ivgi et al., 2022) is a method for aug-
+menting pretrained encoder-decoder models for
+longer contexts by performing fusion in-decoder
+(Izacard and Grave, 2021); this allows the use of
+pretrained models, albeit with an expensive ﬁne-
+tuning, and the input sequence length is eventually
+memory bounded. We replicate the authors’ exper-
+iments for BART+SLED on several datasets.
+Memorizing Transformers (Wu et al., 2022) is
+the most similar work to ours; they propose a train-
+able attention gate that moderates between the stan-
+dard cross-attention and attention over retrieved
+keys from a datastore in one layer. Since the public
+implementation4 for this method is “not ofﬁcially
+supported” and is not fully reproducible, we ap-
+proximated it by using attention over the datastore
+4https://github.com/google-research/meliad
+
+in only a single decoder layer; this is equivalent to
+their setting with the learned interpolation parame-
+ter g set to 1.5 Our work differs from Memorizing
+Transformers in several key ways: Wu et al. (2022)
+added additional weights, and thus cannot easily
+leverage pretrained LMs, while Unlimiformer is
+fully non-parametric and can improve performance
+without ﬁnetuning. Further, Wu et al. (2022) ap-
+plies attention retrieval to a single layer because
+of computational constraints, but our attention re-
+formulation (Section 2.3) allows for the use of Un-
+limiformer in every decoder layer while still being
+more efﬁcient than Memorizing Transformers.
+5
+Experimental Results
+5.1
+Long Document Summarization
+Table 3 shows the results in the long-document (4k-
+16k token input) summarization datasets. First, we
+can see that applying Unlimiformer on an exist-
+ing checkpoint without any training (+test Unlim-
+iformer) improves BARTbase by, for example, 1.8
+ROUGE-1 points on both datasets. By contrast, ap-
+plying SLED without additional training decreases
+performance from the base model. Unlimiformer
+is the only model that can be applied training-free.
+Early stop w/ Unlimiformer is also shown to be
+a very efﬁcient training approach: it provides, for
+example, 3.3 ROUGE-1 points gain on GovReport,
+while the training computational cost is identical
+to standard ﬁnetuning.
+In the long-range training methods in Table 4 ,
+Unlimiformer shows consistent improvements. In
+almost all metrics and datasets, Unlimiformer out-
+performs the SLED and Memorizing Transformers
+baselines with the same base model.
+The experiments with PRIMERA show two im-
+portant points: ﬁrst, Unlimiformer that is based
+on BARTbase performs better than the baseline
+PRIMERA, even though PRIMERA was pretrained
+on much more data, using a pretraining objec-
+tive that was designed for summarization; second,
+these experiments show that not only can Unlimi-
+former outperform Longformer-based models such
+as PRIMERA, Unlimiformer can also be applied
+on top of existing long-range transformers.
+5This is an approximation, but Wu et al. (2022) note that in
+their experiments, most heads learned a value for g such that
+they attended “almost exclusively” to the external memory.
+5.2
+Book Summarization
+Table 5 shows the result on BookSum. In Book-
+Sum, we also see improvements from applying Un-
+limiformer, using both BARTbase and PRIMERA.
+Random-encoded, Retrieval, and Alternating
+training show competitive performance, with the
+best method varying across datasets and models.
+The low-cost training methods underperform these
+training strategies but outperform the baseline mod-
+els; even applying Unlimiformer without training
+modiﬁcations improves over the base model in
+most settings.
+6
+Analysis
+6.1
+Entity mentions
+Unlimiformer outperforms all base models on
+BookSum (see Table 5), but the truncation baseline
+(using only the ﬁrst 1024 tokens of the input) also
+shows relatively high performance on the automatic
+metrics. This is strongly counterintuitive for book
+summarization, where the plot of the book should
+not be apparent from reading the ﬁrst pages. In
+the outputs from this baseline, we observe limited
+coherence and a high rate of hallucination (see Ap-
+pendix B for an example with analysis). However,
+this is not reﬂected in n-gram based overlaps, and
+BERTScore does not strongly distinguish between
+any of the BookSum models.
+Following the use of entity reference measures
+in medicial summarization (Zhang et al., 2021),
+we use an entity-based metric as a proxy for the
+informativeness of the candidate summaries. We
+use SpaCy6 to tag all named entities in the gold
+summary and collect a set of unique entities. We
+then tag each candidate summary and compute the
+percentage of entities present in this summary (i.e.
+recall of unique entities). We report this metric
+(abbreviated as EntMent) in Table 5 for BookSum.
+The Unlimiformer models exhibit far higher entity
+recall, and even adding Unlimiformer only at test
+time without customized training doubles the entity
+recall of summaries from the base model.
+6.2
+Input limitation
+To evaluate the performance gains from using the
+full input, we artiﬁcally impose a maximum data-
+store size. Figure 3 shows the performance of the
+best BookSum model as the maximum length in-
+creases; entity recall increases with length.
+6https://spacy.io
+
+Base model
+Training method
+ROUGE 1 / 2 / L / BERTScore
+GovReport
+SummScreen
+BARTbase
+SLED (Ivgi et al., 2022)
+54.7 / 24.4 / 25.4 / 67.0
+32.7 / 7.9 / 19.1 / 58.4
+LEDlarge
+PRIMERA (Xiao et al., 2022)
+55.1 / 23.9 / 25.9 / 67.0
+32.3 / 7.1 / 18.3 / 57.1
+BARTbase
+Memorizing Transformers
+55.2 / 25.1 / 26.4 / 67.5
+32.7 / 7.4 / 19.2 / 57.4
+BARTbase
+Unlimiformer (this work)
+56.6 / 26.3 / 27.6 / 68.2
+34.7 / 8.5 / 19.9 / 58.5
+PRIMERA
+Memorizing transformers
+57.0 / 25.3 / 26.5 / 67.7
+33.0 / 7.3 / 18.4 / 57.3
+PRIMERA
+Unlimiformer (this work)
+57.4 / 26.2 / 28.0 / 68.1
+33.3 / 7.6 / 18.9 / 57.7
+Table 4: Test results on long-document datasets, when allowing compute-costly, long-range training methods,
+using different base models. The best metric in every dataset and every training category is marked in bold.
+Base model
+Training method
+ROUGE 1 / 2 / L
+EntMent
+BARTbase
+Hierarchical (Kry´sci´nski et al., 2021)
+30.0 / 6.0 / 11.0
+-
+BARTbase
+Standard ﬁnetuning
+36.4 / 7.6 / 15.3
+10.0
+BARTbase
++test Unlimiformer
+35.5 / 7.7 / 15.4
+21.9
+BARTbase
++early stop w/ Unlimiformer
+35.5 / 7.7 / 15.4
+21.9
+BARTbase
+Memorizing Transformers
+35.6 / 6.4 / 14.6
+15.7
+BARTbase
+Unlimiformer (random-encoded training)
+37.3 / 6.7 / 15.2
+20.8
+BARTbase
+Unlimiformer (alternating training)
+36.7 / 7.3 / 15.5
+20.3
+PRIMERA
+Standard ﬁnetuning
+38.6 / 7.2 / 15.6
+11.6
+PRIMERA
++test Unlimiformer
+38.3 / 7.5 / 15.9
+18.9
+PRIMERA
++early stop w/ Unlimiformer
+39.5 / 7.3 / 15.8
+22.2
+PRIMERA
+Unlimiformer (retrieval training)
+37.9 / 8.2 / 16.3
+25.5
+PRIMERA
+Unlimiformer (random-encoded training)
+39.5 / 7.1 / 15.9
+19.7
+Table 5: Results on BookSum (average input length ≈143k tokens). EntMent is entity recall, described in §6.1. Hi-
+erarchical summarization is a baseline reported by Kry´sci´nski et al. (2021), where chapter summaries are combined
+and condensed to form a book summary. The best metric in every dataset is marked in bold.
+6.3
+WikiSum
+Previous work in dataset analysis has found that
+strong signal for many generation tasks is concen-
+trated in only part of the input (e.g. the layout
+bias in news summarization (Kedzie et al., 2018)
+or answering questions using a single paragraph in
+HotpotQA (Jiang and Bansal, 2019).
+We observe this trend in WikiSum, a multi-
+document summarization dataset where the inputs
+are all references for a Wikipedia article and the
+output summary is the intro paragraph of the arti-
+cle (Liu* et al., 2018)7. As a strong baseline, we
+follow the paragraph ranking scheme of Liu* et al.
+(2018), where the paragraphs across documents are
+presented in order of relevance according to TF-
+IDF. A baseline using only the ﬁrst 1024 tokens
+of this sorted input outperformed Unlimiformer,
+7A full copy of WikiSum is not available online; details of
+our scraped copy are in Appendix A.2.
+suggesting that the full input is not necessary to
+produce the summary on this dataset.
+6.4
+Computational cost
+Although Unlimiformer does not introduce addi-
+tional trained parameters, the encoding of the full
+input, datastore construction, and datastore search
+increase the processing time necessary during both
+training and inference. We benchmark the GPU-
+time necessary to train BART-base for a single
+epoch and evaluate over the validation set using
+each training methodology.
+Table 6 shows the relative cost for each method.
+The Unlimiformer training methodologies are
+higher cost than the base training; however, the
+largest difference occurs during inference, where
+the full input (in Booksum, an average of 112,885
+tokens) must be encoded, instead of the 1,024 to-
+kens encoded in the baseline approach.
+We graph the computational cost of inference
+
+1K
+2K
+4K
+8K 16K 32K 64K 100K350K
+0
+5
+10
+15
+20
+25
+Max datastore size
+Entity Mention Recall
+Unlimiformer
+BARTbase
+Figure 3: As the maximum datastore size increases, the
+entity recall generally increases. At all datastore sizes,
+Unlimiformer outperforms the baseline (BART, in red).
+1K
+2K
+4K
+8K
+16K 32K 64K 100K
+0
+5
+10
+15
+20
+25
+30
+Max datastore size
+Time per example (s)
+Unlimiformer
+BARTbase (truncates to 1024)
+Figure 4: As the maximum datastore size increases, the
+inference cost increases sublinearly. Note the log scale.
+Method
+Relative GPU-time
+Baseline training
+1.00 ± 0.00
+Chunked training
+1.02 ± 0.02
++early stop w/ Unlimiformer
+1.00 ± 0.00
+Retrieval training
+1.89 ± 0.06
+Random-encoded training
+2.87 ± 0.28
+Baseline inference
+1.00 ± 0.00
+Unlimiformer inference
+4.48 ± 0.56
+Table 6: Computational effort per epoch for different
+training methodologies, relative to the baseline of stan-
+dard ﬁnetuning and inference. All are averaged over 3
+runs on BookSum using a single 48 GB A6000 GPU,
+32 GB RAM, and 16 CPUs.
+with respect to the input length in Figure 4. When
+all inputs are restricted to 1,024 tokens, Unlimi-
+former requires additional time relative to the base-
+line for datastore construction and search. How-
+ever, the beneﬁts of Unlimiformer are clear as input
+length increases. The GPU-time required increases
+sublinearly with input length.
+7
+Related Work
+Retrieval-augmented transformers. Interpolat-
+ing language model probabilities with nearest
+neighbors retrieval from a datastore was origi-
+nally proposed by Khandelwal et al. (2019) to im-
+prove the language modeling of decoder-only mod-
+els. Additional work in this space has explored
+adding structure to this datastore (Alon et al., 2022)
+to further increase performance and improve ef-
+ﬁciency. More recent work has focused on lan-
+guage modeling for long-form text (Wu et al., 2022)
+and applying retrieval-augmented transformers to
+downstream classiﬁcation tasks (Shi et al., 2022).
+Our work furthers this area by applying retrieval-
+augmented methods to encoder-decoder models
+and sequence generation tasks.
+Long-context transformers. An orthogonal so-
+lution has emerged in the large language models
+literature: change the transformer model such that
+its time/space complexity is Θ(Nlog(N)) or Θ(N)
+(Tay et al., 2020). Most solutions achieve this re-
+duction through sparsifying the attention mecha-
+nism as in Sparse Transformers (Child et al., 2019),
+Reformer (Kitaev et al., 2020), Longformer (Belt-
+agy et al., 2020b), Routing Transformers (Roy et al.,
+2020), ETC (Ainslie et al., 2020), and Big Bird (Za-
+heer et al., 2020). In other work, the attention mech-
+anism is either approximated or replaced entirely
+as in Linformer (Wang et al., 2020), Linear Trans-
+formers (Katharopoulos et al., 2020), Performers
+(Choromanski et al., 2020), and FNet (Lee-Thorp
+et al., 2021). For the most part, these are general
+purpose language models, not catered to a speciﬁc
+downstream task because of the high cost of pre-
+training. These models also are limited to the max-
+imum sequence length chosen during pretraining;
+that length, often chosen to be 8192 or 16384, is
+substantially lower than the lengths of many Book-
+Sum or WikiSum training examples.
+Long-document summarization. Prior work has
+proposed several strategies for long-document sum-
+marization. In particular, many methods select a
+subsection of input to summarize using TF-IDF
+(Liu* et al., 2018), smaller retriever models (Liu
+and Lapata, 2019), or sentence similarity metrics
+(Bajaj et al., 2021). An orthogonal approach is
+to summarize chunks of the input, then combine
+and condense these sub-summaries into a global
+
+summary, either using vanilla transformer mod-
+els (Kry´sci´nski et al. (2021), Zhang et al. (2022),
+(Zhang et al., 2021)) or a specialized architecture
+(Liu and Lapata (2019), Grail et al. (2021)). Other
+work has focused on expanding the amount of text
+that can be processed, by applying long-context
+transformers or developing new long-context meth-
+ods (Huang et al., 2021). However, these meth-
+ods all suffer from cascading errors: if the initial
+trimming or chunk summarization steps remove
+important information, there is no way to recover
+that information in the downstream summary.
+8
+Conclusions
+We present Unlimiformer, a method for augment-
+ing pretrained encoder-decoders with an exter-
+nal datastore to allow for unlimited length input.
+We demonstrate the usefulness of this approach
+for downstream sequence-to-sequence generation
+tasks, particularly long-document summarization.
+We examine several training methodologies for
+ﬁnetuning models with this method, and demon-
+strate that these strategies signiﬁcantly improve
+over the base model, without adding weights.
+We expect that future work will further improve
+upon this performance, potentially by incorporating
+structure into the datastore or by retrieving embed-
+dings in chunks. The information retrieval com-
+munity has developed a wide variety of methods
+for improving retrieval, and we hope that the ap-
+plication of these methods will further improve
+the performance of retrieval-augmented LLMs on
+challenging downstream tasks. Toward this end,
+we release code8 for easily injecting Unlimiformer
+into any model using the HuggingFace Transform-
+ers (Wolf et al., 2020) library.
+9
+Limitations
+In our experiments, we have only considered
+English-language datasets. While we have no rea-
+son to believe the method would suffer from the
+use of a different high-resourced language, the qual-
+ity of the nearest-neighbors search depends on the
+quality of the indexed embeddings; thus, this ap-
+proach may not be feasible in languages where a
+strong pretrained model is not available.
+Interpretability is a concern in any long-input
+summarization task, as the input may be infeasibly
+long for manual inspection. The retrieved embed-
+8MIT license; see repo for details
+dings at each step are difﬁcult to interpret; further
+work here is necessary.
+The length of inputs is theoretically bounded by
+the memory limitations of the computer used. More
+practically, using a CPU datastore is many times
+slower than a GPU datastore because of slower
+search and the need to transfer retrieved embed-
+dings to the GPU. In our experiments, we were
+able to use a GPU datastore for input examples
+exceeding 500k tokens (on GPUs no larger than
+48 GBs), but this may be a concern when using
+smaller GPUs or even larger inputs. Additionally,
+CPU datastores are necessary for models with con-
+text windows larger than 2048 tokens, as the Faiss
+GPU datastore implementation does not support
+retrieving more than 2048 nearest neighbors.
+References
+Joshua Ainslie, Santiago Ontanon, Chris Alberti, Va-
+clav Cvicek, Zachary Fisher, Philip Pham, Anirudh
+Ravula, Sumit Sanghai, Qifan Wang, and Li Yang.
+2020. Etc: Encoding long and structured inputs in
+transformers.
+Uri Alon, Frank F. Xu, Junxian He, Sudipta Sen-
+gupta, Dan Roth, and Graham Neubig. 2022. Neuro-
+symbolic
+language
+modeling
+with
+automaton-
+augmented retrieval.
+Ahsaas Bajaj, Pavitra Dangati, Kalpesh Krishna, Prad-
+hiksha Ashok Kumar, Rheeya Uppaal, Bradford
+Windsor, Eliot Brenner, Dominic Dotterrer, Rajarshi
+Das, and Andrew McCallum. 2021.
+Long docu-
+ment summarization in a low resource setting using
+pretrained language models. In Proceedings of the
+59th Annual Meeting of the Association for Compu-
+tational Linguistics and the 11th International Joint
+Conference on Natural Language Processing: Stu-
+dent Research Workshop, pages 71–80, Online. As-
+sociation for Computational Linguistics.
+Iz Beltagy, Matthew E Peters, and Arman Cohan.
+2020a.
+Longformer:
+The long-document trans-
+former. arXiv preprint arXiv:2004.05150.
+Iz Beltagy, Matthew E. Peters, and Arman Cohan.
+2020b.
+Longformer:
+The long-document trans-
+former.
+Mingda Chen, Zewei Chu, Sam Wiseman, and Kevin
+Gimpel. 2022.
+SummScreen:
+A dataset for ab-
+stractive screenplay summarization. In Proceedings
+of the 60th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers),
+pages 8602–8615, Dublin, Ireland. Association for
+Computational Linguistics.
+Rewon Child, Scott Gray, Alec Radford, and Ilya
+Sutskever. 2019.
+Generating long sequences with
+sparse transformers.
+
+Krzysztof Choromanski, Valerii Likhosherstov, David
+Dohan, Xingyou Song, Andreea Gane, Tamas Sar-
+los, Peter Hawkins, Jared Davis, Afroz Mohiuddin,
+Lukasz Kaiser, David Belanger, Lucy Colwell, and
+Adrian Weller. 2020. Rethinking attention with per-
+formers.
+Kevin Clark, Urvashi Khandelwal, Omer Levy, and
+Christopher D. Manning. 2019. What does BERT
+look at? an analysis of BERT’s attention. In Pro-
+ceedings of the 2019 ACL Workshop BlackboxNLP:
+Analyzing and Interpreting Neural Networks for
+NLP, pages 276–286, Florence, Italy. Association
+for Computational Linguistics.
+Arman Cohan, Franck Dernoncourt, Doo Soon Kim,
+Trung Bui, Seokhwan Kim, Walter Chang, and Na-
+zli Goharian. 2018.
+A discourse-aware attention
+model for abstractive summarization of long docu-
+ments. In Proceedings of the 2018 Conference of
+the North American Chapter of the Association for
+Computational Linguistics: Human Language Tech-
+nologies, Volume 2 (Short Papers), pages 615–621,
+New Orleans, Louisiana. Association for Computa-
+tional Linguistics.
+Jacob Devlin, Ming-Wei Chang, Kenton Lee, and
+Kristina Toutanova. 2019.
+BERT: Pre-training of
+deep bidirectional transformers for language under-
+standing.
+In Proceedings of the 2019 Conference
+of the North American Chapter of the Association
+for Computational Linguistics: Human Language
+Technologies, Volume 1 (Long and Short Papers),
+pages 4171–4186, Minneapolis, Minnesota. Associ-
+ation for Computational Linguistics.
+Quentin Grail, Julien Perez, and Eric Gaussier. 2021.
+Globalizing BERT-based transformer architectures
+for long document summarization. In Proceedings
+of the 16th Conference of the European Chapter
+of the Association for Computational Linguistics:
+Main Volume, pages 1792–1810, Online. Associa-
+tion for Computational Linguistics.
+Luyang Huang, Shuyang Cao, Nikolaus Parulian, Heng
+Ji, and Lu Wang. 2021. Efﬁcient attentions for long
+document summarization.
+In Proceedings of the
+2021 Conference of the North American Chapter of
+the Association for Computational Linguistics: Hu-
+man Language Technologies, pages 1419–1436, On-
+line. Association for Computational Linguistics.
+Maor Ivgi, Uri Shaham, and Jonathan Berant. 2022. Ef-
+ﬁcient long-text understanding with short-text mod-
+els.
+Gautier Izacard and Edouard Grave. 2021. Leveraging
+passage retrieval with generative models for open
+domain question answering. In Proceedings of the
+16th Conference of the European Chapter of the As-
+sociation for Computational Linguistics: Main Vol-
+ume, pages 874–880, Online. Association for Com-
+putational Linguistics.
+Yichen Jiang and Mohit Bansal. 2019. Avoiding rea-
+soning shortcuts: Adversarial evaluation, training,
+and model development for multi-hop QA. In Pro-
+ceedings of the 57th Annual Meeting of the Asso-
+ciation for Computational Linguistics, pages 2726–
+2736, Florence, Italy. Association for Computa-
+tional Linguistics.
+Jeff Johnson, Matthijs Douze, and Hervé Jégou. 2019.
+Billion-scale similarity search with GPUs.
+IEEE
+Transactions on Big Data, 7(3):535–547.
+Angelos Katharopoulos, Apoorv Vyas, Nikolaos Pap-
+pas, and François Fleuret. 2020. Transformers are
+rnns: Fast autoregressive transformers with linear at-
+tention.
+Chris Kedzie, Kathleen McKeown, and Hal Daumé III.
+2018. Content selection in deep learning models of
+summarization.
+In Proceedings of the 2018 Con-
+ference on Empirical Methods in Natural Language
+Processing, pages 1818–1828, Brussels, Belgium.
+Association for Computational Linguistics.
+Urvashi Khandelwal, Omer Levy, Dan Jurafsky, Luke
+Zettlemoyer, and Mike Lewis. 2019. Generalization
+through memorization: Nearest neighbor language
+models.
+Nikita Kitaev, Łukasz Kaiser, and Anselm Levskaya.
+2020. Reformer: The efﬁcient transformer.
+Tomáš Koˇciský, Jonathan Schwarz, Phil Blunsom,
+Chris Dyer, Karl Moritz Hermann, Gábor Melis, and
+Edward Grefenstette. 2018. The NarrativeQA read-
+ing comprehension challenge. Transactions of the
+Association for Computational Linguistics, 6:317–
+328.
+Huan Yee Koh, Jiaxin Ju, Ming Liu, and Shirui Pan.
+2022. An empirical survey on long document sum-
+marization: Datasets, models, and metrics.
+ACM
+Comput. Surv., 55(8).
+Wojciech Kry´sci´nski, Nazneen Rajani, Divyansh Agar-
+wal, Caiming Xiong, and Dragomir Radev. 2021.
+Booksum: A collection of datasets for long-form
+narrative summarization.
+James Lee-Thorp, Joshua Ainslie, Ilya Eckstein, and
+Santiago Ontanon. 2021. Fnet: Mixing tokens with
+fourier transforms.
+Mike
+Lewis,
+Yinhan
+Liu,
+Naman
+Goyal,
+Mar-
+jan Ghazvininejad, Abdelrahman Mohamed, Omer
+Levy, Veselin Stoyanov, and Luke Zettlemoyer.
+2020a. Bart: Denoising sequence-to-sequence pre-
+training for natural language generation, translation,
+and comprehension. In Proceedings of the 58th An-
+nual Meeting of the Association for Computational
+Linguistics, pages 7871–7880.
+Mike
+Lewis,
+Yinhan
+Liu,
+Naman
+Goyal,
+Mar-
+jan Ghazvininejad, Abdelrahman Mohamed, Omer
+Levy, Veselin Stoyanov, and Luke Zettlemoyer.
+2020b.
+BART: Denoising sequence-to-sequence
+pre-training for natural language generation, trans-
+lation, and comprehension. In Proceedings of the
+
+58th Annual Meeting of the Association for Compu-
+tational Linguistics, pages 7871–7880, Online. As-
+sociation for Computational Linguistics.
+Chin-Yew Lin. 2004.
+ROUGE: A package for auto-
+matic evaluation of summaries. In Text Summariza-
+tion Branches Out, pages 74–81, Barcelona, Spain.
+Association for Computational Linguistics.
+Peter J. Liu*, Mohammad Saleh*, Etienne Pot, Ben
+Goodrich, Ryan Sepassi, Lukasz Kaiser, and Noam
+Shazeer. 2018. Generating wikipedia by summariz-
+ing long sequences. In International Conference on
+Learning Representations.
+Yang Liu and Mirella Lapata. 2019. Hierarchical trans-
+formers for multi-document summarization. In Pro-
+ceedings of the 57th Annual Meeting of the Asso-
+ciation for Computational Linguistics, pages 5070–
+5081, Florence, Italy. Association for Computa-
+tional Linguistics.
+Ramesh Nallapati, Bowen Zhou, Cicero dos Santos,
+Ça˘glar Gulçehre, and Bing Xiang. 2016. Abstrac-
+tive text summarization using sequence-to-sequence
+RNNs and beyond.
+In Proceedings of the 20th
+SIGNLL Conference on Computational Natural Lan-
+guage Learning, pages 280–290, Berlin, Germany.
+Association for Computational Linguistics.
+Shashi Narayan, Shay B. Cohen, and Mirella Lapata.
+2018. Don’t give me the details, just the summary!
+topic-aware convolutional neural networks for ex-
+treme summarization. In Proceedings of the 2018
+Conference on Empirical Methods in Natural Lan-
+guage Processing, pages 1797–1807, Brussels, Bel-
+gium. Association for Computational Linguistics.
+Aurko Roy, Mohammad Saffar, Ashish Vaswani, and
+David Grangier. 2020.
+Efﬁcient content-based
+sparse attention with routing transformers.
+Uri Shaham, Elad Segal, Maor Ivgi, Avia Efrat, Ori
+Yoran, Adi Haviv, Ankit Gupta, Wenhan Xiong,
+Mor Geva, Jonathan Berant, and Omer Levy. 2022.
+Scrolls:
+Standardized comparison over long lan-
+guage sequences.
+Weijia Shi, Julian Michael, Suchin Gururangan, and
+Luke Zettlemoyer. 2022.
+knn-prompt:
+Nearest
+neighbor zero-shot inference.
+Yi Tay, Mostafa Dehghani, Dara Bahri, and Donald
+Metzler. 2020. Efﬁcient transformers: A survey.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob
+Uszkoreit, Llion Jones, Aidan N Gomez, Ł ukasz
+Kaiser, and Illia Polosukhin. 2017. Attention is all
+you need. In Advances in Neural Information Pro-
+cessing Systems, volume 30. Curran Associates, Inc.
+Sinong Wang, Belinda Z. Li, Madian Khabsa, Han
+Fang, and Hao Ma. 2020. Linformer: Self-attention
+with linear complexity.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien
+Chaumond, Clement Delangue, Anthony Moi, Pier-
+ric Cistac, Tim Rault, Remi Louf, Morgan Funtow-
+icz, Joe Davison, Sam Shleifer, Patrick von Platen,
+Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu,
+Teven Le Scao, Sylvain Gugger, Mariama Drame,
+Quentin Lhoest, and Alexander Rush. 2020. Trans-
+formers: State-of-the-art natural language process-
+ing. In Proceedings of the 2020 Conference on Em-
+pirical Methods in Natural Language Processing:
+System Demonstrations, pages 38–45, Online. Asso-
+ciation for Computational Linguistics.
+Yuhuai Wu, Markus Norman Rabe, DeLesley Hutchins,
+and Christian Szegedy. 2022.
+Memorizing trans-
+formers. In International Conference on Learning
+Representations.
+Wen Xiao, Iz Beltagy, Giuseppe Carenini, and Arman
+Cohan. 2022. PRIMERA: Pyramid-based masked
+sentence pre-training for multi-document summa-
+rization. In Proceedings of the 60th Annual Meet-
+ing of the Association for Computational Linguistics
+(Volume 1: Long Papers), pages 5245–5263, Dublin,
+Ireland. Association for Computational Linguistics.
+Manzil Zaheer, Guru Guruganesh, Avinava Dubey,
+Joshua Ainslie, Chris Alberti, Santiago Ontanon,
+Philip Pham, Anirudh Ravula, Qifan Wang, Li Yang,
+and Amr Ahmed. 2020. Big bird: Transformers for
+longer sequences.
+Longxiang Zhang, Renato Negrinho, Arindam Ghosh,
+Vasudevan Jagannathan, Hamid Reza Hassanzadeh,
+Thomas Schaaf, and Matthew R. Gormley. 2021.
+Leveraging pretrained models for automatic summa-
+rization of doctor-patient conversations. In Findings
+of the Association for Computational Linguistics:
+EMNLP 2021, pages 3693–3712, Punta Cana, Do-
+minican Republic. Association for Computational
+Linguistics.
+Tianyi Zhang, Varsha Kishore, Felix Wu, Kilian Q.
+Weinberger, and Yoav Artzi. 2019. Bertscore: Eval-
+uating text generation with bert.
+Yusen Zhang, Ansong Ni, Ziming Mao, Chen Henry
+Wu, Chenguang Zhu, Budhaditya Deb, Ahmed
+Awadallah, Dragomir Radev, and Rui Zhang. 2022.
+Summn: A multi-stage summarization framework
+for long input dialogues and documents. In Proceed-
+ings of the 60th Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Pa-
+pers), pages 1592–1604, Dublin, Ireland. Associa-
+tion for Computational Linguistics.
+
+A
+Implementation Details
+A.1
+Training details
+At training time, we must backpropagate through
+the operations described above. Thus, the input
+length is bounded more strictly – the number of
+tokens in the full input must ﬁt in GPU memory
+while the model is loaded. For the computationally
+expensive methods, we train using batch size 1
+and truncate the longest inputs (generally, to 16k
+tokens). At test time, we use the full input without
+truncation. We train one model per setting, using
+the hyperparameter settings from SLED (Ivgi et al.,
+2022) and early stopping.
+A.2
+WikiSum scraping
+We rescraped the dataset, following the same pre-
+processing steps as the original authors. We ob-
+serve that many inputs in the scraped dataset are
+shorter than reported, likely due to changes in avail-
+ability of the data since 2017; as a preprocess-
+ing step, we remove all inputs that are less than
+1457 words, which is the 40th percentile of citation
+size for the original dataset. We trained on 10,000
+randomly selected examples from this version of
+WikiSum and evaluate on 2,000 randomly sam-
+pled examples (1,000 validation, 1,000 test), main-
+taining the same sample across all experiments.
+When sampling, we respect the original WikiSum
+train/validation/test split. We release the subset we
+trained on as well as our modiﬁed version of the
+scraping code.
+A.3
+Evaluation details
+Vanilla BERTScore is only well-deﬁned up to 512
+tokens; for GovReport and ScriptSumm, we eval-
+uate
+using
+facebook/bart-large-mnli
+instead.
+This model has context size 1024.
+For BookSum, we experimented with using
+allenai/longformer-large-4096 (con-
+text size 4096), as many references are longer
+than 1024 tokens; however, we found that this
+approach had no distinguishing power between
+model outputs, ranking all models tested within 0.3
+points of each other despite observing signiﬁcant
+differences with ROUGE, EntMent, and manual
+inspection.
+For the named entity recognition in EntMent, we
+used SpaCy’s en_core_web_lg model.
+A.4
+Computational Cost
+We estimate the total GPU time for results pre-
+sented in this paper did not exceed approximately
+116 days of time on a single 48-GB A6000. The
+longest-training models, SLED and kNN training
+for GovReport, took approximately 10 days to
+train.
+
+B
+Validation Results
+Table 7 shows the validation metrics for GovReport and SummScreen.
+Base model
+Training method
+ROUGE 1 / 2 / L / BERTScore
+GovReport
+SummScreen
+Low-cost training methods:
+BARTbase
+Standard ﬁnetuning
+47.7 / 18.5 / 22.3 / 64.0
+30.0 / 6.5 / 17.7 / 56.7
+BARTbase
++test SLED
+46.0 / 16.3 / 20.3 / 62.8
+28.4 / 5.9 / 17.0 / 56.0
+BARTbase
++test Unlimiformer
+49.5 / 19.6 / 21.9 / 64.8
+31.8 / 7.1 / 18.6 / 57.8
+BARTbase
++early stop w/ Unlimiformer
+51.0 / 20.6 / 21.6 / 65.9
+32.5 / 7.2 / 19.9 / 57.9
+BARTbase
+Train chunked
+48.3 / 18.1 / 22.3 / 63.8
+29.4 / 6.3 / 17.6 / 56.8
+BARTbase
++test Unlimiformer
+52.9 / 22.2 / 22.4 / 65.8
+29.4 / 6.3 / 17.6 / 56.8
+Long-range training methods:
+BARTbase
+SLED (Ivgi et al., 2022)
+55.5 / 24.8 / 25.8 / 66.9
+34.2 / 8.2 / 19.2 / 58.8
+BARTbase
+Memorizing Transformers
+55.8 / 25.6 / 26.9 / 67.7
+32.8 / 7.6 / 19.3 / 57.7
+BARTbase
+Unlimiformer
+57.4 / 26.4 / 27.9 / 68.2
+35.0 / 8.3 / 19.6 / 58.4
+Low-cost training methods:
+PRIMERA
+Standard ﬁnetuning
+55.0 / 23.6 / 25.9 / 66.9
+33.0 / 7.8 / 18.8 / 57.4
+PRIMERA
++test Unlimiformer
+56.4 / 24.7 / 26.4 / 67.6
+33.1 / 7.9 / 18.7 / 57.4
+PRIMERA
++early stop w/ Unlimiformer
+56.4 / 25.0 / 26.4 / 67.6
+33.5 / 8.2 / 19.3 / 57.7
+Long-range training methods:
+PRIMERA
+Memorizing transformers
+57.0 / 25.6 / 26.8 / 67.8
+32.9 / 7.7 / 18.5 / 57.5
+PRIMERA
+Unlimiformer
+58.0 / 26.5 / 28.6 / 68.3
+34.1 / 7.9 / 19.0 / 57.8
+Table 7: Validation results on long-document datasets (average input length between 4k to 16k tokens). The best
+metric in every dataset and every training category is marked in bold.
+
+C
+Sample Outputs
+These outputs from BookSum are summaries of The Brothers Karamazov, an elaborate novel about a
+Russian family. Neither summary is fully factually correct, but the summary from the input-truncated
+model hallucinates several plotlines (e.g. a lover from the Congo, the many deaths of Pavel) which are not
+present in the original. The hallucinations in the Unlimiformer output are more constrained; for instance,
+it incorrectly describes Dmitri as a “nobleman” instead of a landowner and says he has been sentenced to
+death instead of jail. This summary features more of the novel’s characters and identiﬁes plot details from
+the later parts of the book, such as Dmitri’s trial.
+Gold (reference) summary:
+The Brothers Karamazov is a family tragedy centered around a father and his sons. Fyodor, the
+eldest Karamazov, has three sons: Dmitri, Ivan, and Alyosha. Ivan and Alyosha have the same
+mother, but Dmitri, the oldest, has a different mother. Fyodor is a greedy landowner, a bawdy
+lecher, and a neglectful father. Hence, the Karamazov brothers end up growing into young men
+under the care of various other people. But they all have returned home to visit their father, and
+it is the ﬁrst time they all have been together for quite some time. Dmitri has a dispute with
+Fyodor over his inheritance, and Alyosha, who is living in a monastery, suggests that they see
+Father Zossima, Alyosha’s mentor. Alyosha believes that the wise old man can settle the dispute
+peacefully. Father Zossima is patient and kind, but Fyodor and Dmitri end up quarreling anyway.
+After Fyodor drives the men to frustration, they leave the monastery separately, and Alyosha
+worries about their family’s future. Alyosha talks to Dmitri, who confesses his complicated
+situation with women and money. Dmitri promised to marry a girl named Katerina, and she lent
+him 3,000 rubles. Instead of paying it back, he spent it on another girl named Grushenka. He
+wants to run away with Grushenka, but he feels that he needs to pay Katerina back before he
+can do so. This is why he is so interested in getting the money from Fyodor. Back at Fyodor’s
+house, Smerdyakov is talking to the Karamazovs. Smerdyakov is an epileptic servant who
+was adopted by Grigory and Marfa, Fyodor’s other servants. He was born to a woman named
+Lizaveta who died in childbirth. She was the town idiot, and she lived off charity from the
+other townspeople. Everyone called her "Stinking Lizaveta," and when the town found out
+she was pregnant, they were furious at whoever could do such a thing to a helpless girl. They
+decided Fyodor must have been the culprit. Grigory and Marfa gave birth to a deformed child,
+and when they buried the child, they found Lizaveta, who had just given birth to Smerdyakov.
+They adopted the child immediately, and Fyodor named him. Father Zossima is dying, and
+Alyosha is distraught. Instead of asking Alyosha to stay with him during his last days, however,
+Father Zossima tells Alyosha he should leave the monastery to be with his family. His life
+gets even more complicated when a young crippled girl named Lise expresses that she has
+feelings for him. Alyosha visits Katerina, the girl who is engaged to marry Dmitri. Ivan is in
+love with her, but he feels that Dmitri is a better match for her. Frustrated and disgusted with
+his family’s situation, Ivan says he is going to leave town. Alyosha sees a boy being picked
+on by his schoolmates, and he tries to talk to the boy, but he bites Alyosha’s hand and runs
+away. Later, when Alyosha is bringing money to a man named Captain Snegiryov, who has
+been beaten by Dmitri, he recognizes the man’s son. It is Ilusha, the boy who bit his hand. The
+family is poor, but Captain Snegiryov refuses to take the money because he feels that he needs
+to earn his son’s respect after being humiliated by Dmitri–and accepting charity, especially from
+a Karamazov, is out of the question. When Alyosha goes back to see Katerina, he ﬁnds Lise,
+Madame Hohlakov’s daughter. The two realize that they love each other, and they decide to get
+married. Alyosha goes to visit Ivan, and he ﬁnds him in a restaurant. Ivan has gone there to
+get away from his father, and Alyosha sits down with him to have an intimate talk. Ivan tells
+his brother about his thoughts regarding God and the world. He recites to Alyosha a poem he
+has written called "The Great Inquisitor." The poem describes Christ returning to earth in the
+sixteenth century. The Church throws him in jail, and The Great Inquisitor explains to him that
+his presence is problematic for the world. The Church has spent years trying to replace the sense
+
+of freedom Christ gave man with security. He talks about how cruel the world is, especially
+to innocent children. After their meal, Alyosha and Ivan part ways, feeling closer than ever.
+Ivan sees Smerdyakov when he goes back to his father’s house, and Smerdyakov tells him he
+is worried about Fyodor. He is worried Dmitri will come to kill him and the old man will be
+helpless to save himself. Ivan goes to sleep very troubled. Father Zossima is on his deathbed,
+and Alyosha goes to visit him. The Elder tells those around him how much Alyosha reminds
+him of his older brother, a boy who died when he was a youth. He talks about being a proﬂigate
+youth in the army. One day, he challenged another man to a duel because of a girl. Before the
+duel, however, he had a change of heart. He did not shoot and, after the duel, he retired from the
+army and joined a monastery. He talks about how much the Bible has affected him and says that
+everyone should embrace the world and the people in it. He dies. Many predicted that a miracle
+would happen upon Father Zossima’s death, but his body begins to putrefy, ﬁlling the monastery
+with an awful smell. This ﬁlls the other monks with doubt that Father Zossima was the saintly
+man they thought he was. Alyosha is shaken by the news. He goes to see Grushenka, who has
+sent for him, and she admits to wanting to "ruin" him. When he tells her that Father Zossima has
+died, however, she becomes contrite about her callousness. She says she thinks she is a wicked
+person, and the two comfort each other. When Alyosha leaves, he has a renewed faith in Father
+Zossima and his teachings because Alyosha feels how wonderful it is to love and be loved in
+return. Meanwhile, Dmitri has become desperate. He wants to be with Grushenka, but he wants
+to pay Katerina back ﬁrst. He goes on an odyssey, hoping that he can depend on the charity of
+others. He visits a man named Samsanov, a man who used to pursue Grushenka, and he hates
+Dmitri. He sends Karamazov to see a surly drunk, tricking Dmitri into thinking this man may be
+helpful. The man is practically incoherent, however, and Dmitri goes to ﬁnd Madame Hohlakov.
+She tells Dmitri that the only way he will ﬁnd 3,000 rubles is in the gold mines. In confusion,
+Dmitri concludes that Grushenka has gone to visit his father, and he goes to his father’s house in
+a rage, carrying a brass pestle. When he arrives, he does not ﬁnd Grushenka, but as he is leaving,
+Grigory, his father’s servant, thinks he has come to murder Fyodor. The two scufﬂe, and Dmitri
+hits Grigory on the head with the pestle. After determining that the man is not dead, Dmitri ﬂees
+the scene and looks for Grushenka. She is with Kalganov, a former lover who had treated her
+poorly. Dmitri decides that he will not end up with Grushenka and decides to kill himself after
+seeing her one more time. He crashes her party and sits down with her gentleman friend and
+some other men. The situation becomes tense, and after the gentlemen make some disparaging
+remarks about Russians and Dmitri, Grushenka decides she does not want to be with such an
+insulting and vicious man. She decides that she loves Dmitri, and as the two are coming to terms
+with their love, the police come to arrest him for the murder of Fyodor. As the police question
+Dmitri, it becomes clear that the facts all support the conclusion that he did indeed murder his
+father, even though he did not commit the crime. He was at the scene of the crime, wielding a
+weapon, the night of the murder. He had said he would kill his father on several occasions. He
+publicly announced he was looking for 3,000 rubles and was desperate to ﬁnd them, and Fyodor
+reportedly had an envelope with 3,000 rubles that was stolen the night of the murder. Dmitri is
+carried away, and very few people believe that he is innocent of Fyodor’s murder. Meanwhile,
+Alyosha is visiting Ilusha, the boy who bit his hand, in the hospital. The boy has fallen quite ill,
+and Alyosha has gotten to know many of the boy’s friends, who are also visiting him. One boy,
+Kolya Krassotkin, is a leader among the boys. He and Ilusha were friends, but they had a falling
+out because Ilusha fed a pin to a dog, and Kolya did not approve of his cruelty. When Alyosha
+comes to visit, he and Kolya talk for quite some time. The boy looks up to this wise man about
+which he has heard so much from the other boys, and he wants to impress him. The two become
+friends, and Alyosha treats all the boys as equals. When Kolya goes in to see Ilusha, he gives
+him a dog as a present. He reveals that the dog is none other but the dog Ilusha gave the piece
+of bread with a pin in it. Kolya has nursed the dog back to health and has fully trained him
+as a gesture of friendship to Ilusha. The mood is dampened, however, when the doctors go in
+
+to see Ilusha. Without even saying it, everyone understands that the boy does not have much
+time left. Ilusha is brave, and he tries to lift the spirits of those around him. Later, Alyosha
+visits his brother in jail. Dmitri tells Alyosha that Ivan has concocted a plan for his escape from
+jail. Alyosha goes to talk to Ivan, who feels strangely guilty about his father’s death. Alyosha
+tells his brother that he should not feel responsible for a crime that he did not commit, but Ivan
+stalks off angrily. He meets Smerdyakov, who tells Ivan he thinks the Karamazov brother is
+guilty as an accomplice to the murder. He says that Ivan wanted his father dead and left the
+night of the murder to try to free himself of the responsibility of protecting his father. Ivan is
+angry and troubled by this, and when he talks to Smerdyakov later, Smerdyakov ﬂatly admits
+to hilling Fyodor. He says that Ivan’s theories and ideas were the basis for his crime and that
+Ivan’s talks with Smerdyakov basically rationalized the deed. When Ivan returns home after
+this meeting, he sees a devil in his room. The devil chastises him for being a wicked person
+with weaknesses and foibles that have led to disastrous circumstances. Alyosha bangs on the
+door and ﬁnds his brother in a feverish state, muttering about a devil and Smerdyakov. Alyosha
+stays the night with his brother to take care of him. Dmitri’s trial begins. Many people from all
+around come to see the spectacle of the parricide trial. Dmitri has an excellent lawyer, but it is a
+hard case to win. The prosecution brings many witnesses who testify to seemingly damning
+evidence against Dmitri. The defense, however, discredits one after another of these witnesses,
+showing ulterior motives or mitigating circumstances. Alyosha defends his brother from the
+stand, and Katerina gives a moving account of Dmitri’s honorable nature. Then Ivan comes
+into the courtroom, waving money and implicating Smerdyakov. Since he is yelling nonsense,
+disrupting the trial, and generally acting crazy, the court does not believe him. Suddenly, at
+the end of the trial, Katerina stands up again, showing a letter from Dmitri that clearly states
+Dmitri’s intention to kill Fyodor as a last resort. She has a change of heart and no longer wants
+to lie to protect a man who has hurt her so much. Word comes to the courtoom that Smerdyakov
+has hanged himself. After ﬁnal statements are made, the verdict comes back: guilty. Dmitri
+is sentenced to jail. Dmitri welcomes this chance to become a new man, but he does not want
+to be in exile in Siberia for the rest of his life; he wants to return to his home country before
+he dies. Ivan is still sick, and Katerina takes care of him. Alyosha visits the boys with whom
+he has become friends. They are sad because Ilusha has died. Alyosha passes along Father
+Zossima’s teachings of love and understanding, and they all embrace his words, cheering him.
+BART (with input truncated to 1024) summary:
+Fyodor Pavlovitch Karamazov, a landowner in his own day, lives with his three sons, Adelaida
+Ivanovna and Alexey. He is the son of the landowner, Fyodor, and his wife, Adele, are the
+daughters of a wealthy nobleman in the district. Adele is the daughter of a nobleman, and
+her father, Ivanovitch, is a prominent ﬁgure in the town. She is a beautiful, intelligent, and
+intelligent young woman, who is destined to be a great writer. She has a great deal of ambition,
+and she is determined to achieve her goals. However, her ambition is short-lived. She falls in
+love with a handsome young man named Ivanovn, who has recently returned from a trip to the
+Congo. He has a lot of money, but he is also a poor man, and he has no means of earning it. In
+fact, he is a miserly beggar, and so he spends most of his time trying to earn money from the
+poor. He also has a wife, a beautiful young girl, who he marries, and a young son, Ivan, who
+lives with him. He and Adele have two children, Ivan and Aleksey, and they are very happy,
+but they have a problem: Ivan is a poor beggar who is unable to pay his rent, and Aleksandra
+is a beggar. Ivan is very ill, so he is forced to sell his estate to a rich man named Vladimir.
+Vladimir is a rich, well-to-do man who is also rich, but who is not well-liked by the people
+who live in the neighborhood. Vladimir’s wife, Evgeny, is also ill, and Vladimir’s son, Pavel, is
+very sick. Vladimir has a bad case of typhus fever, which causes him to lose his job and his
+money. Vladimir, Pavel’s younger brother, is sick, and Pavel is sent to the hospital to recover
+his father’s condition. Pavel is also sick and dies, and Ivan is left to care for him. The next day,
+Pavel and Adelayna are reunited with their father, who died in a typhus epidemic in the country.
+
+Pavel’s father, Vladimir, has died, and the family is now in mourning. Pavel has been unable to
+ﬁnd a new wife, so the family decides to send him to Moscow, where he will be reunited with
+his father. The family is devastated, but Pavel is able to ﬁnd an old friend, a young man who
+has just returned from the Congo, who will be able to help him. Pavel and Ivan are devastated
+by the loss of his father, but Ivan and Vladimir are able to make amends with Vladimir. Pavel,
+however, is devastated by this news, and, after a long period of mourning, he decides to return
+to Moscow. He returns to Moscow to ﬁnd his father dead, and to ﬁnd that his father has died.
+He then goes to Moscow and is buried in the city cemetery, where his father is buried. Pavel
+dies of a heart attack, and then he is buried with his mother. He was a young, beautiful, and
+beautiful woman who was raised by a kindly, kind, and generous family. He had a great time
+with his family, but his life was cut short when his father died. Pavel was left to live with his
+aunt and uncle in Moscow, and when he died, he was left alone with his uncle and his two sons.
+He died in Moscow and his mother, who had been living with him in a convent, died in the same
+convent. Pavel had been a poor, poor, and ill-treated man, but now he was able to raise his son
+and raise his own son. Pavel survived, and now he lives in Moscow with his Aunt and Uncle.
+He lives with their aunt and Uncle, who are very poor and poor. They live in a small house in
+the countryside, and their children are raised by their uncle and aunt. They have a great love for
+each other, but their love for one another is not reciprocated. Pavel also dies in the convent, and
+after a brief illness, Pavel is left with a broken heart. He dies in Moscow. His father, a wealthy
+man, is the father of his son, who was also a clergyman. Pavel died of a stroke in the hospital,
+and was buried in a nearby cemetery. He left Pavel and his family behind. Pavel tried to help
+Pavel, but was unable to save him, so Pavel was forced to leave Moscow. Pavel returned to
+Moscow in the middle of the night. He tried to save Pavel’s life, but it was too late for Pavel.
+Pavel managed to escape, and in the end, Pavel was killed by a bullet. Pavel took Pavel’s body
+and died of his own wounds. Pavel left Pavel to die in the forest. Pavel stayed with the family
+for a few years, until he died of an illness. Pavel became ill and Pavel was sent to
+Unlimiformer summary:
+The ﬁrst part of the novel focuses on the question of whether or not the Russian nobleman,
+Dmitri Fyodorovitch, has killed his father. In the town of Ivanovna, the lieutenant-colonel of
+the Mushenkhanovitch is accused of the murder of his brother Ivanovitch. The lieutenant-in-
+command, Vasilyevitch, takes the form of a dog, and the two men–the two men and the woman
+who are questioned by the court-martial–murphy. The two men cry out to the God of Russia for
+help in their quest to save the town. The man, afraid of the wrath of the God, hands the dog a
+bunch of letters that are supposed to be proof of his love for his brother. The old man–the one
+who had killed his mother, and then found the letter–arrives. He reads it–asked the old man
+to forgive him for the murder and then takes the dog away. The other men, all of whom are
+prisoners, demand that the man confess his crime to the court. The ﬁrst and most important
+thing they tell the court is that they love the man. The court acquits the man and sentences the
+man to death. The second man–an old ofﬁcer of the town, Alekandrovitch–askes to tell them
+the same thing. The third man–in the process of confessing his crime–is Vashenka, a drunk
+man who has been sent to the town to kill his father, for reasons which are not entirely clear
+to the people. The woman’s servant, Evgenyevna, is also the one who has told the court the
+story of the Medvedevitch’s murder, for the good old man’s and the young man’s love. The
+three men, who are separated for the ﬁrst time, are laughing at the man’s attempt to seduce
+Mitya. The young man, in the meantime, is conscripted into the town-side. He tells the court
+that he loves her, but he has yet to tell her the true story. The men, in this room, demand a
+man to kill her, and she will not betray them. The women, in their own country, are rebelling
+against the man who had sent them three thousand roubles, and they will not allow the man of
+the people to see them. They will not let the man in the town be allowed to see the man–or
+Dmitriovitch; he will have her husband killed him. He will not tell the people who love him.
+The next man, named Vashenovitch, arrives, and takes the man away. They all begin to laugh at
+
+the fact that he has succeeded in seducing and entrusting his brother Dmitri. He is then taken
+away to the old woman’s house, where the governor-side-of-the-world, and his sister, Arkadin,
+is being punished. The priestesses and the baron are shocked, for they have been so virtuous and
+well-suited. The only thing they will be able to do is kill the priest. They threaten to burn the
+priestess to death, for she has been so wicked and libidinous that she has not yet seen the priest,
+for her husband. The priests–ostensibly convinced that she is a woman who loves the priest and
+has been punished for her love and for allowing the priest to marry her. The last man, Yakivitch,
+arrives at the house, and, after a long day of drinking and then some of the men–is killed. He
+and the priest are ordered to leave the town so that the priest can ﬁnally be reunited with the
+people of the old lady. The ﬁnal man, the commander of the St. Petersburg town of Arkadina, is
+sentenced to death for the crime of having killed and then the lieutenant of the governor, for
+taking the money. The commander, the former lieutenant-delegation of the People’s Army, is
+summarily executed, and all the men, except for the commander, have been summarily punished
+for their crime. The entire town is shocked and, in a very dramatic way, the priestesses plead for
+the forgiveness of the man, for allowing them to kill and imprison Ivan. They plead for their
+brother to be restored as well, for all the people they have loved, and for the priestor to tell the
+story.
+

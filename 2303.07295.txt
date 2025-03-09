@@ -1,0 +1,1652 @@
+Meet in the Middle: A New Pre-training Paradigm
+Anh Nguyen∗
+Nikos Karampatziakis∗
+Weizhu Chen
+Microsoft Azure AI
+March 14, 2023
+Abstract
+Most language models (LMs) are trained and applied in an autoregres-
+sive left-to-right fashion, assuming that the next token only depends on the
+preceding ones. However, this assumption ignores the potential beneﬁts
+of using the full sequence information during training, and the possibility
+of having context from both sides during inference. In this paper, we
+propose a new pre-training paradigm with techniques that jointly improve
+the training data eﬃciency and the capabilities of the LMs in the inﬁlling
+task. The ﬁrst is a training objective that aligns the predictions of a
+left-to-right LM with those of a right-to-left LM, trained on the same data
+but in reverse order. The second is a bidirectional inference procedure that
+enables both LMs to meet in the middle. We show the eﬀectiveness of our
+pre-training paradigm with extensive experiments on both programming
+and natural language models, outperforming strong baselines. 1
+1
+Introduction
+2
+2
+Preliminaries
+4
+2.1
+The Inﬁlling task . . . . . . . . . . . . . . . . . . . . . . . . . . .
+4
+2.2
+Bidirectional Language Modeling . . . . . . . . . . . . . . . . . .
+5
+3
+Meet in the Middle
+5
+3.1
+Pre-training . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+5
+3.2
+Inﬁlling
+. . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+6
+3.2.1
+Inference
+. . . . . . . . . . . . . . . . . . . . . . . . . . .
+6
+3.2.2
+Optional Enhancements . . . . . . . . . . . . . . . . . . .
+9
+∗Equal Contribution
+1Code and models available at https://github.com/microsoft/Meet-in-the-Middle
+1
+arXiv:2303.07295v1  [cs.CL]  13 Mar 2023
+
+4
+Experiments
+10
+4.1
+Data and Models . . . . . . . . . . . . . . . . . . . . . . . . . . .
+10
+4.2
+Benchmarks and metrics . . . . . . . . . . . . . . . . . . . . . . .
+11
+4.2.1
+Code generation and inﬁlling . . . . . . . . . . . . . . . .
+11
+4.2.2
+Language Modeling
+. . . . . . . . . . . . . . . . . . . . .
+11
+4.3
+Main results . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+12
+4.3.1
+Code generation and inﬁlling . . . . . . . . . . . . . . . .
+12
+4.3.2
+Language Modeling
+. . . . . . . . . . . . . . . . . . . . .
+13
+4.4
+Ablation Study . . . . . . . . . . . . . . . . . . . . . . . . . . . .
+13
+4.4.1
+Eﬀect of Optional Enhancements . . . . . . . . . . . . . .
+13
+4.4.2
+Eﬀect of Agreement Regularizer
+. . . . . . . . . . . . . .
+14
+4.5
+Eﬃciency of Inference
+. . . . . . . . . . . . . . . . . . . . . . . .
+14
+5
+Related work
+15
+6
+Conclusion
+18
+A Appendix
+23
+A.1 Model training details . . . . . . . . . . . . . . . . . . . . . . . .
+23
+A.2 Programming language dataset details . . . . . . . . . . . . . . .
+23
+1
+Introduction
+Language models (LMs) are powerful tools for generating natural and program-
+ming language, and have been widely used for various assisted authoring tasks,
+such as text summarization, code completion, and paraphrasing. In order to be
+usable in many diﬀerent applications, most LMs have to be able to generate the
+next token from the sequence of previous tokens. Given the importance of this
+operation, pre-training has focused on optimizing the model’s ability to predict
+the next token given the previous tokens, as measured by perplexity. However,
+at pre-training time we have additional information that we are not utilizing. In
+particular, when training the model to predict one token we condition on the
+previous tokens (preﬁx) but completely ignore the subsequent tokens (suﬃx).
+While the suﬃx cannot be used as an input to the model, there are other ways to
+incorporate it into pre-training which have not received attention in the literature.
+Our goal is to utilize the pre-training data more eﬃciently while preserving the
+autoregressive nature of the underlying LM.
+The approach we advocate involves additional modeling which at ﬁrst blush
+may seem wasteful. After all, the main artifact produced during pre-training is
+an autoregressive left-to-right LM and the pre-training objective closely matches
+how the LM is applied. Still, there are two reasons to consider alternative
+training objectives. The ﬁrst is about data eﬃciency. The LM is trained by a
+cheap-to-obtain but rather sparse signal: it produces a probability distribution
+over all possible choices for the next token yet it is only supervised by the
+actual next token in the training data. What if during training we provided a
+2
+
+denser form of supervision, where the probability distribution over next tokens
+is compared with another probability distribution?
+The second reason has to do with other related tasks. In particular, in many
+real-world scenarios, the user may not want to generate text from scratch, but to
+rather inﬁll or modify an existing sequence of tokens. For example, a programmer
+may want to add a new argument to a function, or a writer may want to insert a
+sentence or a phrase to improve the coherence of a paragraph. In these cases, a
+left-to-right LM cannot use the context from both sides of the insertion position,
+and may produce suboptimal results. The additional modeling we do during
+training will also help us develop a state-of-the-art inﬁlling technique.
+In this work, we propose a uniﬁed pre-training and inference paradigm that we
+call “Meet in the Middle” (MIM) to tackle both pre-training as well as inﬁlling.
+MIM leverages two main ideas. The ﬁrst idea is to introduce an additional
+language model that processes tokens right-to-left and use the two models to
+co-regularize each other.
+This allows each LM to beneﬁt from the context
+provided by the other LM, which improves data eﬃciency and consistency. Here
+the models “meet in the middle” metaphorically in the sense of adjusting their
+output probabilities to agree with the other side. The second idea is a simple
+and eﬀective inference procedure for inﬁlling that takes advantage of all the
+artifacts produced during pre-training: both language models, as well as their
+tendency to agree. In this case, the two models will be building the completion
+each from their own side until they literally “meet in the middle”. Our agreement
+regularizer has two important beneﬁts: it regularizes the two language models
+and makes them more consistent, and it helps us stop the generation process
+early in the inﬁlling task, by detecting when the two models converge to the
+same token.
+In other words, to train MIM, we use two decoding ﬂows under a single
+shared decoder-only architecture [BMR+20], [CND+22]. The two LMs generate
+tokens in opposite directions. The forward direction predicts the next token
+given the preﬁx and the tokens it generates. The backward direction predicts
+the previous token given the suﬃx and the tokens it generates. We pre-train the
+two models jointly on a large corpus of text, using a combination of the standard
+language modeling loss and the agreement regularizer. Once, pre-training is
+complete, the forward model is a drop-in replacement for existing autoregressive
+LMs. The backward model can either be discarded or be used for related tasks
+such as inﬁlling.
+In our experiments, we aim to evaluate the eﬀectiveness of MIM for pre-
+training LMs on diﬀerent domains and tasks. We use public code and language
+data to pre-train LMs of diﬀerent sizes and measure their performance in terms
+of perplexity and code completion tasks. We compare MIM with FIM [BJT+22]
+and other baselines, and show that MIM outperforms them in terms of both
+perplexity as well as task-speciﬁc evaluation metrics. We also conduct ablation
+studies to show the eﬀectiveness of our main proposals during training and
+inference. To summarize, our main contributions are:
+• We introduce a new pre-training paradigm for LMs that uses the training
+3
+
+data more eﬃciently by leveraging both the preﬁx and the suﬃx while
+still maintaining the autoregressive nature of LMs. We do this by training
+both a forward and a backward model and encourage them to agree.
+• Propose a simple and eﬃcient inference procedure for the inﬁlling task,
+that takes advantage of context from both sides and the tendency of the
+forward and backward models to agree. Our procedure can use parallelism
+more eﬀectively than existing inﬁlling procedures and on average achieves
+better quality and latency than the state of the art.
+• Pre-train language models of diﬀerent sizes on public code and language
+data using MIM, evaluate them both with human and programming lan-
+guages, and show that MIM outperforms many baselines in terms of
+standard evaluation metrics. Finally, some models and code are made
+publicly available.
+2
+Preliminaries
+We introduce some notation here we use throughout the paper. For a sequence
+of tokens x1, x2, . . . , xN we denote x<i the preﬁx x1, x2, . . . xi−1. We use x>i for
+the suﬃx xi+1, xi+2, . . . xN. The deﬁnitions for x≤i and x≥i are analogous. To
+reduce notation clutter, we are suppressing all dependence of models on learnable
+parameters and when it is clear from context we even suppress the inputs to
+the models. We will use arrows to distinguish the two models and their outputs.
+For example, −→p is the forward model and ←−p is the backward model. Similarly,
+−→
+H will be a hidden representation from the forward model while ←−
+H will be the
+corresponding representation from the backward model.
+2.1
+The Inﬁlling task
+In the inﬁlling task we are given a sequence of tokens x1, x2, . . . , xN, an insertion
+position i and a length M. The task is to generate a plausible (according to a
+LM) sequence of M tokens y1, . . . , yM to ﬁll the gap between x≤i and x≥i+1. In
+real world applications, M is unknown. We consider it as an additional input to
+avoid convoluted arguments about what constitutes a good inﬁlling when M is
+unknown. Given an autoregressive LM p(xt|x1, . . . , xt−1), a preﬁx x≤i, a suﬃx
+x≥i+1, and a length M, the task of ﬁnding the sequence y1, . . . , yM, among all
+M token sequences, that maximizes this probability requires time exponential in
+M. This is because a left-to-right LM cannot account for any disﬂuency that
+may occur between tokens yM and xi+1.
+A simple technique for inﬁlling that allows a LM to use context from both
+sides is called “Fill in the Middle” (FIM). [BJT+22]. In FIM, the context for the
+LM is formed by concatenating the suﬃx and the preﬁx, in that order, to ensure
+coherence near the position where a completion is desired. The advantages of the
+FIM approach are ﬁrst, it can be applied to any pre-trained LM with very little
+modiﬁcation, and second, it is computationally eﬃcient, as it only requires one
+4
+
+forward pass of the LM. However, the FIM approach also has some drawbacks
+namely the contexts are unnatural concatenations of tokens. Furthermore, FIM
+cannot properly balance the inﬂuence of the preﬁx and the suﬃx, as the LM
+generation is typically biased towards the last few tokens of the context. With
+FIM we either have to move the suﬃx far from the point where the completion
+is requested, or (worse) move the preﬁx far from the completion. Moreover, the
+FIM training procedure is itself ad-hoc as the documents are arbitrarily split
+into preﬁx, middle, and suﬃx, and the model is trained to predict the middle
+from the concatenation of suﬃx and preﬁx. The problem here is that during
+pre-training the model only sees one (or few) of the O(N 2) possible (preﬁx,
+middle, suﬃx) splits in a document with N tokens.
+2.2
+Bidirectional Language Modeling
+Bidirectional language modeling has been mainly used in the literature to train
+non-autoregressive LMs using training objectives such as Masked Language
+Modeling. Empirically, these non-autoregressive models seem to produce better
+representations than autoregressive LMs but have other disadvantages such as
+the diﬃculty to perform in-context learning [PLR+22].
+The ﬁrst diﬀerence between our use of bidirectional modeling and the rest
+of the bidirectional modeling research is that our model remains autoregressive.
+The future tokens are only used to regularize the model and are not necessary
+for inference. The second diﬀerence is that we do not attempt to produce a
+single probability for every token. Instead there are always two probabilities,
+one computed from the past tokens (preﬁx) and one computed from the future
+tokens (suﬃx).
+3
+Meet in the Middle
+We now describe the details of our proposed solution ﬁrst for pre-training and
+then for inﬁlling. Intuitively, during pre-training we train two models that need
+to balance two goals: The ﬁrst is that the models need to independently predict
+their next token well each using a diﬀerent view of the input (preﬁx vs. suﬃx).
+The second is that the probability distributions assigned to the next token from
+each model need to agree. This gives each model a glimpse of its future and
+provides a more dense supervision signal than simply the prediction of the next
+token. Thus for pre-training we encourage the two models to “meet in the middle”
+in the sense of reaching a compromise between what is predicted from the preﬁx
+and what is predicted from the suﬃx.
+3.1
+Pre-training
+We use two decoder-only language models that share all of their parameters,
+and we train both a forward model −→p and a backward model ←−p . The forward
+model −→p is trained to predict next tokens in the forward direction x1, x2, . . . and
+5
+
+the backward model ←−p is trained to predict previous tokens in the backward
+direction xN, xN−1, . . .. In other words, −→p is trained to maximize the likelihood
+of xt given x1, x2, . . . , xt−1 and ←−p is trained to maximize the likelihood of xt
+given xN, xN−1, . . . , xt+1.
+To improve data eﬃciency during training we employ a natural co-regularization
+term that encourages −→p and ←−p to agree on their predicted probability distribu-
+tion over the vocabulary for each token. Many choices are possible here, such as
+diﬀerent f-divergences or even more stringent measures of agreement such as
+the Euclidean distance between the contextualized representations of the same
+token according to the two models. We do not explore these choices here and
+leave them for future work. For our purposes, we used the simple total variation
+distance to capture the disagreements among the two models on the i-th token:
+DT V
+i,x (−→p ||←−p ) = 1
+2
+X
+z∈V
+|−→p (z|x<i) −←−p (z|x>i)|
+where V is the vocabulary.
+The agreement regularizer is the sum of these
+distances over all sentences and tokens. The beneﬁt of this regularizer is two-fold.
+First, it can provide the models with a denser supervision signal which improves
+data eﬃciency and helps us train a better autoregressive LM. The reason we say
+it is a dense supervision signal is because the probabilities of all tokens from one
+side are compared with the probabilities of all tokens from the other side. In
+contrast the traditional language modeling objective only assesses the probability
+of the token that is actually observed. The second beneﬁt of the agreement
+regularizer is that it encourages the models to agree on their predictions. As we
+will argue later, this degree of agreement aﬀects the eﬃciency of our inference
+technique in the inﬁlling task.
+To sum up, for a dataset S of sequences, the full training loss is
+X
+x∈S
+|x|
+X
+i=1
+−log (−→p (xi|x<i)) −log (←−p (xi|x>i)) + βDT V
+i,x (−→p ||←−p ).
+(1)
+The hyperparameter β is set to 0.1 in our experiments (except for ablation
+studies where β = 0). Once pre-training is done, we can directly use −→p as a
+left-to-right autoregressive LM.
+3.2
+Inﬁlling
+We now turn our attention to the inﬁlling problem and describe how our inference
+procedure works. Afterwards, we will discuss some optional modiﬁcations to the
+model architecture and training that could be used if we are only interested in
+inﬁlling and do not need −→p to be a drop-in replacement for existing autoregressive
+LMs.
+3.2.1
+Inference
+At inference time, our goal is to have an eﬃcient and low-latency generation
+procedure. At a conceptual level, a naive procedure could work as follows: First
+6
+
+The
+quick
+dog
+brown
+fox
+jumped over
+jumps
+over
+the
+lazy
+✓
+Preﬁx
+Suﬃx
+−→p (xt)
+←−p (xt)
+MIM
+Veriﬁcation
+✓
+0
+0
+0
+1
+1
+2
+2
+3
+3
+4
+4
+5
+5
+Figure 1: Inference procedure for inﬁlling. Given the preﬁx “The quick” and the
+suﬃx “dog”, the models −→p and ←−p generate tokens until a candidate meet-in-the-
+middle token is detected (shaded area). We use a single token for illustration
+purposes, although the method can use more tokens. Given the candidate MIM
+token, the −→p (respectively ←−p ) model can in parallel verify that the tokens
+generated by ←−p (resp. −→p ) are acceptable completions (only the −→p veriﬁcation
+is shown to reduce clutter). The numbers in the top right of each box show
+the order of operations. Two boxes with the same number can be executed in
+parallel. Similarly, thick lines show that information (embeddings, tokens) can
+ﬂow in parallel, while thin lines denote sequential steps.
+generate candidates from both models. As mentioned earlier, M the length of
+the desired inﬁlling is unknown in many applications. So in practice we would
+generate from the two models until each meets a condition (e.g. an application
+speciﬁc token, such as the newline or the EOS token is generated). If −→p generates
+−→y 1, −→y 2, . . . , −→y F and ←−p generates ←−y 1, ←−y 2, . . . , ←−y B then we would need to ﬁnd
+the best stitching −→y 1, . . . , −→y i, ←−y j, . . . ←−y B among all (i, j) pairs 1 ≤i ≤F,
+1 ≤j ≤B. However, this can be time-consuming as we would need to examine
+and assign a score to all F × B possible stitchings.
+Instead we propose a simpliﬁed procedure that interleaves generation and
+scoring and can terminate as quickly as a unidirectional LM. Moreover, with
+enough parallelism, it can even be faster. This approach is shown in Figure 1.
+At a high level, the two models start building a completion each from their own
+side and they try to literally meet in the middle.
+The steps of our approach are as follows. Initially, the preﬁx and suﬃx
+are consumed by −→p and ←−p respectively.
+Then −→p and ←−p generate tokens
+synchronously one at a time. For each generated token from −→p we check whether
+it is in the generated tokens from ←−p (or the ﬁrst token of the suﬃx). Likewise,
+for each generated token from ←−p we check whether it is in the generated tokens
+from −→p (or the last token of the preﬁx). If there is a match, we have a “meet in
+the middle” candidate position for joining the two generated sequences.
+7
+
+In the most optimistic scenario, −→p and ←−p produce the same sequence (←−p
+produces it in reverse order). In that case we will detect that we can join the
+two generated sequences after each model has generated half of the tokens. Thus
+the two models have “met in the middle”. The importance of the agreement
+regularizer should now be more clear: if −→p and ←−p produce completely diﬀerent
+sequences, then our method is slower than FIM as it has no chance to terminate
+the generation early. But if the two models completely agree (and we have
+enough parallelism) it can even beat FIM in terms of generation latency as
+each model only needs to autoregressively generate half of the completion (while
+the other half is generated in parallel). As we will see in the experiments, our
+method achieves lower latency than FIM which suggests that in most cases the
+two generated sequences meet somewhere near the middle.
+Admittedly, the above procedure can suﬀer from false positives: just because
+one side generated “the” and the other side had generated “the” it does not
+necessarily mean that joining the two generated sequences at that position would
+produce a coherent inﬁlling. To reduce false positives we use n-grams instead
+of a single token. In all of the inﬁlling experiments, we use 4-gram matching.
+Finally, to be conﬁdent that the resulting sequence could have been generated
+by running −→p or ←−p until the end, we run a parallel veriﬁcation procedure which
+we describe next.
+Our parallel veriﬁcation procedure is adapted from [GXS+22] where they
+used it in the context of certain tasks with special structure. Fortunately, our
+setup is the ideal place to apply their techniques. To make things more concrete,
+let’s assume that the latest token generated from −→p matches with a token in
+position s generated from ←−p , as is the case in Figure 1 for the token “over”.
+Then we can use the tokens that were generated by ←−p before s as inputs to −→p in
+parallel. In the context of Figure 1 we provide the tokens “over”, “the”, “lazy” as
+inputs to −→p in parallel. If each output of −→p matches the corresponding input, we
+have veriﬁed that −→p would have autoregressively generated the tokens it copied
+from ←−p ’s output. Grounding the discussion back to Figure 1, if −→p generates (in
+parallel) “the” and “lazy” we have veriﬁed that −→p would have autoregressively
+generated the same tokens. If there is a partial match we can fast-forward the
+generation from −→p to the point of the ﬁrst disagreement. If there is no partial
+match we can return to autoregressive generation from −→p and ←−p . So far, we
+have described veriﬁcation as performing greedy top-1 sampling and checking
+whether the output from one position is the input we provided into the next
+position. While this closely matches our parallel veriﬁcation implementation,
+more relaxed acceptance criteria could be adopted such as the provided candidate
+token having a high enough probability in the previous output. If the generations
+from −→p and ←−p terminate without meeting or passing veriﬁcation, we return the
+sequence with higher probability according to the model that generated it.
+To sum up, we generate by running both the forward and backward direction
+in parallel, and after each step check whether there is a candidate meeting point
+where the two generated sequences are likely to be compatible. If so, we then
+apply a parallel veriﬁcation procedure [SSU18], [GXS+22] to the joined sequence
+and decide whether we should stop the generation process early. With this
+8
+
+technique, “Meet in the Middle” (MIM) can produce high-quality outputs with
+better latency than FIM.
+3.2.2
+Optional Enhancements
+To improve the inﬁlling performance of our models, we can trade oﬀtheir
+compatibility with autoregressive LMs and adopt a more powerful attention
+mechanism that allows bidirectional conditioning during generation. To do so,
+we switch the regular attention layer to a Synchronous Bidirectional Attention
+[ZZZ19] layer which has recently shown promising results in Neural Machine
+Translation. This layer couples the forward and backward models together and
+allows the generation of one direction to condition on context and previously
+generated tokens from the opposite direction (in addition to its own context and
+previously generated tokens).
+More concretely the Synchronous Bidirectional Attention [ZZZ19] layer mod-
+iﬁes the regular attention layer activations in the following way: Let −→
+H be the
+output of an attention layer in −→p and ←−
+H the corresponding layer in ←−p . Then
+for a hyperparameter λ we deﬁne the fused attention hidden representation as
+−→
+H f = −→
+H + λ←−
+H and ←−
+H f = ←−
+H + λ−→
+H.
+The models −→p and ←−p then use −→
+H f and ←−
+H f in place of −→
+H and ←−
+H. When λ = 0,
+−→p and ←−p are decoupled and reduce to classic autoregressive transformers.
+With this modiﬁed architecture, care must be exercised during training.
+Recall that the LMs are trained with teacher forcing which means that during
+training the prediction for each token is conditioned on the previous ground truth
+tokens rather than the previously generated tokens. Therefore, it is possible for
+the Synchronous Bidirectional Attention layer to leak information from the other
+direction during training. This could cause the LMs to simply learn to copy
+ground truth tokens from the other side. To prevent this we make the training
+procedure somewhat closer to how inference is performed. Similar to [ZZZ19],
+we employ a two stage process: In the ﬁrst stage we do not update the model
+parameters and simply use λ = 0 to generate candidates −→z , ←−z from −→p and ←−p
+respectively. We denote the candidates produced up to the i −1-th step of the
+ﬁrst stage as −→z <i and ←−z <i. In the second stage we use the actual λ > 0 and
+condition the probability of xi according to −→p on both x<i and ←−z <i. Similarly
+for ←−p we condition the probability of x|x|−i on both x>|x|−i and −→z <i, where
+|x| is the length of sequence x. Training is only done for the second stage. For
+the gradient computations, we treat −→z and ←−z as constants even though they do
+depend on the current model parameters.
+As we will show, the modiﬁcations suggested here further improve inﬁlling
+metrics but come at the cost of incompatibility with existing autoregressive LMs.
+Therefore we consider them optional and application dependent.
+9
+
+4
+Experiments
+This section presents the pre-training experiments, evaluation setup, main results
+and ablation studies for our models.
+4.1
+Data and Models
+We ﬁrst pre-train our models on a large and diverse corpus of public code with
+permissive licenses, which covers multiple programming languages. Python, Java,
+C++ are the dominant languages in our corpus, accounting for most of the
+pre-training data. After ﬁltering and deduplication, our corpus contains about
+300 billion tokens. Table 7 shows the detailed statistics of our pre-training data.
+We pre-train our models with a single pass over the data, processing about 300B
+tokens in total. This is about six times larger than the pre-training dataset used
+in the original Incoder model trained on 50B tokens including code and Stack
+Overﬂow data [FAL+22].
+Apart from pre-training our model on public code datasets, we also pre-
+train our model on natural language, speciﬁcally the union of the following
+datasets: CC-News, OpenWebText, CC-Stories and CC-100 with the
+following details.
+• CC-News contains 63 million English news articles crawled between
+September 2016 and February 2019 (76GB).
+• OpenWebText is an open source recreation of the WebText dataset used
+to train GPT-2 (38GB).
+• CC-Stories contains a subset of CommonCrawl data ﬁltered to match
+the story-like style of Winograd schemas (31GB).
+• CC-100 is a dataset extracted from CommonCrawl snapshots between
+January 2018 and December 2018, ﬁltered to match the style of Wikipedia
+(292GB)
+The ﬁrst three of them are used to pre-train Roberta models [LOG+19] and
+the rest is the English subset of CC-100 dataset, which in total contains 112B
+tokens.
+We adopt a decoder-only transformer language model [VSP+17, BMR+20]
+and train it to predict the next token in both directions, i.e., the same model and
+parameters are used for left-to-right and right-to-left prediction. To investigate
+the eﬀect of model size, we pre-train models with three diﬀerent capacities:
+350M, 1.3B and 2.7B parameters. The hyperparameters and training setup for
+each model size are provided in the Appendix.
+As baselines, following [BJT+22], we pre-train three FIM models with context-
+level FIM, apply transformations at the character level, use a FIM-rate of 0.5 and
+SPM+PSM joint training. Both the MIM and the FIM models are pre-trained
+using Megatron-LM framework [SPP+19]. The model conﬁgurations for these
+variants as well as architectural details can be found in the Appendix.
+10
+
+4.2
+Benchmarks and metrics
+4.2.1
+Code generation and inﬁlling
+We evaluate MIM in two diﬀerent settings: Autoregressive left-to-right generation
+and inﬁlling, and use diﬀerent benchmarks and metrics for each setting.
+To evaluate the autoregressive generation task, where the model needs to
+generate the code body given the function signature, docstring, and test cases,
+we use three widely used datasets of Python programming problems and one
+dataset containing multiple programming languages: HumanEval [CTJ+21],
+which contains hand-crafted problems and solutions; MBPP [AON+21], which
+consists of problems and solutions collected from crowd workers with a cleaned
+version that removes duplicates and errors; and APPS [HBK+21], which has
+problems and solutions scraped from online coding platforms with varying
+diﬃculty levels. For the experiments with multiple programming languages,
+we use the HumanEval-X dataset, a multilingual benchmark that contains
+820 human-crafted coding problems in 5 programming languages, each of these
+problems is associated with tests and solutions. In this task, we only use the
+left-to-right model for inference, as there is no given suﬃx for the problems.
+For the inﬁlling task, where the model needs to ﬁll in the blank lines in an
+incomplete program, we use two recently proposed datasets that are designed for
+this scenario: HumanEval Inﬁlling [BJT+22] and MBXP [AGW+22]. This
+task mimics the common use cases of code completion tools like GitHub Copilot
+and document editors. Since these datasets provide suﬃxes and not all models
+can handle them properly, we compare MIM with Incoder, three variants of FIM,
+and code-davinci-002.
+As for the metrics, we use the pass@k metrics [CTJ+21], which measure
+the percentage of times that the generated code passes all the test cases within
+the top-k candidates. Speciﬁcally, we report pass@1, pass@10, and pass@100,
+and compute them using the unbiased estimator described in [CTJ+21]. For
+generation, we use top-p sampling with p = 0.95 and diﬀerent temperatures:
+0.2 for pass@1 and 0.8 for pass@10 and pass@100. Additionally, we report the
+single-line exact match (EM) metrics, which indicate the percentage of times
+that the completed lines exactly match the masked lines in the reference solution,
+as introduced in [FAL+22] and adopted in [BJT+22].
+4.2.2
+Language Modeling
+Apart from experiments on code generation and inﬁlling, we also evaluate our
+models in the language modeling tasks to test the ability of our model to predict
+next token in a sequence measured by perplexity.
+We evaluate and report perplexity in both in-domain and out-of-domain
+settings. For the in-domain setting, we sample a held-out subset of the com-
+bined training data. For the out-of-domain setting, we used the Pile dataset
+[GBB+21], a public language modeling dataset that combines data from various
+domains. We report the average perplexity across all subsets of the Pile dataset
+for our baselines and models.
+11
+
+4.3
+Main results
+4.3.1
+Code generation and inﬁlling
+First, we present the results of our FIM model, pre-trained from scratch, in Table
+1, along with various baselines from the literature. Our FIM implementation
+signiﬁcantly outperforms the Incoder models [BJT+22], on all metrics and
+datasets. For instance, our 2.7B model achieves 28.5% pass@1 in HumanEval,
+while their 6.7B model only reaches 15.2%. This impressive performance of our
+FIM model is attributed to several factors, such as the larger and better-ﬁltered
+training data, and the implementation details we provide in the Appendix. Our
+FIM-2.7B model also surpasses other strong baselines, such as Codex 2.5B
+and CodeGen-Multi-6.1B, by a large margin. For example, FIM-2.7B attains
+67.8% in pass@100, compared to 44.9% and 59.5% of CodeGen-Multi-6.1B and
+Codex-2.5B, respectively. These results clearly establish that our FIM models
+are very competitive baselines. Therefore, in the following sections, we will focus
+on comparing MIM with our FIM baselines directly to highlight the beneﬁts of
+"Meet-in-the-Middle".
+Second, we evaluate MIM’s autoregressive left-to-right generation in a preﬁx-
+only setting (no suﬃx). We compare FIM with MIM on both the HumanEval
+and MBPP benchmarks in Table 1. Both of them have three diﬀerent model
+sizes: 350M, 1.3B, and 2.7B. It is evident that MIM consistently outperforms
+FIM across all the metrics in both datasets. For example, the MIM-2.7B model
+boosts the HumanEval pass@1 to 30.7%, surpassing the FIM-2.7B by 2.2%
+(30.7% vs. 28.5%). The improvement on MBPP is similar, in terms of pass@1,
+4.0% (42.2% vs. 38.2%) on the 2.7B model and 0.9% (26.8% vs. 25.9%) on the
+1.3B model. We note that the improvements increase with the model size. This
+is evidence that the larger models beneﬁt more from the agreement regularizer.
+We further evaluate this setting on the APPS dataset, which has three diﬀerent
+diﬃculty levels. We report the results in Table 3. The trend and improvement
+are similar to the other two datasets, in which MIM consistently outperforms
+FIM across all the metrics and diﬃculty levels. In the multilingual setting, we
+compare MIM with FIM baselines in the HumanEval-X dataset. We observe
+consistent improvement across all metrics and all the programming languages
+that we evaluated on. Results are reported in Table 2.
+These results clearly demonstrate the advantage of MIM over FIM in the
+setting of left-to-right autoregressive generation. The main claim in [BJT+22]
+is that FIM does not harm the original left-to-right generative capability and
+can be learned for free. We argue that MIM is not only free, but also better
+in this setting. In other words, MIM pre-training which receives a more dense
+supervision from the agreement regularizer leads to a high quality left-to-right
+generative model and should become a new pre-training paradigm.
+Lastly, we evaluate MIM in the inﬁlling setting, which is the setting that
+inspired us to design the MIM approach at the beginning. This is because in
+real-world applications, such as Copilot, we observe that the majority of usage is
+in developers jumping to the middle of a source ﬁle and then editing it with both
+12
+
+the preﬁx and the suﬃx providing rich context. For this task, we reported results
+of both MIM and FIM baselines on the HumanEval Inﬁlling benchmark and
+the MBXP Inﬁlling benchmark in Table 1. Comparing to the baselines, MIM
+consistently outperforms FIM in both datasets across all metrics and model sizes.
+Speciﬁcally, the MIM-2.7B model achieved pass@1 of 26.3%, an improvement
+of 3.5% over FIM-2.7B model which achieved pass@1 of 22.8%. In terms of the
+exact match metric, an improvement of 6.1% is also substantial (57.8% vs 51.7%).
+Similar to autoregressive left-to-right generation, we also notice improvement
+across three model sizes we consider.
+4.3.2
+Language Modeling
+In this section, we compare FIM and MIM Models pre-trained on natural
+language datasets. We use perplexity as our evaluation metric and look at two
+diﬀerent language modeling settings, namely in-domain and out-of-domain.
+The perplexity results of both settings are summarized in Table 4. It is
+evident that across all experiments, MIM consistently outperform FIM baselines
+in terms of perplexity. The largest model MIM-2.7B has the best perplexity
+across all datasets in both settings. For example, MIM-2.7B model obtains
+a perplexity of 9.54 in OpenWebText dataset, a relative 19.9% reduction in
+perplexity over FIM-2.7B model, which obtains a perplexity of 11.92.
+In the Pile dataset [GBB+21], which represents the out-of-domain setting,
+MIM-2.7B model also outperforms FIM-2.7B model by a relative reduction of
+15.3% in perplexity (9.24 vs 10.92), which further reinforces the advantages of
+MIM pre-training for natural languages.
+4.4
+Ablation Study
+4.4.1
+Eﬀect of Optional Enhancements
+In this section, we perform an ablation study to qualitatively assess the eﬀect
+of the optional enhancements we proposed in section 3.2.2 for the inﬁlling task.
+We compare the purely autoregressive MIM model (λ = 0) where the LMs are
+not allowed to observe generated tokens from the opposite side, and only utilize
+context from their own side during generation. We contrast this with using
+the Synchronous Bidirectional Attention layer with λ = 0.3 that conditions
+on previously generated tokens from both sides. We used perplexity on the
+validation data to select the value λ. We reuse the same value of λ during
+inﬁlling to avoid any potential mismatch between training and inference.
+We conduct an experiment on the HumanEval Inﬁlling benchmark [BJT+22]
+and results are summarized in Table 5. We notice that models that directly
+incorporate bidirectional context always outperform models that only utilize
+unidirectional context across all model sizes. As always, this is at the expense
+of the forward model no longer being a a drop-in replacement for standard
+autoregressive LMs.
+13
+
+Methods
+HumanEval
+MBPP
+HE Inﬁlling
+MBXP
+k
+1
+10
+100
+1
+10
+100
+1
+EM
+1
+Incoder-1.3B
+8.9
+16.7
+25.6
+11.3
+26.8
+42.7
+8.6
+31
+9.2
+Incoder-6.7B
+15.2
+27.8
+47
+19.4
+46.5
+66.2
+14.5
+44.1
+20.8
+CodeGen-Multi-6B
+18.2
+28.7
+44.9
+-
+-
+-
+-
+-
+-
+CodeGen-Multi-16B
+18.32
+32.07
+50.80
+-
+-
+-
+-
+-
+-
+Codex-2.5B
+21.36
+35.42
+59.5
+-
+-
+-
+-
+-
+-
+Codex-12B
+28.81
+46.81
+72.31
+-
+-
+-
+-
+-
+-
+code-davinci-001
+39
+60.6
+84.1
+51.8
+72.8
+84.1
+-
+-
+-
+code-davinci-002
+47
+74.9
+94.1
+58.1
+76.7
+84.5
+51.3
+74
+57.6
+PaLM-8B
+3.6
+-
+18.7
+5.0
+-
+-
+-
+-
+-
+PaLM-62B
+15.9
+-
+46.3
+21.4
+-
+-
+-
+-
+-
+PaLM-540B
+26.2
+-
+76.2
+36.8
+-
+-
+-
+-
+-
+LLaMA-7B
+10.5
+-
+36.5
+17.7
+-
+-
+-
+-
+-
+LLaMA-13B
+15.8
+-
+52.5
+22.0
+-
+-
+-
+-
+-
+LLaMA-33B
+21.7
+-
+70.7
+30.2
+-
+-
+-
+-
+-
+LLaMA-65B
+23.7
+-
+79.3
+37.7
+-
+-
+-
+-
+-
+FIM-350M
+12.8
+16.7
+27.8
+14.8
+30.2
+44.5
+11.8
+37.6
+14.3
+FIM-1.3B
+20.8
+39.4
+51.7
+25.9
+45.6
+62.5
+15.7
+42.2
+22.1
+FIM-2.7B
+28.5
+45.6
+67.8
+38.2
+61.2
+76.1
+22.8
+51.7
+30.4
+MIM-350M
+13.7
+17.2
+28.5
+16.5
+33.7
+47.4
+14.6
+41.7
+16.4
+MIM-1.3B
+22.4
+41.7
+53.8
+26.8
+47.6
+65.1
+17.4
+47.6
+24.5
+MIM-2.7B
+30.7
+48.2
+69.6
+42.2
+64.8
+79.3
+26.3
+57.8
+35.7
+Table 1: pass@k (%) on the HumanEval, MBPP and HumanEval Inﬁlling
+and MBXP benchmarks. Additionally, Exact Match (EM) metric [FAL+22] is
+reported for HumanEval Inﬁlling. FIM is the baseline ‘Fill in the Middle” (FIM).
+MIM is our proposed bidirectional language modeling with Meet-in-the-middle.
+For reference, we also report evaluation numbers of other models, namely Incoder-
+1.3B and Incoder-6.7B [FAL+22], Codex-12B [CTJ+21] ,code-davinci-001 and
+code-davinci-002. Note that, Codex-12B, davinci-001, PaLM [CND+22] and
+LLaMA [TLI+23] were trained only with left-to-right autoregressive objective,
+thus, cannot perform inﬁlling.
+4.4.2
+Eﬀect of Agreement Regularizer
+In this section, we perform an ablation study to qualitatively assess the impor-
+tance of the token-level agreement regularizer of Section 3.1 during training. We
+show that encouraging agreement during training helps improve the inﬁlling
+performance of our models in the HumanEval Inﬁlling benchmark [BJT+22], as
+summarized in Table 6.
+Comparing with Table 5, we see that models trained without token-level
+agreement regularization in general perform worse than models that do not
+utilize bidirectional context (λ = 0), which further emphasizes the importance of
+our agreement regularizer in making the predictions consistent between forward
+and backward directions.
+4.5
+Eﬃciency of Inference
+In this section, we further look into the eﬃciency of our MIM inference procedure
+for inﬁlling and compare to FIM in terms of inference latency with various batch
+sizes. Figure 2 shows the speedup of MIM in terms of inference latency over
+FIM baselines in both single and half precision format with the same model size
+14
+
+Methods
+C++
+Java
+Go
+k
+1
+10
+100
+1
+10
+100
+1
+10
+100
+Incoder-6B
+10.0
+20.0
+35.0
+9.0
+19.0
+40.0
+8.0
+14.0
+29.0
+CodeGen-6B
+12.0
+20.0
+36.0
+15.0
+18.0
+40.0
+9.0
+22.0
+40.0
+CodeGen-16B
+18.0
+30.0
+50.0
+15.0
+38.0
+60
+13.0
+25.0
+47.0
+CodeGeeX-13B
+20.0
+31.0
+50.0
+16.0
+38.0
+58.0
+15.0
+25.0
+49.0
+FIM-350M
+8.5
+18.3
+24.3
+11.3
+21.5
+27.6
+10.2
+16.8
+31.4
+FIM-1.3B
+16.7
+31.5
+43.2
+15.4
+25.2
+32.6
+12.5
+23.7
+39.6
+FIM-2.7B
+24.5
+38.6
+51.3
+18.3
+28.6
+38.7
+15.2
+30.4
+50.2
+MIM-350M
+10.2
+19.6
+26.3
+11.1
+22.4
+28.2
+10.8
+17.5
+31.8
+MIM-1.3B
+19.3
+36.5
+45.7
+17.6
+27.4
+34.7
+13.6
+25.1
+41.7
+MIM-2.7B
+27.4
+41.3
+54.1
+21.6
+30.8
+39.1
+17.4
+32.7
+53.6
+Table 2: pass@k (%) results on the HumanEval-X benchmarks in the zero-shot
+settings for the baselines FIM and our MIM approach. Results of k = 1, 10 and
+100 are reported across all categories.
+Methods
+Introductory
+Interview
+Competition
+k
+1
+10
+100
+1
+10
+100
+1
+10
+100
+FIM-350M
+3.6
+7.8
+11.5
+0.0
+0.3
+1.2
+0.0
+0.04
+0.9
+FIM-1.3B
+8.2
+11.6
+17.4
+0.12
+0.59
+1.9
+0.01
+0.07
+1.7
+FIM-2.7B
+12.4
+15.7
+20.8
+0.27
+0.72
+2.4
+0.03
+0.095
+2.4
+MIM-350M
+4.7
+9.2
+14.3
+0.2
+0.51
+2.3
+0.02
+0.06
+1.4
+MIM-1.3B
+10.6
+14.2
+21.2
+0.36
+0.76
+3.6
+0.043
+0.09
+2.2
+MIM-2.7B
+14.3
+18.2
+24.6
+0.52
+1.4
+5.2
+0.067
+0.18
+3.3
+Table 3: pass@k (%) results on the APPS benchmarks in the zero-shot settings
+for the baselines FIM and our MIM approach. Results of k = 1, 10 and 100 are
+reported across all categories.
+of 1.3B average over all the examples in the HumanEval Inﬁlling benchmark. In
+particular, the inference speed of MIM-1.3B is 4% to 6% faster compared to the
+inference speed of FIM-1.3B in single precision, and 3% to 5% faster if using
+half precision.
+We speculate that the speedup of MIM over FIM baselines during inference
+is attributed to several factors. Firstly, the generation of tokens in the left-to-
+right and right-to-left models are done in parallel. Furthermore, MIM inference
+procedure allows the generation from both sides to terminate early when there
+is an n-gram match and the sequence of tokens generated passes the veriﬁcation.
+Our veriﬁcation procedure based on [GXS+22] is also very eﬃcient as it can be
+parallelized over all the remaining time steps in the sequence.
+5
+Related work
+There is an extensive body of work on bidirectional language modeling. Early
+models such as BERT [DCLT19] masked tokens randomly, while T5 [RSR+20],
+SpanBERT [JCL+20] masked spans of contiguous tokens and demonstrate im-
+proved performance. XLNET [YDY+19], on the other hand, utilizes bidirectional
+15
+
+Methods
+Datasets
+Models
+CC-News
+OpenWebText
+CC-Stories
+CC-100
+The Pile
+FIM-350M
+21.16
+17.91
+20.89
+14.23
+15.14
+FIM-1.3B
+18.78
+13.28
+17.52
+11.34
+12.48
+FIM-2.7B
+13.45
+11.92
+13.43
+9.43
+10.92
+MIM-350M
+19.43
+17.23
+18.75
+13.45
+13.97
+MIM-1.3B
+16.04
+12.23
+14.63
+11.16
+10.79
+MIM-2.7B
+11.17
+9.54
+11.35
+8.76
+9.24
+Table 4:
+Perplexity results on all datasets in in-domain setting including
+CC-News, OpenWebText, CC-Stories, and CC-100 held-out datasets, and
+perplexity results in out-of-domain setting - the Pile dataset [GBB+21]
+Methods
+HE Inﬁlling
+MBXP
+Models
+λ
+pass@1
+EM
+pass@1
+MIM-350M
+0.0
+12.5
+38.6
+14.1
+0.3
+14.6
+41.7
+16.4
+MIM-1.3B
+0.0
+15.6
+45.2
+21.7
+0.3
+17.4
+47.6
+24.5
+MIM-2.7B
+0.0
+24.7
+54.3
+32.4
+0.3
+26.3
+57.8
+35.7
+Table 5:
+pass@1 (%) results of MIM without bidirectional context (λ = 0.0)
+and with bidirectional context (λ = 0.3) on the HumanEval Inﬁlling and MBXP
+benchmarks. Exact match results on the HumanEval Inﬁlling benchmark are
+also reported.
+context during training by the permutation language modeling objective, which
+maximizes the likelihood over all factorization orderings of the training sequences.
+However, because these models typically focus on representation learning, in-
+context learning via prompting can be diﬃcult [PLR+22].
+Two works that train neural models using similar ideas are [SKS+18] and
+[ZWL+19]. In the former the authors train RNNs for acoustic modeling which
+needs to happen in real-time. This constraint is very similar to our desire of
+having a forward model that can generate the next token from the previous
+ones. However, they propose to regularize the forward and backward RNNs by
+requiring their representations to be close in Euclidean distance. We suspect
+that this constraint may be unnecessarily stringent, and trading it oﬀagainst
+the LM’s perplexity during training could hurt overall performance.
+On the other hand, [ZWL+19] only encourage agreement in probability
+space. However, they are interested only in neural machine translation and
+only encourage agreement of probabilities at whole output sequence level. In
+contrast, we encourage agreement on every token. Another diﬀerence is that
+they are using a sum of two KL divergence terms KL(−→p ||←−p ) + KL(←−p ||−→p ) as
+the regularizer while we use total variation distance. We suspect that KL is more
+stringent as it is unbounded and can hurt the overall model when the model’s
+16
+
+Methods
+HE Inﬁlling
+MBXP
+Models
+Regularizer
+pass@1
+EM
+pass@1
+MIM-350M
+no reg
+11.8
+35.9
+13.5
++ reg
+14.6
+41.7
+16.4
+MIM-1.3B
+no reg
+13.8
+42.7
+22.7
++ reg
+17.4
+47.6
+24.5
+MIM-2.7B
+no reg
+23.2
+52.5
+30.6
++ reg
+26.3
+57.8
+35.7
+Table 6:
+pass@1 (%) results of MIM with token-level agreement regularizer
+and without token-level agreement regularizer on the HumanEval Inﬁlling and
+MBXP benchmark. Exact match results on the HumanEval Inﬁlling benchmark
+are also reported.
+Figure 2: Inference latency of MIM and FIM baselines with batch implementation in
+A100 GPU with fp32 and fp16 precision.
+perplexity needs to be traded oﬀagainst the regularizer during training.
+Sharing all parameters between diﬀerent factorizations of the sequence was
+ﬁrst proposed in XLNET [YDY+19] but has also been used with only forward
+and backward models in the context of image captioning [ZHL+22]. That work
+motivated us to share all parameters between the forward and backward LMs.
+Using LMs for inﬁlling was ﬁrst proposed in [DLL20] where the authors tackled
+the more challenging setup with multiple places that need inﬁlling. [BJT+22]
+applies “Fill in the Middle” (FIM) to the training data by randomly splitting
+each training instance into a tuple of (preﬁx, middle, suﬃx) and concatenate
+all these sections into a single example together with their sentinel tokens after
+tokenization. [BJT+22] also contains a thorough section on research related to
+inﬁlling. We refer the reader there for more details.
+Furthermore, [AHR+22] and [FAL+22] propose an extension of FIM, namely
+“Causal Masked Language Modeling” (CM3) and explore multi-region inﬁlling
+problem. Similar to us, [BJT+22] and [FAL+22] leverage FIM to pre-train
+17
+
+decoder-only language model on code data and evaluate their models on zero-
+shot code completion benchmark created from HumanEval dataset [CTJ+21].
+In [SLB17] the authors propose a bidirectional beam search procedure that
+also employs forward and backward LMs. However their focus is in improving
+accuracy at the expense of latency. Their procedure performs multiple passes
+over the completion, ﬁxing tokens one-by-one and re-evaluating the probabilities
+from the LMs. Our approach focuses on achieving better inﬁlling accuracy than
+FIM while also reducing latency.
+6
+Conclusion
+In this paper we addressed two challanges faced by large LMs: Pre-training data
+eﬃciency and better handling of context for the task of inﬁlling. We proposed
+“Meet in the Middle”, a method that uses both forward and backward LMs
+that share parameters and are trained to agree with each other in addition to
+predicting the next token. The resulting forward LM is a drop-in replacement
+for existing autoregressive LMs while also achieving better quality over strong
+baselines. Moreover, for the task of inﬁlling, we proposed an inference procedure
+that employs both LMs and can in certain cases reduce the inference latency
+by up to 50%. Though in our experiments the latency reduction was modest,
+compared to FIM, the reduction in perplexity and the improvements over FIM
+in both autoregressive and inﬁlling settings were substantial.
+Acknowledgments
+We would like to thank Dejian Yang and Jian-Guang Lou at Microsoft Research
+Asia for helping us with processing training data. We also sincerely thank Daniel
+Fried and Armen Aghajanyan at Meta AI for helpful discussion regarding the
+training details of FIM baselines.
+References
+[AGW+22] Ben Athiwaratkun, Sanjay Krishna Gouda, Zijian Wang, Xiaopeng
+Li, Yuchen Tian, Ming Tan, Wasi Uddin Ahmad, Shiqi Wang,
+Qing Sun, Mingyue Shang, Sujan Kumar Gonugondla, Hantian
+Ding, Varun Kumar, Nathan Fulton, Arash Farahani, Siddhartha
+Jain, Robert Giaquinto, Haifeng Qian, Murali Krishna Ramanathan,
+Ramesh Nallapati, Baishakhi Ray, Parminder Bhatia, Sudipta Sen-
+gupta, Dan Roth, and Bing Xiang. Multi-lingual evaluation of code
+generation models. CoRR, abs/2210.14868, 2022.
+[AHR+22] Armen Aghajanyan, Bernie Huang, Candace Ross, Vladimir
+Karpukhin, Hu Xu, Naman Goyal, Dmytro Okhonko, Mandar Joshi,
+Gargi Ghosh, Mike Lewis, and Luke Zettlemoyer. CM3: A causal
+18
+
+masked multimodal model of the internet. CoRR, abs/2201.07520,
+2022.
+[AON+21] Jacob Austin, Augustus Odena, Maxwell I. Nye, Maarten Bosma,
+Henryk Michalewski, David Dohan, Ellen Jiang, Carrie J. Cai,
+Michael Terry, Quoc V. Le, and Charles Sutton. Program synthesis
+with large language models. CoRR, abs/2108.07732, 2021.
+[BJT+22] Mohammad Bavarian, Heewoo Jun, Nikolas Tezak, John Schulman,
+Christine McLeavey, Jerry Tworek, and Mark Chen. Eﬃcient training
+of language models to ﬁll in the middle. CoRR, abs/2207.14255,
+2022.
+[BMR+20] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared
+Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam,
+Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss,
+Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh,
+Daniel M. Ziegler, Jeﬀrey Wu, Clemens Winter, Christopher Hesse,
+Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess,
+Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya
+Sutskever, and Dario Amodei. Language models are few-shot learners.
+In Hugo Larochelle, Marc’Aurelio Ranzato, Raia Hadsell, Maria-
+Florina Balcan, and Hsuan-Tien Lin, editors, Advances in Neural
+Information Processing Systems 33: Annual Conference on Neural
+Information Processing Systems 2020, NeurIPS 2020, December
+6-12, 2020, virtual, 2020.
+[CND+22] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten
+Bosma, Gaurav Mishra, Adam Roberts, Paul Barham, Hyung Won
+Chung, Charles Sutton, Sebastian Gehrmann, Parker Schuh, Kensen
+Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker
+Barnes, Yi Tay, Noam Shazeer, Vinodkumar Prabhakaran, Emily
+Reif, Nan Du, Ben Hutchinson, Reiner Pope, James Bradbury, Ja-
+cob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin, Toju
+Duke, Anselm Levskaya, Sanjay Ghemawat, Sunipa Dev, Henryk
+Michalewski, Xavier Garcia, Vedant Misra, Kevin Robinson, Liam Fe-
+dus, Denny Zhou, Daphne Ippolito, David Luan, Hyeontaek Lim, Bar-
+ret Zoph, Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani
+Agrawal, Mark Omernick, Andrew M. Dai, Thanumalayan Sankara-
+narayana Pillai, Marie Pellat, Aitor Lewkowycz, Erica Moreira,
+Rewon Child, Oleksandr Polozov, Katherine Lee, Zongwei Zhou,
+Xuezhi Wang, Brennan Saeta, Mark Diaz, Orhan Firat, Michele
+Catasta, Jason Wei, Kathy Meier-Hellstern, Douglas Eck, JeﬀDean,
+Slav Petrov, and Noah Fiedel. Palm: Scaling language modeling
+with pathways. CoRR, abs/2204.02311, 2022.
+[CTJ+21] Mark Chen, Jerry Tworek, Heewoo Jun, Qiming Yuan, Hen-
+rique Ponde de Oliveira Pinto, Jared Kaplan, Harrison Edwards,
+19
+
+Yuri Burda, Nicholas Joseph, Greg Brockman, Alex Ray, Raul
+Puri, Gretchen Krueger, Michael Petrov, Heidy Khlaaf, Girish
+Sastry, Pamela Mishkin, Brooke Chan, Scott Gray, Nick Ryder,
+Mikhail Pavlov, Alethea Power, Lukasz Kaiser, Mohammad Bavar-
+ian, Clemens Winter, Philippe Tillet, Felipe Petroski Such, Dave
+Cummings, Matthias Plappert, Fotios Chantzis, Elizabeth Barnes,
+Ariel Herbert-Voss, William Hebgen Guss, Alex Nichol, Alex Paino,
+Nikolas Tezak, Jie Tang, Igor Babuschkin, Suchir Balaji, Shantanu
+Jain, William Saunders, Christopher Hesse, Andrew N. Carr, Jan
+Leike, Joshua Achiam, Vedant Misra, Evan Morikawa, Alec Radford,
+Matthew Knight, Miles Brundage, Mira Murati, Katie Mayer, Pe-
+ter Welinder, Bob McGrew, Dario Amodei, Sam McCandlish, Ilya
+Sutskever, and Wojciech Zaremba. Evaluating large language models
+trained on code. CoRR, abs/2107.03374, 2021.
+[DCLT19] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova.
+BERT: pre-training of deep bidirectional transformers for language
+understanding. In Jill Burstein, Christy Doran, and Thamar Solorio,
+editors, Proceedings of the 2019 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human
+Language Technologies, NAACL-HLT 2019, Minneapolis, MN, USA,
+June 2-7, 2019, Volume 1 (Long and Short Papers), pages 4171–4186.
+Association for Computational Linguistics, 2019.
+[DFE+22] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher
+Ré. Flashattention: Fast and memory-eﬃcient exact attention with
+io-awareness. CoRR, abs/2205.14135, 2022.
+[DLL20] Chris Donahue, Mina Lee, and Percy Liang. Enabling language
+models to ﬁll in the blanks. arXiv preprint arXiv:2005.05339, 2020.
+[FAL+22] Daniel Fried, Armen Aghajanyan, Jessy Lin, Sida Wang, Eric Wal-
+lace, Freda Shi, Ruiqi Zhong, Wen-tau Yih, Luke Zettlemoyer, and
+Mike Lewis. Incoder: A generative model for code inﬁlling and
+synthesis. CoRR, abs/2204.05999, 2022.
+[GBB+21] Leo Gao, Stella Biderman, Sid Black, Laurence Golding, Travis
+Hoppe, Charles Foster, Jason Phang, Horace He, Anish Thite, Noa
+Nabeshima, Shawn Presser, and Connor Leahy. The pile: An 800gb
+dataset of diverse text for language modeling. CoRR, abs/2101.00027,
+2021.
+[GXS+22] Tao Ge, Heming Xia, Xin Sun, Si-Qing Chen, and Furu Wei. Lossless
+acceleration for seq2seq generation with aggressive decoding. CoRR,
+abs/2205.10350, 2022.
+[HBK+21] Dan Hendrycks, Steven Basart, Saurav Kadavath, Mantas Mazeika,
+Akul Arora, Ethan Guo, Collin Burns, Samir Puranik, Horace He,
+20
+
+Dawn Song, et al. Measuring coding challenge competence with
+apps. arXiv preprint arXiv:2105.09938, 2021.
+[JCL+20] Mandar Joshi, Danqi Chen, Yinhan Liu, Daniel S. Weld, Luke
+Zettlemoyer, and Omer Levy. Spanbert: Improving pre-training by
+representing and predicting spans. Trans. Assoc. Comput. Linguis-
+tics, 8:64–77, 2020.
+[KB15] Diederik P. Kingma and Jimmy Ba. Adam: A method for stochastic
+optimization.
+In Yoshua Bengio and Yann LeCun, editors, 3rd
+International Conference on Learning Representations, ICLR 2015,
+San Diego, CA, USA, May 7-9, 2015, Conference Track Proceedings,
+2015.
+[LOG+19] Yinhan Liu, Myle Ott, Naman Goyal, Jingfei Du, Mandar Joshi,
+Danqi Chen, Omer Levy, Mike Lewis, Luke Zettlemoyer, and Veselin
+Stoyanov. Roberta: A robustly optimized BERT pretraining ap-
+proach. CoRR, abs/1907.11692, 2019.
+[MNA+18] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory F. Di-
+amos, Erich Elsen, David García, Boris Ginsburg, Michael Houston,
+Oleksii Kuchaiev, Ganesh Venkatesh, and Hao Wu. Mixed precision
+training. In 6th International Conference on Learning Representa-
+tions, ICLR 2018, Vancouver, BC, Canada, April 30 - May 3, 2018,
+Conference Track Proceedings. OpenReview.net, 2018.
+[PLR+22] Ajay Patel, Bryan Li, Mohammad Sadegh Rasooli, Noah Constant,
+Colin Raﬀel, and Chris Callison-Burch.
+Bidirectional language
+models are also few-shot learners. arXiv preprint arXiv:2209.14500,
+2022.
+[RSR+20] Colin Raﬀel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan
+Narang, Michael Matena, Yanqi Zhou, Wei Li, and Peter J. Liu.
+Exploring the limits of transfer learning with a uniﬁed text-to-text
+transformer. J. Mach. Learn. Res., 21:140:1–140:67, 2020.
+[Sha19] Noam Shazeer. Fast transformer decoding: One write-head is all
+you need. CoRR, abs/1911.02150, 2019.
+[SKS+18] Dmitriy Serdyuk, Nan Rosemary Ke, Alessandro Sordoni, Adam
+Trischler, Chris Pal, and Yoshua Bengio. Twin networks: Matching
+the future for sequence generation. In International Conference on
+Learning Representations, 2018.
+[SLB17] Qing Sun, Stefan Lee, and Dhruv Batra. Bidirectional beam search:
+Forward-backward inference in neural sequence models for ﬁll-in-the-
+blank image captioning. In Proceedings of the IEEE Conference on
+Computer Vision and Pattern Recognition, pages 6961–6969, 2017.
+21
+
+[SPP+19] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley,
+Jared Casper, and Bryan Catanzaro. Megatron-lm: Training multi-
+billion parameter language models using model parallelism. CoRR,
+abs/1909.08053, 2019.
+[SSU18] Mitchell Stern, Noam Shazeer, and Jakob Uszkoreit. Blockwise
+parallel decoding for deep autoregressive models. In Samy Bengio,
+Hanna M. Wallach, Hugo Larochelle, Kristen Grauman, Nicolò
+Cesa-Bianchi, and Roman Garnett, editors, Advances in Neural
+Information Processing Systems 31: Annual Conference on Neural
+Information Processing Systems 2018, NeurIPS 2018, December 3-8,
+2018, Montréal, Canada, pages 10107–10116, 2018.
+[TLI+23] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet,
+Marie-Anne Lachaux, Timothée Lacroix, Baptiste Rozière, Naman
+Goyal, Eric Hambro, Faisal Azhar, Aurélien Rodriguez, Armand
+Joulin, Edouard Grave, and Guillaume Lample. Llama: Open and
+eﬃcient foundation language models. CoRR, abs/2302.13971, 2023.
+[VSP+17] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion
+Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. Atten-
+tion is all you need. In Isabelle Guyon, Ulrike von Luxburg, Samy
+Bengio, Hanna M. Wallach, Rob Fergus, S. V. N. Vishwanathan, and
+Roman Garnett, editors, Advances in Neural Information Processing
+Systems 30: Annual Conference on Neural Information Processing
+Systems 2017, December 4-9, 2017, Long Beach, CA, USA, pages
+5998–6008, 2017.
+[YDY+19] Zhilin Yang, Zihang Dai, Yiming Yang, Jaime G. Carbonell, Ruslan
+Salakhutdinov, and Quoc V. Le. Xlnet: Generalized autoregres-
+sive pretraining for language understanding. In Hanna M. Wallach,
+Hugo Larochelle, Alina Beygelzimer, Florence d’Alché-Buc, Emily B.
+Fox, and Roman Garnett, editors, Advances in Neural Information
+Processing Systems 32: Annual Conference on Neural Information
+Processing Systems 2019, NeurIPS 2019, December 8-14, 2019, Van-
+couver, BC, Canada, pages 5754–5764, 2019.
+[ZHL+22] Yuanen Zhou, Zhenzhen Hu, Daqing Liu, Huixia Ben, and Meng
+Wang.
+Compact bidirectional transformer for image captioning.
+arXiv preprint arXiv:2201.01984, 2022.
+[ZWL+19] Zhirui Zhang, Shuangzhi Wu, Shujie Liu, Mu Li, Ming Zhou,
+and Tong Xu. Regularizing neural machine translation by target-
+bidirectional agreement. In Proceedings of the AAAI Conference on
+Artiﬁcial Intelligence, volume 33, pages 443–450, 2019.
+[ZZZ19] Long Zhou, Jiajun Zhang, and Chengqing Zong. Synchronous bidirec-
+tional neural machine translation. Trans. Assoc. Comput. Linguistics,
+7:91–105, 2019.
+22
+
+A
+Appendix
+A.1
+Model training details
+To evaluate the eﬀectiveness of “Meet in the Middle” (MIM) pre-training com-
+pared to left-to-right autoregressive and “Fill in the Middle” (FIM) pre-training
+baselines, we adopt standard transformer-based autoregressive language models
+used in previous works [BMR+20] for all the models we trained, varying the
+number of parameters (350M, 1.3B, 2.7B). Moreover, we replace the use of the
+Multi Head Attention [VSP+17] with the use of the Multi Query Attention
+proposed in [Sha19] in all the models we trained, allowing faster inference and
+reducing the memory requirements to store multiple key and values embeddings
+that are not shared between attention heads.
+For our bidirectional language models, we run the forward model and the
+backward model in parallel within a single decoder-only architecture, leveraging
+bidirectional context explicitly during pre-training. We use the sentinel token
+⟨l2r⟩to specify that the generation comes from the forward model and sentinel
+token ⟨r2l⟩to specify that generation comes from the backward model.
+Regarding optimization, we use the Adam optimizer [KB15] with β1 = 0.9,
+β2 = 0.95, ϵ = 10−8 and a global gradient norm clipping of 1.0. We follow
+[BMR+20] to decay learning rate to 10% of its maximum value using cosine
+annealing with linear warm-up of 2% of the total number of training steps.
+For scaling the training of these models, we employ the open source Megatron-
+LM framework [SPP+19] and partition the training across multiple GPUs along
+the batch dimension. All the training runs that we conducted use mixed precision
+training [MNA+18] and FlashAttention [DFE+22] to reduce memory require-
+ments and increase training throughput. During pre-training of our models, we
+observed that MIM, FIM and autoregressive left-to-right pre-training have simi-
+lar training wall-clock time, it is because the forward model and the backward
+model are executed in parallel in MIM pre-training. Our largest models of size
+2.7B parameters are trained using 128 A100 GPU with 80GB memory each over
+4 days, while the smaller models are trained using 64 A100 GPU with 80GB
+memory each over 3.5 days. See Table 8 for the details of all the training runs.
+A.2
+Programming language dataset details
+Table 7 details the statistics of the datasets of diﬀerent programming languages
+we use to pre-train our code language models in terms of number of tokens and
+dataset size. We perform some ﬁltering and deduplication to obtain the ﬁnal
+dataset. Our tokenizer is based on the Byte-Pair Encoding algorithm widely
+used in previous work [CTJ+21] to directly encode raw bytes with a vocabulary
+of size 100257 tokens. We pre-tokenize the text using a special regex pattern
+that accounts for splitting on digit and newlines together with the default GPT-2
+pre-tokenization [BMR+20].
+23
+
+Languages
+Size (GB)
+Tokens (B)
+C
+34.3
+12.3
+C++
+215.6
+70.8
+Python
+252.3
+75.5
+Java
+178.5
+46.7
+JavaScript
+120.1
+39.3
+TypeScript
+21.8
+8.6
+PHP
+30.7
+11
+Ruby
+26.8
+10.1
+C#
+35.3
+12.6
+Others
+40.2
+13.3
+Total
+955.6
+300
+Table 7: Approximate statistics of the programming language pre-training data
+Hyper-parameters
+350M
+1.3B
+2.7B
+Number of layers
+24
+24
+32
+Number of heads
+16
+16
+32
+Dimension per head
+64
+128
+80
+Context length
+2048
+2048
+2048
+Batch size
+786k
+1M
+1M
+Weight decay
+0.1
+0.1
+0.1
+Learning rate
+0.0003
+0.0002
+0.0002
+Warmup steps
+7k
+5k
+5k
+Total steps
+382k
+286k
+286k
+Table 8: Details of each training run for all of our model speciﬁcations.
+24
+

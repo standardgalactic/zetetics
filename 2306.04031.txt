@@ -1,0 +1,1057 @@
+Certified Reasoning with Language Models
+Gabriel Poesia, Kanishk Gandhi∗, Eric Zelikman∗, Noah D. Goodman
+Stanford University
+{poesia,kanishkg,ezelikman,ngoodman}@stanford.edu
+Abstract
+Language models often achieve higher accuracy when reasoning step-by-step in
+complex tasks. However, their reasoning can be unsound, inconsistent, or rely
+on undesirable prior assumptions. To tackle these issues, we introduce a class of
+tools for language models called guides that use state and incremental constraints
+to guide generation. A guide can be invoked by the model to constrain its own
+generation to a set of valid statements given by the tool. In turn, the model’s choices
+can change the guide’s state. We show how a general system for logical reasoning
+can be used as a guide, which we call LOGICGUIDE. Given a reasoning problem in
+natural language, a model can formalize its assumptions for LOGICGUIDE and then
+guarantee that its reasoning steps are sound. In experiments with the PrOntoQA
+and ProofWriter reasoning datasets, LOGICGUIDE significantly improves the
+performance of GPT-3, GPT-3.5 Turbo and LLaMA (accuracy gains up to 35%).
+LOGICGUIDE also drastically reduces content effects: the interference of prior and
+current assumptions that both humans and language models have been shown to
+suffer from. Finally, we explore bootstrapping LLaMA 13B from its own reasoning
+and find that LogicGuide is critical: by training only on certified self-generated
+reasoning, LLaMA can self-improve, avoiding learning from its own hallucinations.
+1
+Introduction
+Consider a language-based autonomous agent tasked with managing a user’s calendar and email. The
+user might want to specify general principles on how the agent should behave, such as “if the email is
+from any of my managers, you must send me a notification”, and important pieces of information
+such as “I’m part of the research team”, or “Grace manages the research team”. When the agent
+analyzes an email and decides what actions to take, we’d like it to respect the given instructions.
+Doing so might require reasoning: the agent should conclude that an email from Grace warrants a
+notification, even if that wasn’t said explicitly. How should the agent make such conclusions?
+A Large Language Model (LLM), such as GPT-3 [2] or PaLM [3], can in principle take in the given
+instructions and context, choose actions to take and, before each action, ask itself “is this permitted?”
+The answer might require making chains of inferences based on the user’s input. For this class of
+problems, LLMs have been shown to dramatically benefit from chain-of-thought reasoning [30, 26].
+Empirically, allowing LLMs to generate reasoning steps before their answer consistently yields higher
+accuracy across a wide range of tasks [26]. Qualitatively, reasoning steps provide “an interpretable
+window” into how the model arrived at the answer [30], in contrast to an opaque guess.
+But much like humans, language models can also produce unsound reasoning: even after correctly
+interpreting a problem, they can take logically invalid inference steps, or produce a guess at the final
+answer that is not supported by their own rationale [22]. Moreover, LLMs have also been observed to
+show human-like content effects in reasoning: their accuracy drops significantly when asked to reason
+with assumptions that contradict their prior beliefs [6]. While a natural language rationale can be
+highly desirable for purposes of interpretability, it is not enough to ensure a high degree of reliability.
+Preprint. Under review.
+arXiv:2306.04031v1  [cs.AI]  6 Jun 2023
+
+Figure 1: A language model can invoke a guide tool, such as our LOGICGUIDE, to perform certifiable
+generations. Here, when the model decides to generate an infer block, it is constrained to generate
+one of the formal deductions established by an external theorem-proving environment.
+How can we avoid unsound, perhaps dangerous, inferences? This question illustrates the central
+concern that led to the development of formal logic. In a formal system, valid inferences can be
+generated mechanically with logical deduction rules. Automated reasoning tools, such as Z3 [7],
+solve formalized problems automatically. This level of reliability also brings its costs. Using these
+tools requires users to fully formalize their problem, but some desiderata might be impractical to
+express in logic (e.g., “if the email looks important, you can create a to-do item for me”). Moreover,
+they do not provide a simple, equivalent “interpretable window” into how conclusions were derived:
+even the basic inference principles that they employ, such as resolution, are fundamentally hard to
+describe1. If the user’s rules were incorrectly formalized, they will have difficulty understanding why
+the system is misbehaving. This can undermine trust just as invalid inferences can.
+In this paper, we aim to allow LLMs to rely on trusted formal deductions during generation by
+building on the recent paradigm of tool use in language models [4, 23]. In prior work, LMs invoke
+external tools by generating special sequences, intercepted by the decoding algorithm. They can
+generate inputs (e.g., a mathematical operation, or search query) and receive the tool’s output as if it
+was their own generation. We generalize this input-output paradigm to a broader class of LM tools
+we call guides. When a guide is invoked by the model using a special delimiter, the tool computes a
+space of valid outputs, as illustrated in Fig. 1. We then employ constrained decoding [20] to ensure
+the model will incrementally generate one of the valid outputs. Guides thus enable a more declarative
+interaction between tool and model: the guide declares a set of possible sequences, while the model
+brings prior expectations used to generate one among them. A guide can maintain state: its next valid
+outputs might depend on the sequence of choices up to that point.
+We use this framework to allow language models to locally constrain generation to a set of valid
+statements determined by an external logical tool. To that end, we leverage the Peano theorem-proving
+environment [19] to construct LOGICGUIDE, which an LM can use to formalize its assumptions, set
+proof goals and make sound inference steps. The model can intersperse formal reasoning and natural
+language during generation. When the language is conditioned on previous formal steps, it is highly
+reliable, since the generations allowed by LOGICGUIDE are formally certified.
+We validate our method on three existing natural language reasoning datasets, PrOntoQA [22],
+ProofWriter [27], and Syllogistic Validity [6]. We also follow the format and methodology of
+PrOntoQA to introduce a new dataset, DeontiQA, where problems require reasoning using deontic
+logic principles to determine whether an action is permissible, obligatory or forbidden. When used
+with few-shot prompting, we find that LOGICGUIDE significantly improves the accuracy of OpenAI
+GPT-3 and GPT-3.5 Turbo, and the open LLaMA 13B model. Moreover, models using LOGICGUIDE
+have drastically lower content effects: we show this both with PrOntoQA and in the Syllogism
+Validity dataset [6], used previously to measure content effects in LLMs.
+Self-improvement methods, such as the Self-Taught Reasoner (STaR; [35]), improve reasoning by
+fine-tuning a model on the rationales of its successful answers. In the tasks we analyze here, there’s
+a high probability of guessing the correct answer (e.g. true or false, so at least 50%), hence STaR
+1When introducing the first-order resolution principle, Robinson remarks that it is powerful in two senses: it
+is logically complete, and “in the psychological sense that it condones single inferences which are often beyond
+the ability of the human to grasp” [21]
+2
+
+alone fails to yield meaningful improvements. LOGICGUIDE allows us to differentiate cases where
+the model arrived at a certified conclusion and when it generated an unsupported guess. We show
+that running STaR using only certified solutions is highly effective: LLaMA 13B enjoys accuracy
+gains of up to 17% on PrOntoQA, while naïve STaR — fine-tuning on all generations that led to the
+correct answer — fails to provide improvements. Altogether, guides provide a promising approach
+for combining the trustworthiness of formal reasoning with the flexibility of language models.
+2
+Related Work
+As reviewed above, our work builds on two classes of systems for reasoning: language models,
+which can reason flexibly in natural language, and formal reasoning systems, which rely on formal
+logic to derived certified inferences. To interface these two systems, we leverage recent methods
+for constrained decoding from language models. Specifically, we employ Constrained Semantic
+Decoding (CSD) [20], an algorithm that guarantees a valid sample by construction. CSD does not
+require full access to the model, only the ability to bias its logits. This allows us to use GPT-3 [2]
+and GPT-3.5 Turbo models through their public APIs, as well as a locally-run LLaMA model [28].
+Other constrained decoding methods, such as NeuroLogic Decoding [15] and NeuroLogic A*esque
+decoding [14], have been proposed to enforce lexical (but not richer) constraints at inference time.
+LLMs have been increasingly used as agents interacting with other systems, by both using tools
+to delegate computation or to trigger external actions [23, 34, 33, 12, 24]. In prior work, LLMs
+can provide inputs to an external tool, such as a search query [23] or a mathematical operation
+[4], and receive the output in the decoding stream. Our framework of guides (§3) can be seen as a
+generalization of this paradigm, where the tool defines a space of outputs and he LM chooses one
+using its own probabilities.
+Our approach to certifying reasoning from language models relies on grounding their inferences in an
+interactive theorem prover, Peano [19]. Similar to other popular theorem proving languages like Lean
+[8] and Coq [1], Peano uses dependent type theory as its logical foundation. Most theorem proving
+environments are designed for the verification of given proofs. In contrast, and of special interest
+to us, Peano is designed to aid in generation by exposing a finite action space. Many other recent
+works have integrated LLMs and interactive theorem provers in the context of formal mathematical
+reasoning. Recent work on autoformalization has shown that LLMs can be effective in translating
+informal to formal mathematics [32]. This idea is related to how we use LLMs to formalize their
+assumptions given in natural language, though our end goal is to produce reliable natural language
+rationales rather than formal proofs alone.
+3
+Certified Reasoning with Guides
+We now develop the framework of guide tools, and discuss how to implement a guide for general
+logical reasoning. We then remark how guides can overcome computational limitations of Transformer
+models, and briefly discuss other potential guide tools.
+3.1
+Guide functions
+Previous work in tools for language models assumed an interface where the model would provide
+inputs to the tool and receive back a single output, conditioning on this output for further generation.
+For instance, [4] allowed the model to rely on a calculator by generating a string such as «51*12=.
+At this point, the decoding algorithm would execute the operation externally and copy the result as if
+it was generated by the language model. Here, our main goal is to leverage a trusted external tool to
+answer the question: “what logical inferences could be made next?” In principle, given a tool that can
+answer this question, we could copy its entire output into the decoding stream. However, this set can
+be very large, and for logical inference the set grows larger as each inference allows many new ones
+to be reached. We could instead randomly choose a single possibility from the set, but this would
+ignore the substantial prior knowledge of the language model, often yielding a useless choice. Our
+key idea will be to use constrained decoding so that, when the tool is invoked, the language model
+itself will generate one of the valid inferences.
+3
+
+More generally, a guide tool defines a set of valid generations given previous choices. Formally, let
+S = Σ∗be the set of strings in the guide’s alphabet Σ, with S∗denoting the set of finite sequences of
+such strings. We define a guide g to be a function g : S∗→P(S) that takes a sequence of previously
+generated strings and returns a regular set of allowed next generations. Our idea is to leverage g
+at specific points when sampling from an autoregressive language model PLM(·) so that when the
+guide is invoked at a prefix s0, we will sample a continuation from PLM(s|s0) that belongs to the set
+allowed by g when given the previous guided generations in the prefix s0 (e.g., previous valid logical
+inferences).
+3.2
+From guides to completion engines
+Given any guide function g as above, we want to provide a tool for LMs that, once invoked by some
+special sequence, will constrain the immediate subsequent output using g. To that end, we employ
+the Constrained Semantic Decoding algorithm (CSD; [20]). CSD can constrain the output of the
+underlying model at inference time by leveraging a user-defined completion engine. We briefly review
+what a completion engine requires and explain how we define one to implement guide tools.
+Background: Completion Engines and CSD
+A completion engine is defined as a function
+c : Σ∗→RE(Σ), taking a string in the vocabulary Σ and returning a regular expression over Σ. The
+idea is that c can dynamically compute a set of valid continuations: once the LM generates enough
+tokens to maximally match the current regular expression, CSD will call c again to determine what
+can follow. The algorithm handles the technical complication that c and the LM often have different
+vocabularies. For instance, in our case, the LMs we use have vocabularies with multiple tokens that
+either contain or overlap with the special strings we use to trigger the guide tool. CSD allows our
+definition of guide tools to be agnostic to the underlying model’s vocabulary.
+Guide Tool as a Completion Engine
+We implement the guide tool for a guide function g as a
+completion engine. First, we arbitrarily pick special strings t1 and t2: t1 will trigger the tool and
+t2 will mark the end of the “trusted” generation (e.g., we later use t1 = "[[" and t2 = "]]"). The
+guide completion engine takes a string s, containing the model’s partial output so far. It first checks
+whether s ends in t1 to decide if the tool has been invoked. If not, it returns a regular expression
+matching any string not containing t1 and ending in t1. As a result, CSD will allow the model to
+freely generate text until it invokes the tool by generating t1. If s does end in t1, then the completion
+engine will collect all blocks of text between occurrences of t1 and t2 in s into a sequence Sp, and
+return a regular expression matching the strings in g(Sp) as its output. We expect the strings in g(Sp)
+to end in t2 when the guide wants to allow the model to return to free generation. CSD will then
+constrain the LM to generate one of the strings matching g(Sp), and it will handle the complication
+that the model’s tokenizer might overlap t1 and the beginning of some generation in g(Sp).
+With the resulting completion engine wrapping g, CSD can essentially sample from any given LM
+while constraining the outputs between the delimiters t1 and t2 to come from the guide. In this
+framework, it is easy to define simple input/output tools by having g return a singleton set. It also
+allows us to design richer LM tools, as the LOGICGUIDE we introduce next. We describe several
+other guides in the Appendix, leaving their exploration for future work.
+3.3
+The LOGICGUIDE
+We now construct LOGICGUIDE, a guide tool for language models to perform externally certified
+reasoning. Our logical backend of choice is Peano [19], a theorem-proving language together with
+an environment for incremental proof generation. The main feature of Peano we rely on is that its
+environment provides a finite action space. Thus, given a partial argument, Peano gives us a list of
+valid inferences that can be made in a single step given the background theory, assumptions (possibly
+added by the model) and previous inferences. Our idea is to use this list to guide the model whenever
+it decides to derive a logical conclusion. While Peano makes the guide implementation particularly
+simple, other theorem-proving environments might be adaptable for this purpose.
+We use the guide delimiters "[[" and "]]", and implement a guide function that accepts strings
+with the format action:parameter. We define 6 actions (exemplified in Fig. 2) that allow the
+model to (1) formalize its assumptions (object, prop, relation, axiom), (2) set a goal (goal),
+and (3) perform logical inferences (infer). For (1) and (2), the guide returns constraints that ensure
+4
+
+Context: 1- The mouse visits the tiger. (...) 3- If something visits the tiger then it visits the mouse. (...) 12- If something 
+visits the mouse then it is blue. (...)
+Question: True or false: The mouse is green?
+Formalized 
+context: 
+1- The [[object: mouse]] [[relation: visits]] the [[object: tiger]] [[axiom:   
+(visits mouse tiger)]] (...) 3- If something [[relation: visits]] the [[object: tiger]] 
+then it [[relation: visits]] the [[object: mouse]] [[axiom: (visits 'x tiger) -> 
+(visits 'x mouse)]] (...) 12- If something [[relation: visits]] the [[object: mouse]] then 
+it is [[prop: blue]] [[axiom: (visits 'x mouse) -> (blue 'x)]] (...)
+[[infer: (visits mouse mouse)]] The mouse visits itself. [[infer: (blue mouse)]] The 
+mouse is blue. [[infer: (green mouse)]] The mouse is green. This satisfies the goal.
+[[goal: (green mouse)]]
+   Formalized goal:
+Reasoning: 
+Answer:
+TRUE
+Figure 2: Example solution of gpt3.5-turbo using LOGICGUIDE in a problem from ProofWriter.
+The model’s generation starts at the “Formalized context”. This example shows all 6 actions we
+implement in the LOGICGUIDE: object declares a particular entity, prop and relation mark
+unary and binary predicates, respectively; axiom denotes propositions assumed to hold (possibly
+implications), goal sets a target to be proven or contradicted, and infer generates logical inferences.
+the model’s formalization to be syntactically valid; since these actions are the boundary between
+natural and formal language, it is impossible to guarantee that they are semantically valid in the
+sense that the model has properly formalized the hypotheses. What is certifiable is that the logical
+inferences (action type 3) follow from the model’s formalization, i.e. its inference are valid given its
+explicit assumptions. (§4 provides empirical evidence that formalization errors rarely lead to a wrong
+conclusion; most often they make the model unable to prove or disprove the goal).
+Using the guide
+In the typical setup for logical reasoning problems [27, 22], the input contains
+a context (the set of assumptions) and a goal, and the few-shot examples additionally contain a
+rationale and the final answer (typically whether the goal is true or false). In our experiments, we
+demonstrate how to use the guide by creating few-shot examples with the proper LOGICGUIDE action
+annotations (as in Fig. 2). Specifically, we add a section before the rationale named “Formalized
+context” where we repeat the assumptions in the scenario while marking objects, properties and
+relations, and formalizing each of the assumptions into an [[axiom:]] block. We do the same for
+the goal. Then, we prepend each reasoning step with the appropriate [[infer:]] action. In this way
+the model is encouraged to first generate a formal inference step and only then its natural language
+counterpart. We include all of our prompts in the Appendix.
+3.4
+Guides can overcome computational limitations of Transformers
+It’s unsurprising that Transformer models trained on (often imperfect) human data generate logical
+inconsistencies or generalize in unpredictable ways. Below we show that LOGICGUIDE can helpfully
+address these practical failures. Guides also provably expand the computational power of Transform-
+ers. As a concrete example, consider the PARITY problem: given a binary input string, output the
+number of 1 symbols modulo 2. The following result is established in [10]:
+(Corollary 2 in [10]). Transformers with hard attention cannot model PARITY. More precisely, no
+fixed-size decoder-only Transformer with hard attention can process an input string and generate a
+character indicating whether its input length was odd or even.
+Computational limitations like this directly translate to corresponding limits to performing logical
+reasoning. For instance, the PARITY problem corresponds to the problem of processing iterated
+negations in propositional logic, and thus is a sub-problem of reasoning in any other more expressive
+logic. Yet PARITY is a trivial problem on a traditional computer. Therefore, with the protocol from
+§3, a Transformer model could rely on an external counting guide as long as it was able to provide
+its input string within the guide delimiters. The ECHO problem summarizes this required capability:
+given an input string of arbitrary length, followed by a special delimiter, copy the input into the
+output. We observe that the following holds:
+Proposition. There exists a fixed-size, decoder-only Transformer with hard attention that can model
+ECHO for unbounded inputs.
+5
+
+We show this by manually constructing this Transformer network in the Appendix. A simple
+modification allows this network to be combined with a guide to solve PARITY using the protocol
+defined in §3. This establishes the following:
+Corollary. Transformers with hard attention and a guide tool can model PARITY.
+The idea extends immediately to other example problems used in the literature to analyze computa-
+tional properties of Transformers. This simple observation points out that guided (or even regular
+tool-using) Transformers have fundamental differences as models of computation. As language
+model tools become more prevalent in practical deployments, future theoretical analyses cannot
+ignore reliance on external tools; there is an exciting opportunity for future work in understanding
+these hybrid systems, where computation alternates inside and outside of neural networks.
+4
+Experimental evaluation
+We now evaluate the effectiveness of LOGICGUIDE in improving language models on reasoning
+tasks. We focus on three research questions:
+RQ1:
+Does LOGICGUIDE improve the accuracy of language models in multi-step reasoning?
+We investigate this question in §4.1 using OpenAI GPT-3, OpenAI GPT-3.5 and LLaMA 13B, and
+three multi-step reasoning datasets (PrOntoQA [22] and ProofWriter[27], as well as the DeontiQA
+problems we introduce).
+RQ2:
+Does LOGICGUIDE reduce content effects in language model reasoning? §4.2 explores this,
+leveraging the PrOntoQA False Ontology split and the Syllogism Validity dataset [6].
+RQ3:
+Can an LLM self-improve using LOGICGUIDE by learning from its own solutions? In §4.3,
+we explore improving a LLaMA 13B model using the Self-Taught Reasoner method.
+4.1
+Impact of LOGICGUIDE on reasoning accuracy
+Datasets
+We use two recent natural language reasoning datasets: PrOntoQA [22] and ProofWriter
+[27]. Both datasets contain generated reasoning problems with (1) a list of assumptions (e.g. “Every
+dog is a mammal”, or “Sam is a dog”), and (2) a proposition that can be reasoned about from the
+assumptions (e.g. “Sam is a mammal?”). In both datasets, the goal is to answer the question with
+either true or false. Problems are categorized by how many reasoning “hops” the solution needs (1
+to 5). In addition, PrOntoQA has three splits: “True Ontology”, where the rules are coherent with
+common sense, “False Ontology”, where rules violate commonsense (e.g., “Every composite number
+is prime”), and “Fictitional Ontology”, which uses made-up concepts (e.g., “Every rumpus is feisty.”).
+ProofWriter uses real concepts for all rules (e.g., people, animals, colors), but the rules are generated
+at random–thus they also often contradict commonsense. We use the problems from ProofWriter that
+have proofs for the answer (i.e. ignoring the “closed-world assumption” and “unknown” problems,
+where fully justifying the answer requires meta-logical reasoning).
+Language models
+We evaluate three language models in the few-shot setting: OpenAI GPT-3
+(text-davinci-003; [2]), OpenAI GPT-3.5 Turbo (gpt-3.5-turbo) and LLaMA 13B [28]. We
+use 4 few-shot examples for the vanilla models. For guided models, the prompt examples are
+augmented to show formalized reasoning. Given the assumptions and the question, we first show the
+model how to formalize the assumptions and the proof goal, and then present the chain-of-thought
+where sentences are preceded by a guided inference (in an infer block, c.f. §3.3). Since this makes
+the prompt longer, we only use two prompt examples for the guided models: one where the answer is
+true and one where it is false. We implement CSD on the OpenAI models using their public API,
+which exposes a parameter to bias the logits on given tokens. We use the rejection-based sampling
+procedure described in [20], which only requires extra API calls when we detect a violation in
+the model’s output inside guided blocks. gpt3.5-turbo requires a slight adaptation (to resume
+generation) since it is a chat-based model; we detail this along with all of our prompts in the Appendix.
+Results
+Fig. 3 shows few-shot results on multi-hop reasoning, measuring final-answer accuracy.
+When models do not provide any answer to the problem, we assume a random guess. Overall,
+6
+
+Figure 3: Final answer accuracies with guided and unguided language models on PrOntoQA and
+ProofWriter, with bootstrapped 95% confidence intervals.
+guided models perform significantly better. GPT-3 and GPT-3.5 are highly accurate in formalizing
+assumptions, and enjoy the largest benefits (with nearly perfect performance on PrOntoQA with
+LOGICGUIDE, and improving from chance to 80% correct on ProofWriter). For them, LOGICGUIDE
+essentially eliminates single-step reasoning errors, and the impact of this benefit grows in solutions
+requiring more hops—a single error is enough to reach the wrong final conclusion. LLaMA 13B
+sees gains between 10 and 20% in PrOntoQA False and Fictitional, while LOGICGUIDE hurts its
+performance in PrOntoQA True (where the unguided model often avoids reasoning altogether, as the
+answer follows common sense) and ProofWriter.
+We observe two main failure modes: (1) models can misformalize assumptions, and (2) they can fail
+at planning, making a sequence of valid inferences that do not ultimately lead to the goal. When
+formalization errors happen, it’s more common that no conclusion can be drawn, rather than a wrong
+conclusion: in only 1.6% of the solutions did a guided model formally derive a wrong answer; these
+cases were mostly due to missing a negation when formalizing a sentence (and mostly for LLaMA on
+ProofWriter). A more common formalization failure (especially for LLaMA) was to use inconsistent
+names for properties or relations, e.g. (sees A B) in one place and (see B C) in another. When
+planning fails and no further inferences can be made, LOGICGUIDE generates the string nothing in
+the [[infer]] block. When that happens, we observed models spontaneously concluding that the
+answer is “Unknown” or “Cannot be concluded” despite that not being demonstrated in the prompt
+(models abstained in 78% of the cases where they exhausted the inferences that could be made, while
+guessing “False” in 19% of those cases). This contrasts with the unguided models, which most often
+still make an unjustified guess, writing as if it was a logical conclusion (only unguided GPT-3.5 Turbo
+abstained in our experiments, in 9% of its predictions).
+Errors in language model reasoning would be especially problematic in practice when an agent
+must decide which actions are permissible. Hence we created DeontiQA: a set of 60 new reasoning
+problems inspired by Deontic Logic [29]. We follow the same methodology used in PrOntoQA to
+create the problems, creating logical forms first and then realizing them in natural language. Like in
+PrOntoQA, we add distractor rules to prevent guessing the answer from surface shortcuts. In these
+problems, the goal is to decide whether a given action is permissible, obligatory, or impermissible in
+the context of managing calendar events for a group of people. We detail the creation of DeontiQA
+in the Appendix, and make the dataset available along with our code. DeontiQA problems are
+significantly longer (up to 28 rules) compared to PrOntoQA (maximum of 18). This increased length
+means we are only able to fit one prompt example in the context window of GPT-3 and GPT-3.5 Turbo.
+We find LOGICGUIDE to be helpful on DeontiQA: GPT-3 alone is correct on 61.6% of problems,
+which increases to 80.0% with LOGICGUIDE. GPT-3.5 Turbo alone achieves 77.5% accuracy which
+increases to 81.3% when guided.
+Overall, this provides positive evidence for our first research question: LOGICGUIDE can significantly
+improve the accuracy of base models in natural language reasoning problems. Their answers become
+7
+
+Figure 4: Accuracies of models with and without LOGICGUIDE on the Syllogism Validity task.
+not only more accurate but also more trustworthy: LOGICGUIDE makes models answer “Unknown”
+when they don’t have an answer, rather than producing an unsupported guess.
+4.2
+Mitigating content effects in reasoning
+Both humans [9] and language models [6] have been shown to suffer from content effects in rea-
+soning: their accuracy in logical judgements is influenced by prior beliefs about the assumptions
+and conclusions. For instance, from the assumptions that “Some librarians are happy people” and
+“Some happy people are healthy people”, it does not follow that “Some librarians are healthy people”.
+Humans and LMs have difficulty judging this argument as invalid because the conclusion agrees
+with prior beliefs. We hypothesize that LMs will have smaller influence from the content when
+formalizing assumptions, rather than reasoning from logical sentences. If that is the case, then using
+LOGICGUIDE will help mitigate content effects.
+We use two tasks to investigate this hypothesis. First, we contrast the results in the different PrOntoQA
+ontologies. As in the original PrOntoQA results [22], we see that the base performance of GPT-3
+and GPT-3.5 Turbo is already close to ceiling in the True Ontology split (where the model doesn’t
+strictly need to reason correctly as long as it judges the conclusion using common sense). In contrast,
+accuracy is significantly lower in the False and Fictitional ontologies and decays with more hops.
+However, both of these models are highly accurate in formalizing assumptions, and thus benefit
+from the guide in the False and Fictitional ontologies: performance is near ceiling. Interestingly,
+GPT-3.5 Turbo still exhibits occasional content effects, explicitly judging the conclusions derived
+using LOGICGUIDE as contradictory. For instance, in one problem where the model must decide
+whether Sam is luminous or not, it is given that “Sam is a snake”, and from the given assumptions the
+model correctly concludes “... [[infer:(sheep sam)]] Sam is a sheep”. It then proceeds to question
+this conclusion and halts: “This contradicts the fact that Sam is a snake. Therefore, we cannot infer
+whether Sam is luminous or not.”.
+Second, we leverage the Syllogism Validity dataset [6]. In this task, the model is given two as-
+sumptions and a conclusion, and has to decide if together they constitute a valid argument (i.e., the
+conclusion logically follows from the assumptions). The example above about librarians is taken
+from this dataset. Solutions have a single step: judging the argument as valid or invalid. When using
+LOGICGUIDE, we prompt the model to first perform a single inference given its formalization of
+the assumptions and then judge the validity of the argument. Syllogism Validity has 3 conditions:
+“Nonsense”, where rules are about made-up concepts, “Consistent“, where the conclusions agree with
+commonsense regardless of whether the argument is valid, and “Inconsistent”, where the conclusion
+always violates world knowledge. Unguided models behave consistently with those in [6]: in the
+“Consistent” split, all models strongly tend to judge the argument as being valid, thus performing close
+to chance (GPT-3.5 Turbo is slightly better, at 60%). Both GPT-3 and GPT-3.5 Turbo are, however,
+highly accurate at formalizing the assumptions and conclusions and tend to trust LOGICGUIDE,
+nearing ceiling performance for all conditions. LLaMA 13B has much more difficulty judging the
+syllogisms, performing near chance in all conditions. However, it is still successful at formalizing
+many syllogisms, obtaining non-trivial performance (60% to 77%) when using LOGICGUIDE. In
+failure cases, it often confuses logical connectives (e.g., formalizing “Some X are Y” as “X implies
+Y” and vice-versa). We overall see positive evidence for our second research question: models with
+LOGICGUIDE show greatly diminished content effects, with stronger benefits for models that are
+more capable of formalizing individual sentences.
+8
+
+4.3
+Learning to reason by guided self-improvement
+Finally, we consider improving the reasoning ability of a language model. The Self-Taught Reasoner
+(STaR; [35]) is a simple method for improving LLMs on reasoning tasks that has been shown to
+be effective in symbolic, mathematical and commonsense reasoning. Given a dataset of reasoning
+problems paired with correct final answers (but not reasoning traces), STaR iterates between (1)
+solving problems with few-shot chain-of-thought prompting, and (2) fine-tuning the model on its
+own generated rationales that led to correct final answers. This allows the model to bootstrap its own
+reasoning from a small seed set of few-shot examples.
+Crucially, STaR relies on the premise that if a generated rationale led to the correct answer, it is
+likely to be correct. While this holds in domains like arithmetic, it breaks down in binary answer
+tasks like PrOntoQA. In these cases, right answers will happen often with bad rationales, leading
+STaR and similar approaches to fine-tune on incorrect reasoning. Indeed, the authors in [35] remark
+that “filtering bad reasoning paired with correct answers remains an open question.”
+Figure 5: Accuracy of LLaMA 13B
+on held-out PrOntoQA problems when
+bootstrapping using STaR.
+We thus consider STaR training on either all correct an-
+swers (with and without the guide) or only on certified
+correct answers. We run 2 STaR iterations with LLaMA
+13B on PrOntoQA2. In each iteration, we attempt 200 ran-
+dom problems equally split between 1 and 5 hops, and
+fine-tune on successful solutions, evaluating on unseen
+problems.
+Fig. 5 shows the results. As predicted in [35], the high
+chance of guessing confounds STaR, and training on all
+rationales that yield the right answer does not give mean-
+ingful improvements (“Unguided”, red curve). Training
+on all guided solutions leading to correct answers brings
+some improvement (“Guided”; 72% to 80% after one iter-
+ation), but still ends up over-fitting to accidentally-correct
+reasoning. Fine-tuning only on certified correct answers
+avoids this trap and achieves high performance (“Strict
+Guided”, up to 86%). This allows us to positively answer our third research question: LOGICGUIDE
+can be used for effective self-improvement in reasoning, in cases where naïve methods collapse.
+5
+Discussion and conclusion
+We introduced guide tools for language models. When invoked, a guide locally constrains generation
+to a controlled set of statements. LOGICGUIDE leveraged this idea for logical reasoning, where the
+guide allows the LM to formalize its interpretation of input sentences and make certifiably sound
+inferences with respect to its formalization. This avoids inferences that do not follow from stated
+assumptions, substantially improving accuracy in natural language reasoning problems.
+Two major challenges remain. First, natural language is often ambiguous and can be difficult
+to faithfully represent in formal logic. Indeed, the appropriate formalization of many ubiquitous
+constructions is still an active subject of philosophical debate [17] (e.g., [5] recently discusses the
+formalization of “A unless B”). Domains where arguments tend to have more systematic logical
+structure, such as law, are more likely to benefit from tools like LOGICGUIDE, based on formalization.
+Second, making correct logical inferences does not imply making useful ones. LLMs can still
+fail at planning by making inferences that do not eventually connect to their goal. Many current
+investigations into planning techniques for LM reasoning are complementary to our work and can be
+integrated with guides [16, 37].
+Language models bring to reasoning the flexibility of human language and a wealth of useful prior
+knowledge. But that power comes with lack of reliability and difficulty verifying extended reasoning.
+Our approach points to a rich direction for seamlessly integrating reliable symbolic and flexible
+neural reasoning into a unified text stream. The result is better, and more easily verified, reasoning.
+2ProofWriter has shortcuts that allow guessing the answer without reasoning [36], which fine-tuning quickly
+learns. PrOntoQA explicitly includes distractor rules to avoid shortcuts. Thus, we focus on PrOntoQA here.
+9
+
+References
+[1] Bruno Barras, Samuel Boutin, Cristina Cornes, Judicaël Courant, Jean-Christophe Filliatre,
+Eduardo Gimenez, Hugo Herbelin, Gerard Huet, Cesar Munoz, Chetan Murthy, et al. The Coq
+proof assistant reference manual: Version 6.1. PhD thesis, Inria, 1997.
+[2] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[3] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm:
+Scaling language modeling with pathways. arXiv preprint arXiv:2204.02311, 2022.
+[4] Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to
+solve math word problems. arXiv preprint arXiv:2110.14168, 2021.
+[5] Roy Cook. ’unless’ is’ or’, unless’¬ a unless a’is invalid. dialectica, 2022.
+[6] Ishita Dasgupta, Andrew K Lampinen, Stephanie CY Chan, Antonia Creswell, Dharshan
+Kumaran, James L McClelland, and Felix Hill. Language models show human-like content
+effects on reasoning. arXiv preprint arXiv:2207.07051, 2022.
+[7] Leonardo De Moura and Nikolaj Bjørner. Z3: An efficient smt solver. In Tools and Algorithms
+for the Construction and Analysis of Systems: 14th International Conference, TACAS 2008,
+Held as Part of the Joint European Conferences on Theory and Practice of Software, ETAPS
+2008, Budapest, Hungary, March 29-April 6, 2008. Proceedings 14, pages 337–340. Springer,
+2008.
+[8] Leonardo de Moura, Soonho Kong, Jeremy Avigad, Floris Van Doorn, and Jakob von Raumer.
+The lean theorem prover (system description). In Automated Deduction-CADE-25: 25th Inter-
+national Conference on Automated Deduction, Berlin, Germany, August 1-7, 2015, Proceedings
+25, pages 378–388. Springer, 2015.
+[9] Jonathan St BT Evans. Logic and human reasoning: an assessment of the deduction paradigm.
+Psychological bulletin, 128(6):978, 2002.
+[10] Michael Hahn. Theoretical limitations of self-attention in neural sequence models. Transactions
+of the Association for Computational Linguistics, 8:156–171, 2020.
+[11] Joy He-Yueya, Gabriel Poesia, Rose E. Wang, and Noah D. Goodman. Solving math word
+problems by combining language models with symbolic solvers, 2023.
+[12] Ehsan Hosseini-Asl, Bryan McCann, Chien-Sheng Wu, Semih Yavuz, and Richard Socher. A
+simple language model for task-oriented dialogue. Advances in Neural Information Processing
+Systems, 33:20179–20191, 2020.
+[13] Cheng-Zhi Anna Huang, Ashish Vaswani, Jakob Uszkoreit, Noam Shazeer, Ian Simon, Curtis
+Hawthorne, Andrew M Dai, Matthew D Hoffman, Monica Dinculescu, and Douglas Eck. Music
+transformer. arXiv preprint arXiv:1809.04281, 2018.
+[14] Ximing Lu, Sean Welleck, Peter West, Liwei Jiang, Jungo Kasai, Daniel Khashabi, Ronan
+Le Bras, Lianhui Qin, Youngjae Yu, Rowan Zellers, et al. Neurologic a* esque decoding:
+Constrained text generation with lookahead heuristics. In Proceedings of the 2022 Conference
+of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies, pages 780–799, 2022.
+[15] Ximing Lu, Peter West, Rowan Zellers, Ronan Le Bras, Chandra Bhagavatula, and Yejin Choi.
+NeuroLogic decoding: (un)supervised neural text generation with predicate logic constraints.
+In Proceedings of the 2021 Conference of the North American Chapter of the Association for
+Computational Linguistics: Human Language Technologies, pages 4288–4299, Online, June
+2021. Association for Computational Linguistics.
+10
+
+[16] Seyed Mehran Kazemi, Najoung Kim, Deepti Bhatia, Xin Xu, and Deepak Ramachandran.
+Lambada: Backward chaining for automated reasoning in natural language. arXiv e-prints,
+pages arXiv–2212, 2022.
+[17] Robert Michels. The formalization of arguments. dialectica, 2022.
+[18] OpenAI. Gpt-4 technical report, 2023.
+[19] Gabriel Poesia and Noah D Goodman. Peano: Learning formal mathematical reasoning. arXiv
+preprint arXiv:2211.15864, 2022.
+[20] Gabriel Poesia, Alex Polozov, Vu Le, Ashish Tiwari, Gustavo Soares, Christopher Meek, and
+Sumit Gulwani. Synchromesh: Reliable code generation from pre-trained language models. In
+International Conference on Learning Representations, 2022.
+[21] John Alan Robinson. A machine-oriented logic based on the resolution principle. Journal of
+the ACM (JACM), 12(1):23–41, 1965.
+[22] Abulhair Saparov and He He. Language models are greedy reasoners: A systematic formal
+analysis of chain-of-thought. arXiv preprint arXiv:2210.01240, 2022.
+[23] Timo Schick, Jane Dwivedi-Yu, Roberto Dessì, Roberta Raileanu, Maria Lomeli, Luke Zettle-
+moyer, Nicola Cancedda, and Thomas Scialom. Toolformer: Language models can teach
+themselves to use tools. arXiv preprint arXiv:2302.04761, 2023.
+[24] Dhruv Shah, Bła˙zej Osi´nski, Sergey Levine, et al. Lm-nav: Robotic navigation with large
+pre-trained models of language, vision, and action. In Conference on Robot Learning, pages
+492–504. PMLR, 2023.
+[25] Peter Shaw, Jakob Uszkoreit, and Ashish Vaswani. Self-attention with relative position repre-
+sentations. arXiv preprint arXiv:1803.02155, 2018.
+[26] Mirac Suzgun, Nathan Scales, Nathanael Schärli, Sebastian Gehrmann, Yi Tay, Hyung Won
+Chung, Aakanksha Chowdhery, Quoc V Le, Ed H Chi, Denny Zhou, et al. Challenging big-
+bench tasks and whether chain-of-thought can solve them. arXiv preprint arXiv:2210.09261,
+2022.
+[27] Oyvind Tafjord, Bhavana Dalvi, and Peter Clark. Proofwriter: Generating implications, proofs,
+and abductive statements over natural language. In Findings of the Association for Computa-
+tional Linguistics: ACL-IJCNLP 2021, pages 3621–3634, 2021.
+[28] Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timo-
+thée Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open
+and efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+[29] Georg Henrik Von Wright. Deontic logic. Mind, 60(237):1–15, 1951.
+[30] Jason Wei, Xuezhi Wang, Dale Schuurmans, Maarten Bosma, Ed Chi, Quoc Le, and Denny
+Zhou. Chain of thought prompting elicits reasoning in large language models. arXiv preprint
+arXiv:2201.11903, 2022.
+[31] Jason Weston, Antoine Bordes, Sumit Chopra, Alexander M Rush, Bart Van Merriënboer,
+Armand Joulin, and Tomas Mikolov. Towards ai-complete question answering: A set of
+prerequisite toy tasks. arXiv preprint arXiv:1502.05698, 2015.
+[32] Yuhuai Wu, Albert Qiaochu Jiang, Wenda Li, Markus Rabe, Charles Staats, Mateja Jamnik,
+and Christian Szegedy. Autoformalization with large language models. Advances in Neural
+Information Processing Systems, 35:32353–32368, 2022.
+[33] Zhengyuan Yang, Linjie Li, Jianfeng Wang, Kevin Lin, Ehsan Azarnasab, Faisal Ahmed,
+Zicheng Liu, Ce Liu, Michael Zeng, and Lijuan Wang. Mm-react: Prompting chatgpt for
+multimodal reasoning and action. arXiv preprint arXiv:2303.11381, 2023.
+11
+
+[34] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao.
+React: Synergizing reasoning and acting in language models. arXiv preprint arXiv:2210.03629,
+2022.
+[35] Eric Zelikman, Yuhuai Wu, Jesse Mu, and Noah Goodman. Star: Bootstrapping reasoning with
+reasoning. Advances in Neural Information Processing Systems, 35:15476–15488, 2022.
+[36] Honghua Zhang, Liunian Harold Li, Tao Meng, Kai-Wei Chang, and Guy Van den Broeck. On
+the paradox of learning to reason from data. arXiv preprint arXiv:2205.11502, 2022.
+[37] Hongyu Zhao, Kangrui Wang, Mo Yu, and Hongyuan Mei. Explicit planning helps language
+models in logical reasoning. arXiv preprint arXiv:2303.15714, 2023.
+12
+
+A
+Proofs
+The PARITY language, as defined in Section 4 in [10], consists of the set of strings in the vocabulary
+{0, 1} where the number of 1’s in the string is even. A decoder-only Transformer is said to model
+a formal language, such as PARITY, if it is capable of classifying input strings as belonging (1) or
+not belonging (0) to the language in its activations after reading the string and an end-of-sequence
+symbol.
+Hahn [10] showed that Transformers with hard attention cannot model PARITY with essentially the
+following argument (Theorem 1). For a hard-attention Transformer with a given size, it is possible to
+find input restrictions (essentially, input “templates” where some input symbols are fixed to either
+0 or 1 and the others are allowed to vary) where there is an input-independent limit in how many
+input symbols can influence the function modeled by the Transformer. But changing even a single
+ignored input symbol in a string s1, turning it into s2, will change membership with respect to the
+PARITY language (s1 is in PARITY if and only if s2 is not). Thus, if the Transformer will produce the
+same output for both s1 and s2, it cannot be correct in both cases. Hence, it cannot model PARITY in
+general. The difficulty presented here is in modeling a function that is sensitive to all input bits with
+a bounded hard-attention Transformer network.
+We here show that, given a proper guide function (as defined in §3) for PARITY, which is trivial to
+implement in a traditional computer, we can construct a hard-attention Transformer network that will
+read in the input string, activate the guide, copy its input to the guide’s input, and then be constrained
+to generate the correct output (a bit indicating membership to PARITY). Our first step is to show a
+construction of a Transformer network that models ECHO: the problem of reading the input string and
+copy it into the output. ECHO is similar to PARITY in that the output depends on all input symbols,
+but it differs in that each output symbol only depends on one input symbol. This makes it easy to
+implement with a hard-attention Transformer, circumventing the input insensitivity results from [10].
+Proposition. There exists a fixed-size, decoder-only Transformer with hard attention that can model
+ECHO for unbounded inputs.
+Proof. We first construct the appropriate Transformer by specifying input and positional embeddings
+and hidden layer weights, and then show that it behaves as desired. Our Transformer will consist of a
+single self-attention layer and a final linear output layer.
+First, let V = {· · · , $} be the vocabulary. Our Transformer will model ECHO for a string containing
+any number of tokens and ending in the end-of-sentence symbol $ (which is assumed to not be
+contained otherwise in the input).
+We let the hidden dimension be H = |V| + 2. We use the V standard basis vectors for embedding
+input symbols.
+To define 2-dimensional positional embeddings, first let R =
+ cos 1
+n −sin 1
+n
+sin 1
+n
+cos 1
+n
+
+be the rotation matrix
+for an angle of 1
+n, where n is the input length3. We define positional embeddings ρi with ρ0 = [0, 0]T
+representing position 0, and ρi = Rρi−1 for i > 0.
+Following the notation from [10], we take Layer 0 of the Transformer, f(vi, ρi), to be the con-
+catenation of the symbol embedding of vi (the i-th standard basis vector in R|V|) with the position
+embedding ρi. and with a third 2-dimensional vector qi as follows: qi will be equal to ρ0 for i = 0,
+and will be the zero vector otherwise. This gives a (|V| + 2 × 2)-dimensional hidden vector for each
+input symbol as input to the first self-attention layer. We can see this vector hi as a concatenation of
+three vectors, which we’ll name oi (the first V dimensions), ρi and qi.
+To construct the self-attention layer, we must specify the weight matrices Q, K and V for a single
+attention head (we’ll encode all the useful computation in the self-attention phase, and thus assume the
+identity function in the feed-forward layer). We’ll use dot-product attention (thus, f att
+k,h(a, b) = aT b).
+3We show the simplest construction where the positional embeddings depend on n to highlight the key
+mechanism for implementing ECHO, though this dependency can be removed by using relative position encodings
+[25, 13]. The missing mechanism is to “look up n positions before”, where n is input-dependent. But this can
+be recovered by looking up the position of the $ symbol, then using a relative encoding to look up that same
+number of positions behind. This requires adding one extra self-attention layer, but is otherwise a mechanical
+extension of this construction.
+13
+
+The query vector for position i will be constructed by the linear mapping hi 7→[0, 0, Rρi]. This
+linear map is encoded into Q. In turn, we let K be the linear transformation that sets the first V
+dimensions to 0, and V will be the corresponding transformation that sets the position embedding
+dimensions to zero.
+The final output layer is the simple linear transformation that reads out the value in vi and ignores
+the remaining 2 dimensions. This matrix O has input dimension H and output dimension |oi| = |V|,
+matching the vocabulary embedding dimensionality. This concludes the construction.
+We now analyze the behavior of sampling from this Transformer network.
+Assume the input is initialized with a sequence s of ending in the $ symbol, with |s| = n. As
+constructed, we have Rρn = ρ0; thus, the largest dot-product of the query at the $ symbol will be
+with the first input symbol, regardless of its content. This will cause its corresponding value to be
+selected by the arg max in hard attention, and that character will be copied over to the output. At the
+next position, we’ll have Rρn+1 = Rρ0 = ρ1, causing the second character to be copied by the same
+argument. This will repeat for as many characters as we sample, cycling over the input.
+With a network implementing ECHO, we can then model PARITY:
+Corollary. Transformers with hard attention and a guide tool can model PARITY.
+Proof. To implement this in our framework, we can define this guide as a completion engine that first
+produces a regular expression matching any sequence of bits followed by a $ symbol, and then, after
+a maximal match to this regular expression, will generate a regular expression that only matches the
+number of 1s in the previous sequence modulo 2. We can then integrate this guide with delimiters
+t1 = $, t2 = #. The last generated character before # will be the parity bit.
+We can also extend this construction to make the symbol generated after # to be the parity bit, by
+adding an extra self-attention layer where an input symbol embedding of # overrides the position to
+be looked up to be R−2ρi (i.e., the character two positions before).
+B
+Other Guides
+In §3.3 we explored LOGICGUIDE, which captured a rich set of operations that both set and leverage
+state, as well as a complex external logical support tool. Nonetheless, many other guides can be easily
+defined in this same framework. We survey several such guides here as potential ideas for future
+work:
+Memory Guide A simple guide in the same format of LOGICGUIDE can be one where the model
+can set values to keys ([[set:key=value]]), and later on retrieve the value associated
+with a given key ([[get:key=value]]). When retrieving, the guide can limit the key to be
+within one of the existing values, and will force the value to be the last stored one. Values
+can be either overridden or added to a set, depending on the domain. This can effectively
+implement memory, and this can extend beyond a simple context window provided that the
+guide keeps external memory. In problems like the bAbI tasks [31] requiring models to
+keep track of the state of objects and characters through long stories, this guide can reduce
+the problem of remembering locations (and avoiding interference in self-attention) by the
+problem of translating each question into a query, using only local information.
+Quote Guide Language models often hallucinate quotes, e.g. saying that “According to Wikipedia,
+’XYZ’. Therefore...”. We can implement a simple quote guide that forces quotes to actually
+come from a trusted source. Specifically, whenever a prefix like [[quote:]] is generated,
+the guide can force the subsequent output to be one of the sentences contained in a certain
+web page (that set is regular). Externally, an UI can even mark guided quotes with their
+source, which can be kept by the guide.
+Algebra Guide Mathematical reasoning tools can be also integrated as guides for math problem-
+solving. Peano itself was originally used with algebra problems, and can thus also serve as a
+guide for mathematical reasoning. We can also leverage other tools, such as computer algebra
+systems, as guides. One example is the SymPy integration with Codex used previously
+to solve math word problems [11], where some instructions can add variables, and some
+14
+
+can indicate to the solver a variable to be solved for. In the case of [11], the model simply
+indicates which variable to solve for, and the answer is externally extracted. When specifying
+equations in an [[eq]] block, the guide can force the model to output a syntactically valid
+equation, and also one that only uses already existing variables. This will guarantee that
+parentheses will be correctly closed (the completion engines in [20] achieve this by deriving
+a completion engine from a parser) and that variables are used after they are introduced. If
+we wanted the model to also use the results from the solver, we can turn the [[answer]]
+block into a [[solve:x=v]] guided block, where x is constrained to be one of the existing
+variables, and v is given by the algebra solver.
+C
+DeontiQA
+We generate the DeontiQA problems following the general methodology of PrOntoQA [22], where
+we first sample assumptions and proofs in a logical form and then realize those in natural language.
+The main qualitative differences are (1) in the specific logical framework we use and (2) in how we
+translate logical sentences into natural language.
+Logical framework
+We formalize a logical framework for a general domain of managing calendar
+and event invites in Peano. We create a base type for actions, as well as the deontic predicates
+permissible and obligatory, to be applied to actions. We have 5 object types: person, entity,
+reminder, event and invite. From these, we create 14 kinds of actions:
+• Given an event invite, the agent can accept, decline or send_notification for that
+invite.
+• Given an event, the agent can cancel_event.
+• Given a reminder specification (constructed with a person and a time period before the
+event), the agent can set_reminder.
+• Given an event and an entity, the agent can add_participant or remove_participant.
+• Given an event and a person, the agent can delegate_event.
+• For an event, a person might request_event_update, suggest_alternative_time, or
+check_availability
+• Given an event and a proper event property to be changed, the agent can update_event,
+reschedule_event, or change_visibility, with the property describing the proper
+update.
+Problem generation
+To generate a problem, we first sample a theory — a set of hypotheses —, and
+using those assumptions we try to construct a random derivation (applying axioms and assumptions
+to hypotheses or previous conclusions). The conclusion of the derivation (or its negation, 50% of the
+time) becomes the goal in the generated problem.
+Translation to natural language
+To realize the problem in natural language, we use the aid of
+GPT-4 [18], prompted to translate the logical statements into a story in natural language given a
+few examples, with sentences describing the axioms. All stories were manually checked to still
+be unambiguous and logically sound, and we only use GPT-4 to help with diversity. As a result,
+the DeontiQA problems show greater linguistic variation than both PrOntoQA and ProofWriter,
+especially at their beginning. We show 3 example problems in Fig. 6, Fig. 7 and Fig. 8. The full set
+of 60 problems is released along with the supplementary material.
+D
+Constrained Semantic Decoding with Chat Models
+Originally, Constrained Semantic Decoding was proposed to work with standard autoregressive lan-
+guage models [20]. This relied on the ability to bias the logits of the model during generation, which
+is both possible in local models as well as through the OpenAI API4. The OpenAI gpt3.5-turbo
+4https://platform.openai.com/docs/api-reference/completions/create#completions/
+create-logit_bias
+15
+
+Context: 1- In a company, there are three employees: Alice, Bob, and Carol. 2- They have a group called
+"WorkTeam". 3- They have three upcoming events: a team event, a team-building event, and a product
+launch event. 4- Bob is the organizer of the team-building event. 5- Carol is a participant in the product
+launch event. 6- The team event is a conference. 7- The team-building event is yearly. 8- The team event is
+a monthly event and is a short event, while the product launch event is a long event. 9- Alice is busy during
+the team event, while Bob is free during the product launch event. 10- The team event is a private event,
+and the product launch event is a public event. 11- If a person is busy during an event, it is impermissible
+to add them as a participant. 12- If a person is free during an event, it is permissible to add them as a
+participant. 13- If an event is a long event, it is obligatory to add groups as a participant. 14- If an event has
+high priority for a person, then it is not obligatory to set a reminder for a few days before the event for that
+person. 15- If an event is a conference, it is permissible to update the event to be public. 16- If an event has
+low priority for a person, it is permissible to cancel the event. 17- If an event is short, it is impermissible
+to reschedule the event yearly. 18- If an event has low priority for a person, then it is obligatory to set
+a reminder for a few days before the event for that person. 19- If an event is private, it is obligatory to
+remove Carol as a participant. 20- If a person is a participant in an event, it is permissible to request an
+event update from them. 21- If a person is the organizer of an event, it is obligatory to change the event’s
+visibility to confidential. 22- If an event is a monthly event, it is a short event. 23- If an event is a yearly
+event, it is a long event. 24- If an event is long, then Carol has high priority for that event. 25- If an event
+is a conference, it is a public event. 26- If an event is private, it is a meeting. 27- If an event is public, it is
+a social event. 28- If a person is the organizer of an event, they are a participant in that event.
+Question: Given the rules above, is it not obligatory for Carol to set a reminder for a few days before the
+team-building event?
+Reasoning: The team-building event is a yearly event. The team-building event is a long event. Carol has
+high priority for the team-building event. If an event has high priority for a person, then it is not obligatory
+to set a reminder for a few days before the event for that person. Thus, it is not obligatory for Carol to set a
+reminder for a few days before the yearly team-building event.
+Answer (yes or no): Yes, it is not obligatory for Carol to set a reminder for a few days before the yearly
+team-building event.
+Figure 6: Example #1 of a DeontiQA problem.
+Context: 1- In a marketing agency, there are three employees: Alice, Bob, and Carol. 2- Alice is the
+marketing manager, Bob is a graphic designer, and Carol is a content writer. 3- The company has a remote
+team called "CreativeTeam". 4- They have three upcoming events: a brainstorming session, a company
+party, and a progress event. 5- Alice is the organizer of the brainstorming session, Carol is a participant in
+the company party, and the CreativeTeam is a group participant in the progress event. 6- The brainstorming
+session is short, while the company party is a long event. 7- The brainstorming session is a meeting, and
+the company party is a social event. 8- If an event has high priority for a person, it is permissible for them
+to suggest an alternative time. 9- If a person is the organizer of an event, it is obligatory to add them as a
+participant. 10- If a person is free during an event, it is permissible for them to accept an individual invite
+to the event. 11- If a group is a participant in an event, it is permissible to delegate the event to the group.
+12- If a person is busy during an event, it is impermissible to set a reminder for a few minutes before the
+event. 13- If a person is a participant in an event, it is permissible to remove them as a participant. 14-
+For short events, it is permissible to update the event to a social event. 15- If a person’s status is tentative
+for an event, it is obligatory to check the availability of the person for that event. 16- If an event has high
+priority for a person, it is obligatory to set a reminder for a few days before the event. 17- If a person is a
+participant in an event, it is impermissible for them to suggest an alternative time. 18- If an event is public,
+it is obligatory to add Alice as a participant. 19- Meetings are public events. 20- Public events are short
+events. 21- If a person is the organizer of an event, their priority for that event is high. 22- If a person is a
+participant in an event, they are available for that event. 23- If an event is short, Bob is a participant. 24-
+Daily events are short events. 25- If a person has a high priority for an event, they are busy during that
+event. 26- If a person has a low priority for an event, they are free during that event. 27- If a group is a
+participant in an event, the event is public. Question: Given the rules above, is it permissible for Bob to
+suggest an alternative time for the progress event? Reasoning: The CreativeTeam is a group participant
+in the progress event. The progress event is a public event. The progress event is a short event. Bob is a
+participant in the progress event. It is impermissible for a participant to suggest an alternative time for an
+event they are participating in. Answer (Yes or no): No
+Figure 7: Example #2 of a DeontiQA problem.
+16
+
+Context: 1- In a software company, there are three project managers: Alice, Bob, and Carol. 2- They have a
+team called "DevTeam". 3- They have two upcoming events: a team-building activity and a project review
+event. 4- Alice is the organizer of the team-building activity, Bob is a participant in the team-building
+activity, and the entire DevTeam is participating in the team-building activity. 5- The project review is a
+short event. 6- The team-building activity is a social event. 7- The team-building activity is a public event.
+8- If a person is the organizer of an event, it is obligatory to add them as a participant. 9- If a person is a
+participant in an event, it is permissible for them to accept an individual invite to the event. 10- If an event
+is short, it is impermissible to cancel the event. 11- If a group is participating in an event, it is obligatory to
+add the group as a participant. 12- If a person is free during an event, it is permissible to set a reminder for
+a few hours before the event. 13- If a person is busy during an event, it is impermissible to reschedule the
+event to be a daily event. 14- If an event is public, it is obligatory to check Alice’s availability for the event.
+15- If a person is a participant in an event, it is permissible to delegate the event organization to them. 16-
+If a person’s availability for an event is tentative, it is permissible for them to suggest an alternative time
+for the event. 17- If an event has high priority for a person, then it is obligatory to set a reminder for them
+for a few days before the event. 18- If a person’s availability for an event is free, it is impermissible for
+them to suggest an alternative time for the event. 19- If an event is short, then it is a meeting. 20- If an
+event is a meeting, then Bob’s availability for the event is tentative. 21- If Alice’s availability for an event
+is tentative, then she is a participant in the event. 22- If a person is free for an event, then the event has low
+priority for them. 23- If an event is public, then it is a social event. 24- If an event is private, then it is a
+personal event. 25- If an event is daily, then it is not a weekly event. 26- If an event is weekly, then it is
+not a monthly event. Question: Given the rules above, is it permissible for Bob to suggest an alternative
+time for the project review? Reasoning: The project review is a meeting. Bob’s availability for the project
+review is tentative. It is permissible for a person with tentative availability to suggest an alternative time
+for the event. Therefore, it is permissible for Bob to suggest an alternative time for the project review.
+Answer (Yes or no): Yes, it is permissible for Bob to suggest an alternative time for the project review.
+Figure 8: Example #3 of a DeontiQA problem.
+has a different API, since it is a chat-based model. In this API, we pass a list of messages with roles
+(user or assistant, where the model understands the latter as marking its own past generations).
+The API also has a logit bias parameter. However, we unfortunately cannot pass an incomplete prefix
+for the model’s response. Thus, we are unable to force the model to complete a certain message while
+also applying logit biases. Every completion starts a new message. This requires an adaptation to the
+procedure in [20].
+We start with the usual rejection-based CSD procedure: we put few-shot examples in the previous
+messages showcasing the response format we want, and sample a full response from the model. We
+then use token-by-token CSD to validate the response. If this terminates without finding any violation,
+we’re done — the entire generation, including choices made in guided blocks (e.g., infer), were
+valid. If not, like in original CSD, we take the largest valid prefix and use the CSD algorithm to
+compute the set of tokens that are valid after that prefix.
+Here we reach the main difference in the API. We want the model to continue its message from the
+last valid token. However, this is not possible in the current API. Instead, we must request a new
+message. Fortunately, we found gpt3.5-turbo to very frequently simply continue its generation
+when its last message appears incomplete5. We exploit this behavior and (1) request a new message
+with a single token, passing the set of valid tokens in the logit bias, (2) append the sampled token
+to the previous message and request a new, unconstrained message, and (3) repeat until we have
+received a full response.
+When the model continues from where it stops, this approach is essentially equivalent to rejection-
+based CSD. Unfortunately, it is not fully reliable. In a number of cases, we found the model to
+insistently apologize after noticing that its previous message was incomplete. This is problematic
+when the previous message started a guided block that is to be finished in the next message. In this
+case, the model’s apology is contained in the guided block, and is thus always an invalid generation.
+What happens is that this immediately triggers a violation, and the CSD procedure above is executed.
+Often, the CSD corrections will eventually get the model to make enough choices to complete the
+guided block, at which point its apology is not an issue anymore (e.g., see Fig. 9. In rare (< 0.1%)
+5We hypothesize this is done so that models also complete their messages when the token limit is hit in the
+OpenAI Playground and users immediately request a new completion
+17
+
+Formalized context: 1- Every [[prop:dumpus]] is an [[prop:impus]]. [[axiom:(dumpus ’x) -> (impus
+’x)]]. 2- Each [[prop:vumpus]] is not [[prop:luminous]]. [[axiom:(vumpus ’x) -> (not (luminous ’x))]]. 3-
+[[prop:dumpus]] are [[prop:orange]]. [[axiom:(dumpus ’x) -> (orange ’x)]]. 4- Every [[prop:wumpus]]
+is [[prop:bitter]]. [[axiom:(wumpus ’x) -> (bitter ’x)]]. 5- Each [[prop:jompus]] is not [[prop:orange]].
+[[axiom:(jompus ’x) -> (not (orange ’x))]]. 6- [[prop:wumpus]] are [[prop:numpus]]. [[axiom:(wumpus
+’x) -> (numpus ’x)]]. 7- [[prop:impus]] are [[prop:rompus]]. [[axiom:(impus ’x) -> (rompus ’x)]]. 8-
+Every [[prop:impus]] is [[prop:opaque]]. [[axiom:(impus ’x) -> (opaque ’x)]]. 9- [[prop:numpus]] are
+[[prop:dull]]. [[axiom:(numpus ’x) -> (dull ’x)]]. 10- [[prop:vumpus]] are [[prop:wumpus]]. [[ax-
+iom:(vumpus ’x) -> (wumpus ’x)]]. 11- Each [[prop:numpus]] is a [[prop:dumpus]]. [[axiom:(numpus ’x)
+-> (dumpus ’x)]]. 12- [[object:wren]] is a [[prop:dumpus]]. [[axiom:(dumpus wren)]]. Formalized goal:
+[[goal:(orange wren)]]
+Reasoning: [[infer:(impus wren)]] Wren is an impus. [[infer:(rompus wren)]]’Apologies for the incomplete
+message.
+Continuing from where I stopped: [[infer:(opaque wren)]]"My apologies for the incomplete message.
+Continuing from where I stopped: [[infer:(orange wren)]]] Wren is orange. This was the goal.
+Answer: True
+Figure 9: Example generation of gpt3.5-turbo with LOGICGUIDE on PrOntoQA where the model
+started to apologize twice after violating the guide, but it eventually recovered with our chat adaptation
+of CSD.
+Formalized context: 1- [[object:bob]] is [[prop:blue]].
+[[axiom:(blue bob)]].
+2- [[object:bob]] is
+[[prop:quiet]]. [[axiom:(quiet bob)]]. 3- [[object:bob]] is [[prop:red]]. [[axiom:(red bob)]]. 4- [[ob-
+ject:bob]] is [[prop:rough]]. [[axiom:(rough bob)]]. 5- [[object:bob]] is [[prop:smart]]. [[axiom:(smart
+bob)]]. 6- [[object:charlie]] is [[prop:cold]]. [[axiom:(cold charlie)]]. 7- [[object:charlie]] is [[prop:red]].
+[[axiom:(red charlie)]]. 8- [[object:dave]] is [[prop:blue]]. [[axiom:(blue dave)]]. 9- [[object:dave]] is
+[[prop:quiet]]. [[axiom:(quiet dave)]]. 10- [[object:erin]] is [[prop:cold]]. [[axiom:(cold erin)]]. 11-
+[[object:erin]] is [[prop:white]]. [[axiom:(white erin)]]. 12- If something is [[prop:smart]] then it is
+[[prop:white]]. [[axiom:(smart ’x) -> (white ’x)]]. 13- All [[prop:quiet]], [[prop:rough]] things are
+[[prop:smart]]. [[axiom:(ifsomething isPSSorryPSI apologizePSI apologizePSI apologizePSI apologizePSI
+apologizePSI apologizePSI apologizePSI apologizePSI apologizePSI apologizePSI apologizePSI apolo-
+gizePSFormalized contextPSI apologize for the previous messagePSIPSIPSI apologize for the previous
+messagePSI
+Figure 10: Example generation of gpt3.5-turbo with LOGICGUIDE on ProofWriter where the
+model started to apologize after violating the guide, and did not recover. Here, it violated the s-expr
+syntax for defining axioms in Peano, but after being constrained it still insists in apologizing, instead
+of trying to finish the formula. This behavior is rare (< 0.1% of the cases), and would be avoided if
+the API had a parameter to give the model an incomplete message for it to complete.
+cases, the issue persists and we cannot recover from the apology (Fig. 10 shows an example). To
+avoid a prohibitive number of API calls, we aborted sampling when more than 20 violations were hit
+in the same solution.
+E
+Experimental Details
+Experiments with the OpenAI models were made using their public API. For LLaMA 13B, we ran
+and fine-tuned the model on an NVIDIA A100 80GB GPU. For fine-tuning when running STaR
+(§4.3), we performed inference on 200 problems — 40 for each number of hops from 1 to 5 — in
+each STaR iteration, and collected the generations where the model reached the correct answer (with
+each of the 3 criteria described in §4.3). We fine-tuned for 1 epoch (i.e., seeing each example exactly
+once) with a batch size of 2 and a learning rate of 2e-5. We used the Adam8bit optimizer with default
+parameters, reset in each iteration of STaR.
+F
+Prompts
+All of our prompts are provided in the attached supplementary material. We use JSON files for the
+chat model prompts, exactly as we pass them to the OpenAI API.
+18
+
+Context: Every dog is small. Every feline is a snake. Every animal is not bitter. Sheep are bitter. Cats are
+carnivores. Each vertebrate is a mammal. Mammals are felines. Each vertebrate is dull. Snakes are cats.
+Cats are not kind. Every snake is not happy. Every sheep is a vertebrate. Each feline is cold. Each dog is a
+sheep. Every mammal is not liquid. Every carnivore is a cow. Every carnivore is brown. Alex is a sheep.
+Question: True or false: Alex is not bitter.
+Formalized context: 1- Every [[prop:dog]] is [[prop:small]]. [[axiom:(dog ’x) -> (small ’x)]]. 2- Ev-
+ery [[prop:feline]] is a [[prop:snake]]. [[axiom:(feline ’x) -> (snake ’x)]]. 3- Every [[prop:animal]]
+is not [[prop:bitter]]. [[axiom:(animal ’x) -> (not (bitter ’x))]]. 4- [[prop:sheep]] are [[prop:bitter]].
+[[axiom:(sheep ’x) -> (bitter ’x)]]. 5- [[prop:cat]] are [[prop:carnivore]]. [[axiom:(cat ’x) -> (carnivore
+’x)]]. 6- Each [[prop:vertebrate]] is a [[prop:mammal]]. [[axiom:(vertebrate ’x) -> (mammal ’x)]]. 7-
+[[prop:mammal]] are [[prop:feline]]. [[axiom:(mammal ’x) -> (feline ’x)]]. 8- Each [[prop:vertebrate]]
+is [[prop:dull]]. [[axiom:(vertebrate ’x) -> (dull ’x)]]. 9- [[prop:snake]] are [[prop:cat]]. [[axiom:(snake
+’x) -> (cat ’x)]]. 10- [[prop:cat]] are not [[prop:kind]]. [[axiom:(cat ’x) -> (not (kind ’x))]]. 11- Every
+[[prop:snake]] is not [[prop:happy]]. [[axiom:(snake ’x) -> (not (happy ’x))]]. 12- Every [[prop:sheep]] is
+a [[prop:vertebrate]]. [[axiom:(sheep ’x) -> (vertebrate ’x)]]. 13- Each [[prop:feline]] is [[prop:cold]]. [[ax-
+iom:(feline ’x) -> (cold ’x)]]. 14- Each [[prop:dog]] is a [[prop:sheep]]. [[axiom:(dog ’x) -> (sheep ’x)]].
+15- Every [[prop:mammal]] is not [[prop:liquid]]. [[axiom:(mammal ’x) -> (not (liquid ’x))]]. 16- Every
+[[prop:carnivore]] is a [[prop:cow]]. [[axiom:(carnivore ’x) -> (cow ’x)]]. 17- Every [[prop:carnivore]]
+is [[prop:brown]]. [[axiom:(carnivore ’x) -> (brown ’x)]]. 18- [[object:alex]] is a [[prop:sheep]]. [[ax-
+iom:(sheep alex)]].
+Formalized goal: [[goal:(not (bitter alex))]]
+Reasoning: [[infer:(vertebrate alex)]] Alex is a vertebrate. [[infer:(dull alex)]] Alex is dull. [[infer:(mammal
+alex)]] Alex is a mammal. [[infer:(feline alex)]] Alex is a feline. [[infer:(not (liquid alex))]] Alex is not
+liquid. [[infer:(snake alex)]] Alex is a snake. [[infer:(cat alex)]] Alex is a cat. [[infer:(carnivore alex)]]
+Alex is a carnivore. [[infer:(not (kind alex))]] Alex is not kind. [[infer:(not (happy alex))]] Alex is not
+happy. [[infer:(cold alex)]] Alex is cold. [[infer:(brown alex)]] Alex is brown. [[infer:(cow alex)]] Alex is
+a cow. [[infer:(bitter alex)]] Alex is bitter. This contradicts the goal.
+Answer: False.
+Figure 11: Example generation of text-davinci-003 with LOGICGUIDE on the PrOntoQA False
+Ontology. The solution to this problem can be reasoned in one step, but the model is strongly biased
+towards making wrong conclusions. LOGICGUIDE avoids those, but the model still takes many more
+inference steps to eventually reach the goal, deriving many useless facts first.
+G
+Complete Samples
+We here provide full samples of solutions generated by language models with LOGICGUIDE, also
+showcasing the most common failure modes.
+Fig. 11 shows one case of text-davinci-003 on the PrOntoQA False Ontology, where the model
+properly formalizes all of the assumptions, but still tries to make wrong conclusions very often. As a
+result, its solution ends up taking a long detour to eventually get to the goal, but eventually does so
+correctly (it can be concluded directly from two of the assumptions).
+Fig. 13 shows one example of gpt3.5-turbo on ProofWriter, where the model further justifies its
+solution based on the axioms. We found these post-hoc justifications to be highly accurate. Unguided
+models sometimes also justify their inferences even if not prompted to do so, but to do so they must
+procuce hallucinations (or assume general world knowledge, such that “an animal cannot chase
+itself”).
+Fig. 12 shows one rare failure mode where the model misclassifies whether it has already proved the
+goal, and thus does not proceed further. We can detect this failure mode with LOGICGUIDE, since we
+have access to the Peano state and can ask the environment whether the goal was proved or not. In
+this way, as explained in App. E, we can distinguish certified and uncertified answers.
+Fig. 14 shows a case where LLaMA 13B misformalized (several) assumptions, whereas Fig. 15 shows
+a similar case with text-davinci-003 (much more rare). The result in both cases is that the model
+cannot make progress in its formal inferences, instead of making invalid deductions. Again, since we
+can detect when the answer was not formally derived, we can avoid fine-tuning on these cases where
+the model still guesses the right answer but with unsond reasoning, as we exploited in §4.3.
+19
+
+Formalized context: 1- The [[object:cat]] is [[prop:red]]. [[axiom:(red cat)]]. 2- The [[object:cat]]
+[[relation:visits]] the [[object:cow]]. [[axiom:(visits cat cow)]]. 3- The [[object:cow]] is [[prop:big]].
+[[axiom:(big cow)]]. 4- The [[object:cow]] [[relation:needs]] the [[object:dog]]. [[axiom:(needs cow dog)]].
+5- The [[object:cow]] [[relation:needs]] the [[object:squirrel]]. [[axiom:(needs cow squirrel)]]. 6- The
+[[object:dog]] does not [[relation:need]] the [[object:cat]]. [[axiom:(not (needs dog cat))]]. 7- The [[ob-
+ject:dog]] [[relation:visits]] the [[object:cow]]. [[axiom:(visits dog cow)]]. 8- The [[object:squirrel]] [[rela-
+tion:chases]] the [[object:cow]]. [[axiom:(chases squirrel cow)]]. 9- The [[object:squirrel]] is [[prop:nice]].
+[[axiom:(nice squirrel)]]. 10- The [[object:squirrel]] [[relation:needs]] the [[object:dog]]. [[axiom:(needs
+squirrel dog)]]. 11- If someone [[relation:needs]] the [[object:squirrel]] then they [[relation:chase]] the
+[[object:cat]]. [[axiom:(needs ’x squirrel) -> (chases ’x cat)]]. 12- If someone [[relation:chases]] the
+[[object:cat]] then the [[object:cat]] [[relation:visits]] the [[object:cow]]. [[axiom:(chases ’x cat) -> (visits
+cat cow)]]. 13- If someone [[relation:chases]] the [[object:cat]] then they are [[prop:nice]]. [[axiom:(chases
+’x cat) -> (nice ’x)]]. 14- If someone [[relation:chases]] the [[object:squirrel]] then the [[object:squirrel]]
+[[relation:chases]] the [[object:cow]]. [[axiom:(chases ’x squirrel) -> (chases squirrel cow)]]. 15- If
+someone [[relation:chases]] the [[object:cow]] and they [[relation:needs]] the [[object:squirrel]] then the
+[[object:cow]] [[relation:needs]] the [[object:squirrel]]. [[axiom:(chases ’x cow) -> (needs cow squirrel) ->
+(needs cow squirrel)]]. 16- If someone is [[prop:nice]] then they do not [[relation:need]] the [[object:cat]].
+[[axiom:(nice ’x) -> (not (needs ’x cat))]]. 17- If someone [[relation:needs]] the [[object:dog]] and they are
+[[prop:red]] then they [[relation:chase]] the [[object:dog]]. [[axiom:(needs ’x dog) -> (red ’x) -> (chases
+’x dog)]]. 18- If someone is [[prop:nice]] and not [[prop:green]] then they do not [[relation:visit]] the
+[[object:cat]]. [[axiom:(nice ’x) -> (not (green ’x)) -> (not (visits ’x cat))]].
+Formalized goal: [[goal:(not (needs cow cat))]]
+Reasoning: [[infer:(chases cow cat)]] The cow does not chase the cat. [[infer:(not (needs squirrel cat))]]]
+The cow does not need the cat. This was the goal.
+Answer: True
+Figure 12: Example generation of gpt3.5-turbo with LOGICGUIDE on ProofWriter where the
+model misidentifies whether it has reached the goal or not. Given the Peano state and the formalized
+goal, we can at any point detect whether the model has indeed proved its goal or not, i.e. whether its
+answer was certified or not. This can likely be avoided by making the step of outputting a conclusion
+be prefixed with a formal step, which can be constrained to only be allowed once the goal has been
+proved or disproved.
+(...) Formalized goal: [[goal:(quiet gary)]]
+Reasoning: [[infer:(young gary)]] Gary is young because he is round (from axiom 9). [[infer:(white gary)]]
+Gary is white because he is round and all round people are white (from axiom 5). [[infer:(not (quiet
+gary))]] Gary is not quiet because he is young and white, and all young, white people are not quiet (from
+axiom 7). Therefore, the answer is False.
+Figure 13: Example generation of gpt3.5-turbo with LOGICGUIDE on ProofWriter, where the
+model provides further justification on the inferences. We found that models are highly accurate in
+justifying the inferences post-hoc, provided that they are correct.
+20
+
+Formalized context: 1- The [[object:lion]] chases the [[object:squirrel]]. [[axiom:(chases lion squirrel)]].
+2- The [[object:lion]] is [[prop:big]]. [[axiom:(big lion)]]. 3- The [[object:lion]] is [[prop:blue]]. [[ax-
+iom:(blue lion)]]. 4- The [[object:lion]] is [[prop:kind]]. [[axiom:(kind lion)]]. 5- The [[object:lion]] is
+[[prop:nice]]. [[axiom:(nice lion)]]. 6- The [[object:lion]] is [[prop:young]]. [[axiom:(young lion)]]. 7-
+The [[object:lion]] needs the [[object:squirrel]]. [[axiom:(needs lion squirrel)]]. 8- The [[object:lion]] visits
+the [[object:squirrel]]. [[axiom:(visits lion squirrel)]]. 9- The [[object:squirrel]] chases the [[object:lion]].
+[[axiom:(chases squirrel lion)]]. 10- The [[object:squirrel]] is [[prop:big]]. [[axiom:(big squirrel)]]. 11- The
+[[object:squirrel]] is [[prop:blue]]. [[axiom:(blue squirrel)]]. 12- The [[object:squirrel]] is [[prop:kind]].
+[[axiom:(kind squirrel)]]. 13- The [[object:squirrel]] is [[prop:nice]]. [[axiom:(nice squirrel)]]. 14- The
+[[object:squirrel]] is [[prop:young]]. [[axiom:(young squirrel)]]. 15- The [[object:squirrel]] needs the
+[[object:lion]]. [[axiom:(needs squirrel lion)]]. 16- The [[object:squirrel]] visits the [[object:lion]]. [[ax-
+iom:(visits squirrel lion)]]. 17- If someone visits the [[object:squirrel]] then they chase the [[object:lion]].
+[[axiom:(visits squirrel lion) -> (chases lion)]]
+Formalized goal: [[goal:(chases lion lion)]]
+Reasoning: [[infer:nothing]] The lion does not chase the lion. This contradicts the goal.
+Answer: False
+Figure 14: Example generation of LLaMA 13B with LOGICGUIDE on ProofWriter, where the model
+misformalizes assumption 17. The natural language sentence reads “if someone visits the squirrel,
+then they chase the lion”, but the logical formulation written by the model would translate to “if the
+squirrel visits the lion, then the lion chases”. As a result, the model is not able to make any formal
+inferences. It still outputs an uncertified answer, which we can detect.
+(...) 13- If something [[relation:visits]] the [[object:squirrel]] and the [[object:squirrel]] [[relation:needs]]
+the [[object:bald_eagle]] then the [[object:squirrel]] is [[prop:green]]. [[axiom:(visits ’x squirrel) -> (needs
+squirrel bald_eagle) -> (green ’x)]]. 14- If something [[relation:needs]] the [[object:squirrel]] then it is
+[[prop:green]]. [[axiom:(needs ’x squirrel) -> (green ’x)]].
+Formalized goal: [[goal:(green squirrel)]]
+Reasoning: [[infer:(green bald_eagle)]] The bald eagle is green. [[infer:(green cow)]] The cow is green.
+[[infer:nothing]] Nothing can be inferred from the context about the squirrel. This contradicts the goal.
+Answer: False.
+Figure 15: Example generation of text-davinci-003 with LOGICGUIDE on ProofWriter, where
+the model misformalizes assumption 13. The natural language sentence reads “if someone visits the
+squirrel and the squirrel needs the bald eagle, then the squirrel is green”, but the logical formulation
+written by the model would translate to “if someone visits the squirrel and the squirrel needs the bald
+eagle, then they are green” (not the squirrel is green). Like in Fig. 14, the model is not able to make
+any formal inferences after its second step, and we can detect that its answer was not certified.
+21
+

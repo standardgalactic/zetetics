@@ -1,0 +1,4733 @@
+Compilation Semantics for a Programming
+Language with Versions
+Yudai Tanabe1[0000−0002−7990−0989] #,
+Luthfan Anshar Lubis2[0000−0002−1498−7788],
+Tomoyuki Aotani3[0000−0003−4538−0230], and
+Hidehiko Masuhara2[0000−0002−8837−5303]
+1 Kyoto University, Kyoto, Japan # ⋆⋆yudaitnb@fos.kuis.kyoto-u.ac.jp
+2 Tokyo Institute of Technology, Tokyo, Japan
+{luthfanlubis@prg.is.titech.ac.jp | masuhara@acm.org}
+3 Sanyo-Onoda City University, Yamaguchi, Japan aotani@rs.socu.ac.jp
+Abstract. Programming with versions is a paradigm that allows a pro-
+gram to use multiple versions of a module so that the programmer can
+selectively use functions from both older and newer versions of a single
+module. Previous work formalized λVL, a core calculus for programming
+with versions, but it has not been integrated into practical program-
+ming languages. In this paper, we propose VL, a Haskell-subset sur-
+face language for λVL along with its compilation method. We formally
+describe the core part of the VL compiler, which translates from the
+surface language to the core language by leveraging Girard’s translation,
+soundly infers the consistent version of expressions along with their types,
+and generates a multi-version interface by bundling specific-version in-
+terfaces. We conduct a case study to show how VL supports practical
+software evolution scenarios and discuss the method’s scalability.
+Keywords: Type system · Type inference · Version control system.
+1
+Introduction
+Updating dependent software packages is one of the major issues in software
+development. Even though a newer version of a package brings improvements,
+it also brings the risk of breaking changes, which can make the entire software
+defective.
+We argue that this issue originates from the principle of most programming
+languages that only allow the use of one version of a package at a time. Due to
+this principle, developers are faced with the decision to either update to a new,
+improved version of a package that requires many changes or to remain with an
+older version. The problem gets worse when a package is indirectly used. This
+dilemma often results in delays in adopting upgrades, leading to stagnation in
+software development and maintenance [16,2].
+⋆⋆# Corresponding author
+arXiv:2310.00298v1  [cs.PL]  30 Sep 2023
+
+2
+Y. Tanabe et al.
+Programming with versions [28,29,15,30] is a recent proposal that allows pro-
+gramming languages to support multiple versions of programming elements at a
+time so that the developer can flexibly cope with incompatible changes. λVL is
+the core calculus in which a versioned value encapsulates multiple versions of a
+value (including a function value). The λVL type system checks the consistency
+of each term so that a value produced in a version is always passed to functions in
+the same version. The calculus and the type system design are based on coeffect
+calculus [3,20].
+While λVL offers the essential language constructs to support multiple ver-
+sions in a program, the language is far from practical. For example, with multiple
+versions of a module, each version of the function must be manually represented
+inside a versioned value (i.e., a record-like expression). λVL is as simple as lambda
+calculus, yet it has a verbose syntax due to the coeffect calculus. In short, there
+are aspects of versioning in λVL that a surface language compiler can automate.
+We propose the functional language VL as a surface language for λVL along
+with its compilation method. In VL, a function name imported from an ex-
+ternal module represents a multi-version term, where each occurrence of the
+function name can reference a different version of the function. The VL compiler
+translates a program into an intermediate language VLMini, a version-label-free
+variant of λVL, determines the version for each name occurrence based on a type
+and version inference algorithm, and translates it back into a version-specialized
+Haskell program. VL also offers the constructs to explicitly control versions of
+expressions, which are useful to keep using an older version for some reason.
+This paper presents the following techniques in VL: (a) an application of
+Girard’s translation for translating VL into VLMini, (b) the bundling for mak-
+ing a top-level function act as a versioned value, and (c) a type and version
+inference algorithm for identifying the version of each expression with respect
+to the λVL type system. Finally, we prove the soundness of the inference system
+and implement a VL compiler. Code generation converts a VL program into a
+version-specialized Haskell program using the solution obtained from z3 [18].
+Paper Organization. Section 2 introduces incompatibility issues and fundamen-
+tal concepts in programming with versions with λVL and VL. Section 3 intro-
+duces bundling and Girard’s transformation. Section 4 presents an algorithmic
+version inference for VL. Section 5 features an implementation of VL, and Sec-
+tion 6 introduces a case study that simulates an incompatible update made in
+a Haskell library. Finally, Section 7 discusses further language development and
+concludes the paper by presenting related work and a conclusion.
+2
+Overview
+2.1
+Motivating Example
+First, we will explain a small example to clarify incompatibility issues. Con-
+sider a scenario where an incompatible change is made to a dependent package.
+
+Compilation Semantics for a Programming Language with Versions
+3
+1 module App where
+2 import Dir
+3 import Hash
+4 main () =
+5
+let s = getArg ()
+6
+digest = mkHash s in
+7
+if exists digest
+8
+then print "Found"
+9
+else error "Not found"
+module Dir where
+import Hash
+-- version 1.0.0
+exists hash =
+let fs = getFiles () in
+foldLeft
+(\(acc, f) ->
+acc || match f hash)
+false fs
+module Hash where
+-- version 1.0.0
+mkHash s = {- MD5 hash -}
+match s hash =
+mkHash s == hash
+module Hash where
+-- version 2.0.0
+mkHash s = {- SHA-3 hash -}
+match s hash =
+mkHash s == hash
+version 2.0.0
+version 1.0.0
+The exists provided from Dir (which depends on version 1 of Hash) expects
+an MD5 hash as an argument. However, after the dependency update of App
+on Hash, the value assigned to digest is a SHA-3 hash.
+Fig. 1. Minimal module configuration before and after the dependency update causing
+an error due to inconsistency expected to the dependent package.
+Figure 1 shows the package dependencies in a file explorer App based on a hash-
+based file search. This function is developed using the system library Dir and
+the cryptography library Hash. For simplicity, we equate packages and modules
+here (each package consists of a single module), and we only focus on the version
+of Hash. The pseudocode is written in a Haskell-like language.
+Before its update, App depends on version 1.0.0 of Hash (denoted by 99K).
+The App’s main function implements file search by a string from standard input
+using mkHash and exists. The function mkHash is in version 1.0.0 of Hash,
+and it generates a hash value using the MD5 algorithm from a given string. Hash
+also provides a function match that determines if the argument string and hash
+value match under mkHash. The function exists is in version 1.0.0 of Dir,
+which is also dependent on version 1.0.0 of Hash, and it determines if a file with
+a name corresponding to a given hash exists.
+Due to security issues, the developer of App updated Hash to version 2.0.0
+(denoted by −→). In version 2.0.0 of Hash, SHA-3 is adopted as the new hash
+algorithm. Since Dir continues to use version 1.0.0 of Hash, App needs two
+different versions of Hash. Various circumstances can lead to this situation: Dir
+may have already discontinued maintenance, or functions in Dir, other than
+exists, might still require the features provided by version 1.0.0 of Hash.
+
+4
+Y. Tanabe et al.
+Although the update does not modify App, it causes errors within App. Even
+if a file with an input filename exists, the program returns Not Found error
+contrary to the expected behavior. The cause of the unexpected output lies in the
+differences between the two versions required for main. In line 6 of App, an SHA-
+3 hash value is generated by mkHash and assigned to digest. Since exists
+evaluates hash equivalence using MD5, exists digest compares hashes gen-
+erated by different algorithms, evaluating to false.
+This example highlights the importance of version compatibility when dealing
+with functions provided by external packages. Using different versions of Hash
+in separate program parts is fine, but comparing results may be semantically
+incorrect. Even more subtle changes than those shown in Figure 1 can lead to
+significant errors, especially when introducing side effects or algorithm modifi-
+cations that break the application’s implicit assumptions. Manually managing
+version compatibility for all external functions is unfeasible.
+In practical programming languages, dependency analysis is performed before
+the build process to prevent such errors, and package configurations requiring
+multiple versions of the same package are rejected. However, this approach tends
+towards conservative error reporting. In cases where a core package, which many
+other libraries depend on, receives an incompatible change, no matter how mi-
+nuscule, it requires coordinated updates of diverse packages across the entire
+package ecosystem [2,29,31].
+2.2
+λVL
+λVL [28,29] is a core calculus designed to follow the principles: (1) enabling simul-
+taneous usage of multiple versions of a package, (2) ensuring version consistency
+within a program. λVL works by encapsulating relevant terms across multiple
+versions into a record-like term, tagged with a label indicating the specific mod-
+ule version. Record-like terms accessible to any of its several versions are referred
+to as versioned values, and the associated labels are called version labels.
+Version Labels Figure 2 shows the syntax of λVL. Given modules and their
+versions, the corresponding set of version labels characterizes the variation of
+programs of a versioned value. In λVL, version labels are implicitly generated
+for all external module-version combinations, in which Mi is unique, with the
+universal set of these labels denoted by L. Specifically, in the example illustared
+in Figure 1, L = {l1, l2} and l1 = {Hash = 1.0.0, Dir = 1.0.0}, l2 = {Hash =
+2.0.0, Dir = 1.0.0}. The size of L is proportional to V M where M is the number
+of modules and V is the maximum number of versions.
+Syntax of λVL λVL extends ℓRPCF [3] and GrMini [20] with additional terms
+that facilitate introducing and eliminating versioned values. Versioned values
+can be introduced through versioned records {li = ti} and promotions [t]. A ver-
+sioned record encapsulates related definitions t1, . . . , tn across multiple versions
+
+Compilation Semantics for a Programming Language with Versions
+5
+λVL syntax
+t ::= n | x | t1 t2 | λx.t | let [x] = t1 in t2 | u.l | ⟨li = ti | lk⟩| u
+(terms)
+u ::= [t] | {li = ti}
+(versioned values)
+A, B ::= Int | A →B | 2rA
+(types)
+r ::= ⊥| { li }
+(resources)
+L ∋l ::= {Mi = Vi}
+(version labels)
+Mi and Vi are metavariables over module names and versions of Mi, respectively.
+Fig. 2. The syntax of λVL.
+and their version labels l1, . . . , ln. For instance, the two versions of mkHash in
+Figure 1 can be bundled as the following version record.
+mkHash
+:=
+{l1 = λs.{- make MD5 hash -},
+l2 = λs.{- make SHA-3 hash -}}
+In λVL, programs are constructed via function application of versioned values.
+A function application of mkHash to the string s can be written as follows.
+app
+:=
+let [mkHash′] = mkHash in
+let [s] = [“compiler.vl”] in [mkHash′ s]
+This program (app hereafter) makes a hash for the string “compiler.vl”
+and is available for both l1 and l2. The contextual let-binding let [x] = t1 in t2
+provides the elimination of version values by binding a versioned value for t1
+to x, thus making it accessible in t2. Promotion [x] offers an alternative way to
+introduce versioned values, making any term t act as a versioned value.
+The evaluation of terms ti stored in a versioned value {li = ti} and [t] is
+postponed until a specific version label is later specified. To proceed with a
+postponed evaluation of a versioned value, we use extraction u.lk. Extraction
+specifies one versioned label lk for the versioned value u and recursively extracts
+the inner term tk corresponding to lk from {li = ti}, and t from [t] as follows.
+app#l1
+:=
+let [mkHash′] = mkHash in
+let [s] = [“compiler.vl”] in [mkHash′ s].l1
+−→∗
+(λs.{- make MD5 hash -}) “compiler.vl”
+−→
+4dcb6ebe3c6520d1f57c906541cf3823
+Consequently, app#l1 evaluates into an MD5 hash corresponding to l1.
+Type of Versioned Values The type of a versioned value is expressed as
+2rA, assigning a set of version labels r, called version resources, to a type A.
+Intuitively, the type of a versioned value represents the versions available to that
+versioned value. For example, mkHash and app are typed as follows.
+mkHash : 2{l1,l2} (String →String)
+app : 2{l1,l2} (String →String)
+
+6
+Y. Tanabe et al.
+1 module App where
+2 import Dir
+3 import Hash
+4 main () =
+5
+let s = getArg ()
+6
+digest = mkHash s in
+7
+if exists digest
+8
+then print "Found"
+9
+else error "Not found"
+module Dir where
+-- version 1.0.0
+import Hash
+exists hash =
+let fs = getFiles () in
+foldLeft
+(\(acc, f) ->
+acc || match f hash)
+false fs
+module Hash where
+-- version 1.0.0
+mkHash s = {- MD5 hash -}
+match s hash =
+mkHash s == hash
+module Hash where
+-- version 2.0.0
+mkHash s = {- SHA-3 hash -}
+match s hash =
+mkHash s == hash
+Bundled Dir
+Bundled Hash
+The versions of each external module are bundled. Programs using a bundled
+module can refer to the definitions of all versions of the bundled module.
+Fig. 3. The programs in Figure 1 in VL.
+The types have {l1, l2} as their version resource, illustrating that the ver-
+sioned values have definitions of l1 and l2. For function application, the type
+system computes the intersection of the version resource of subterms. Since the
+promoted term is considered to be available in all versions, the version resource
+of the entire function application indicates {l1, l2} = {l1, l2} ∩L.
+For extractions, the type system verifies if the version resource contains the
+specified version as follows.
+app#l1 : String →String
+app#l3 : (rejected)
+Assuming L = {l1, l2, l3}, app#l3 is rejected by type checking because the
+version resource of app does not contain l3. Conversely, app#l1 is well-typed,
+but note that the resultant type lost its version resource. It is attributed to the
+design principle that it could be used in other versions upon extraction.
+The λVL type system incorporates the notion of version consistency in ad-
+dition to the standard notions of preservation and progress. Proofs of these
+theorems can be found in Appendix C.
+2.3
+Programming with Versions in VL
+Our contributions enjoy the benefits of programming with versions on a λ-
+calculus-based functional language VL. To achieve this, we develop a compilation
+
+Compilation Semantics for a Programming Language with Versions
+7
+VL
+program
+VL
+program
+VLMini
+program
+VLMini
+program
+VLMini
+interface
+VLMini
+interface
+VLMini
+interface
+(bundled)
+Constraints
+Girard’s
+translation
+(version-wise)
+Type
+inference
+Bundling
+Import modules
+Fig. 4. The translation phases for a single module with multiple versions.
+method between lambda calculus and VLMini, a version-label free variant of λVL,
+and a version inference algorithm to infer the appropriate version of expressions.
+In VL, (1) all versions are available for every module, and (2) the version
+of each expression is determined by expression-level dependency analysis. This
+approach differs from existing languages that determine one version for each
+dependent package. Figure 3 shows how the programs in Figure 1 are interpreted
+in VL. The VL compiler bundles the interfaces of multiple versions and generates
+a cross-version interface to make external functions available in multiple versions.
+The VL type system enforces version consistency in main and selects a newer
+version if multiple versions are available. Thus it gives the version label {Hash =
+2.0.0, Dir = 1.0.0} to dependent expressions of main. As a result, since Hash
+version referenced from Dir is no longer limited to 1.0.0, exists digest is
+evaluated using SHA-3 under the context of Hash version 2.0.0.
+Furthermore, VL provides version control terms to convey the programmer’s
+intentions of versions to the compiler. For example, to enforce the evaluation in
+Figure 3 to MD5, a programmer can rewrite line 7 of App as follows.
+7
+if ver [Hash=1.0.0] of (exists digest)
+The program dictates that exists digest is evaluated within the context of
+the Hash version 1.0.0. Consequently, both mkHash and match, which depend
+on exists digest, are chosen to align with version 1.0.0 of Hash. Moreover,
+VL provides unversion t. It eliminates the dependencies associated with term
+t, facilitating its collaboration with other versions under the programmer’s re-
+sponsibility, all while maintaining version consistency within its subterm. Thus,
+VL not only ensures version consistency but also offers the flexibility to control
+the version of a particular part of the program.
+3
+Compilation
+The entire translation consists of three parts: (1) Girard’s translation, (2) an
+algorithmic type inference, and (3) bundling. Figure 4 shows the translation pro-
+cess of a single module. First, through Girard’s translation, each version of the
+
+8
+Y. Tanabe et al.
+VL program undergoes a version-wise translation into the VLMini program.
+Second, the type inference synthesizes types and constraints for top-level sym-
+bols. Variables imported from external modules reference the bundled interface
+generated in the subsequent step. Finally, to make the external variables act as
+multi-version expressions, bundling consolidates each version’s interface into one
+VLMini interface. These translations are carried out in order from downstream
+of the dependency tree. By resolving all constraints up to the main module, the
+appropriate version for every external variable is determined.
+It is essential to note that the translations focus on generating constraints
+for dispatching external variables into version-specific code. While implementing
+versioned records in λVL presents challenges, such as handling many version la-
+bels and their code clones, our method is a constraint-based approach in VLMini
+that enables static inference of version labels without their explicit declaration.
+In the context of coeffect languages, constraint generation in VL can be seen
+as the automatic generation of type declarations paired with resource constraints.
+Granule[20] can handle various resources as coeffects, but it requires type dec-
+larations to indicate resource constraints. VL restricts its resources solely to the
+version label set. This specialization enables the automatic collection of version
+information from external sources outside the codebase.
+3.1
+An Intermediate Language, VLMini
+Syntax of VLMini Figure 5 shows the syntax of VLMini. VLMini encom-
+passes all the terms in λVL except for versioned records {li = ti}, intermediate
+term ⟨li = ti | lk⟩, and extractions t.lk. As a result, its terms are analogous to
+those in ℓRPCF[3] and GrMini[20]. However, VLMini is specialized to treat ver-
+sion resources as coeffects. We also introduce data constructors by introduction
+C t1, ..., tn and elimination case t of pi 7→ti for lists and pairs, and version
+control terms unversion t and version {Mi = Vi} of t. Here, contextual-let in
+λVL is a syntax sugar of lambda abstraction applied to a promoted pattern.
+let [x] = t1 in t2 ≜(λ[x].t2) t1
+Types, version labels, and version resources are almost the same as λVL. Type
+constructors are also added to the type in response to the VLMini term having
+a data constructor. The remaining difference from λVL is type variables α. Since
+VLMini is a monomorphic language, type variables act as unification variables;
+type variables are introduced during the type inference and are expected to be
+either concrete types or a set of version labels as a result of constraint resolution.
+To distinguish those two kinds of type variables, we introduce kinds κ. The kind
+Labels is given to type variables that can take a set of labels {li} and is used to
+distinguish them from those of kind Type during algorithmic type inference.
+Constraints The lower part of Figure 5 shows constraints generated through
+bundling and type inference. Dependency constraints comprise variable depen-
+dencies and label dependencies in addition to propositional formulae. Variable
+
+Compilation Semantics for a Programming Language with Versions
+9
+VLMini syntax (w/o data constructors and version control terms)
+t ::= n | x | t1 t2 | λp.t | [t]
+(terms)
+p ::= x | [x]
+(patterns)
+A, B ::= Int | α | A →B | 2rA (types)
+κ ::= Type | Labels
+(kinds)
+Γ ::= ∅| Γ, x : A | Γ, x : [A]r (contexts)
+Σ ::= ∅| Σ, α : κ
+(type variable kinds)
+R ::= −| r
+(resource contexts)
+Extended with data constructors
+t ::= . . . | C ti | case t of pi 7→ti
+(terms)
+p ::= . . . | C pi
+(patterns)
+C ::= (, ) | [, ]
+(constructors)
+A, B ::= ... | KAi
+(types)
+K ::= (, ) | [, ] (type constructors)
+Extended with version control terms
+t ::= . . . | version {Mi = Vi} of t | unversion t
+(terms)
+VLMini constraints
+C ::= ⊤| C1 ∧C2 | C1 ∨C2
+|
+{z
+}
+propositional
+formulae
+|
+α ⪯α′
+| {z }
+variable
+dependencies
+|
+α ⪯D
+| {z }
+label
+dependencies
+(dependency constraints)
+D ::= ⟨⟨Mi = Vi⟩⟩
+(dependent labels)
+Θ ::= ⊤| Θ1 ∧Θ2 | {A ∼B}
+(type constraints)
+Fig. 5. The syntax of VLMini.
+dependencies α ⊑α′ require that if a version label for α′ expects a specific version
+for a module, then α also expects the same version. Similarly, label dependencies
+α ⪯⟨⟨Mi = Vi⟩⟩require that a version label expected for α must be Vi for Mi.
+For example, assuming that versions 1.0.0 and 2.0.0 exist for both modules A and
+B, the minimal upper bound set of version labels satisfying α ⪯⟨⟨A 7→1.0.0⟩⟩is
+α = {{A = 1.0.0, B = 1.0.0}, {A = 1.0.0, B = 2.0.0}}. If the constraint resolution
+is successful, α will be specialized with either of two labels. Θ is a set of type
+equations resolved by the type unification.
+3.2
+Girard’s Translation for VLMini
+We extend Girard’s translation between VL (lambda calculus) to VLMini fol-
+lowing Orchard’s approach [20].
+JnK ≡n
+JxK ≡x
+Jλx.tK ≡λ[x].JtK
+Jt sK ≡JtK [JsK]
+The translation replaces lambda abstractions and function applications of
+VL by lambda abstraction with promoted pattern and promotion of VLMini,
+respectively. From the aspect of types, this translation replaces all occurrences
+of A →B with 2rA →B with a version resource r. This translation inserts a
+syntactic annotation [∗] at each location where a version resource needs to be
+
+10
+Y. Tanabe et al.
+addressed. Subsequent type inference will compute the resource at the specified
+location and produce constraints to ensure version consistency at that point.
+The original Girard’s translation [11] is well-known as a translation between
+the simply-typed λ-calculus and an intuitionistic linear calculus. The approach
+involves replacing every intuitionistic arrow A →B with !A ⊸B, and subse-
+quently unboxing via let-in abstraction and promoting during application [20].
+3.3
+Bundling
+Bundling produces an interface encompassing types and versions from every
+module version, allowing top-level symbols to act as multi-version expressions.
+During this process, bundling reviews interfaces from across module versions,
+identifies symbols with the same names and types after removing □r using Gi-
+rard’s transformation, and treats them as multiple versions of a singular symbol
+(also discussed in Section 7). In a constraint-based approach, bundling integrates
+label dependencies derived from module versions, ensuring they align with the
+version information in the typing rule for versioned records of λVL.
+For example, assuming that the id that takes an Int value as an argument is
+available in version 1.0.0 and 2.0.0 of M as follows:
+id : 2α1(2α2Int →Int) | C1
+(version 1.0.0)
+id : 2β1(2β2Int →Int) | C2
+(version 2.0.0)
+where α1 and α2 are version resource variables given from type inference. They
+capture the version resources of id and its argument value in version 1.0.0. C1
+is the constraints that resource variables of version 1.0.0 will satisfy. Likewise
+for β1, β2, and C2. Since the types of id in both versions become Int →Int via
+Girard’s translation, they can be bundled as follows:
+id : 2γ1(2γ2Int →Int) | C1 ∧C2 ∧
+
+(γ1 ⪯⟨⟨M = 1.0.0⟩⟩∧γ1 ⪯α1 ∧γ2 ⪯α2)
+∨(γ1 ⪯⟨⟨M = 2.0.0⟩⟩∧γ1 ⪯β1 ∧γ2 ⪯β2)
+
+where γ1 and γ2 are introduced by this conversion for the bundled id interface,
+with label and variable dependencies that they will satisfy. γ1 captures the ver-
+sion resource of the bundled id. The generated label dependencies γ1 ⪯⟨⟨M =
+1.0.0⟩⟩and γ1 ⪯⟨⟨M = 2.0.0⟩⟩indicate that id is available in either version 1.0.0 or
+2.0.0 of M. These label dependencies are exclusively4 generated during bundling.
+The other new variable dependencies indicate that the id bundled interface de-
+pends on one of the two version interfaces. The dependency is made apparent by
+pairing the new resource variables with their respective version resource variable
+for each version. These constraints are retained globally, and the type definition
+of the bundled interface is used for type-checking modules importing id.
+4 In the type checking rules for version l of t, type inference exceptionally generates
+label dependencies. Please see Appendix B.4
+
+Compilation Semantics for a Programming Language with Versions
+11
+VLMini pattern type synthesis
+Σ, R ⊢p : A  Γ; Σ′; Θ; C
+Σ; −⊢x : A  x : A; Σ; ⊤; ⊤(pVar)
+Σ; r ⊢x : A  x : [A]r; Σ; ⊤; ⊤([pVar])
+Σ, α : Labels, β : Type; α ⊢x : β  ∆; Σ′; Θ; C
+Σ; −⊢[x] : A  ∆; Σ′; Θ ∧{A ∼2αβ}; C
+(p□)
+VLMini type synthesis (excerpt)
+Σ; Γ ⊢t ⇒A; Σ′; Θ; C
+x : A ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : A; ⊤; ⊤(⇒lin)
+x : [A]r ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : [A]1; ⊤; ⊤(⇒gr)
+Σ1, α : Type; −⊢p : α  Γ ′; Σ2; Θ1
+Σ2; Γ, Γ ′ ⊢t ⇒B; Σ3; ∆; Θ2; C
+Σ1; Γ ⊢λp.t ⇒α →B; Σ3; ∆\Γ ′; Θ1 ∧Θ2; C
+(⇒abs)
+Σ1 ⊢[Γ ∩FV(t)]Labels  Γ ′
+Σ1; Γ ′ ⊢t ⇒A; Σ2; ∆; Θ; C1
+Σ3 = Σ2, α : Labels
+Σ3 ⊢α ⊑c Γ ′  C2
+Σ1; Γ ⊢[t] ⇒2αA; Σ3; α · ∆; Θ; C1 ∧C2
+(⇒pr)
+VLMini constraints generation
+Σ ⊢α ⊑c Γ  C
+Σ ⊢α ⊑c ∅ ⊤
+(∅)
+Σ ⊢α ⊑c Γ  C
+Σ ⊢α ⊑c (x : [A]r, Γ)  (α ⪯r ∧C)
+(α)
+Fig. 6. VLMini algorithmic typing.
+4
+Algorithmic Type Inference
+We develop the algorithmic type inference for VLMini derived from the declar-
+ative type system of λVL [28,29]. The type inference consists of two judgments:
+type synthesis and pattern type synthesis. The judgment forms are similar to
+Gr [20], which is similarly based on coeffect calculus. While Gr provides type-
+checking rules in a bidirectional approach [8,9] to describe resource constraint
+annotations and performs unifications inside the type inference, VLMini only
+provides synthesis rules and unification performs after the type inference. In
+addition, Gr supports user-defined data types and multiple computational re-
+sources, while VLMini supports only built-in data structures and specializes in
+version resources. The inference system is developed to be sound for declarative
+typing in λVL, with the proof detailed in Appendix D.
+Type synthesis takes type variable kinds Σ, a typing context Γ of term
+variables, and a term t as inputs. Type variable kinds Σ are added to account
+for distinct unification variables for types and version resources. The synthesis
+produces as outputs a type A, type variable kinds Σ′, type constraints Θ, and
+dependency constraints C. The type variable kinds Σ and Σ′ always satisfy
+Σ ⊆Σ′ due to the additional type variables added in this phase.
+Pattern type synthesis takes a pattern p, type variable kinds Σ, and resource
+environment R as inputs. It synthesizes outputs, including typing context Γ,
+type variable kinds Σ′, and type and dependency constraints Θ and C. Pattern
+
+12
+Y. Tanabe et al.
+type synthesis appears in the inference rules for λ-abstractions and case expres-
+sions. It generates a typing context from the input pattern p for typing λ-bodies
+and branch expressions in case statements. When checking a nested promoted
+pattern, the resource context R captures version resources inside a pattern.
+4.1
+Pattern Type Synthesis
+Pattern type synthesis conveys the version resources captured by promoted pat-
+terns to the output typing context. The rules are classified into two categories,
+whether or not it has resources in the input resource context R. The base rules
+are pVar, p2, while the other rules are resource-aware versions of the corre-
+sponding rules. The resource-aware rules assume they are triggered within the
+promoted pattern and collect version resource r in the resource context.
+The rules for variables pVar and [pVar] differ in whether the variable pat-
+tern occurs within a promoted pattern. pVar has no resources in the resource
+context because the original pattern is not inside a promoted pattern. There-
+fore, this pattern produces typing context x : A. [pVar] is for a variable pattern
+within the promoted pattern, and a resource r is recorded in the resource con-
+text. The rule assigns the collected resource r to the type A and outputs it as a
+versioned assumption x : [A]r.
+The rules for promoted patterns p□propagate version resources to the sub-
+pattern synthesis. The input type A is expected to be a versioned type, so the
+rule generates the fresh type variables α and β, then performs the subpattern
+synthesis considering A as 2αβ. Here, the resource α captured by the promoted
+pattern is recorded in the resource context. Finally, the rule unifies A and 2αβ
+and produces the type constraints Θ′ for type refinement.
+4.2
+Type Synthesis
+The algorithmic typing rules for VLMini, derived from declarative typing rules
+for λVL, are listed in Figure 6. We explain a few important rules in excerpts.
+The rule ⇒abs generates a type variable α, along with the binding pattern p
+of the λ-abstraction generating the typing context Γ ′. Then the rule synthesizes
+a type B for the λ-body under Γ ′, and the resulting type of the λ-abstraction is
+α →B with the tentatively generated α. With the syntax sugar, the type rules of
+the contextual-let are integrated into ⇒abs. Instead, λ-abstraction does not just
+bind a single variable but is generalized to pattern matching, which leverages
+pattern typing, as extended by promoted patterns and data constructors.
+The rule ⇒pr is the only rule that introduces constraints in the entire type
+inference algorithm. This rule intuitively infers consistent version resources for
+the typing context Γ. Since we implicitly allow for weakening, we generate a
+constraint from Γ ′ that contains only the free variables in t, produced by context
+grading denoted as [Γ]Labels. Context grading converts all assumptions in the
+input environment into versioned assumptions by assigning the empty set for
+the assumption with no version resource.
+
+Compilation Semantics for a Programming Language with Versions
+13
+Finally, the rule generates constraints from Γ ′ and a fresh type variable α
+by constraints generation defined in the lower part of Figure 6. The rules assert
+that the input type variable α is a subset of all the resources of the versioned
+assumptions in the input environment Γ. The following judgment is the simplest
+example triggered by the type synthesis of [f x].
+r : Labels, s : Labels ⊢α ⊑c f : [Int →Int]r, x : [Int]s  α ⪯r ∧α ⪯s
+The inputs are type variable α and the type environment (f : [Int →Int]r, x :
+[Int]s). In this case, the rules generate variable dependencies for r and s, each
+resource of the assumptions, and return a constraint combined with ∧.
+4.3
+Extensions
+Version Control Terms The rule for version l of t uses the same trick as
+(⇒pr), and generates label dependencies from the input environment Γ to ⟨⟨l⟩⟩.
+Since version l of t only instructs the type inference system, the resulting type
+is the same as t. unversion t removes the version resource from the type of
+t, which is assumed to be a versioned value. We extend Girard’s translation so
+that t is always a versioned value. Since a new resource variable is given to the
+term by the promotion outside of unversion, the inference system guarantees
+the version consistency inside and outside the boundary of unversion. The list
+of the rules is provided in Appendix B.4.
+Data Structures To support data structures, Hughes et al. suggest that coef-
+fectful data types are required to consider the interaction between the resources
+inside and outside the constructor [13]. They introduce the derivation algorithm
+for push and pull for an arbitrary type constructor K to address this.
+push : ∀{a b: Type, r: Labels}. (a,b)[r] -> (a[r],b[r])
+push [(x, y)] = ([x], [y])
+pull : ∀{a b: Type, m n: Labels}. (a[n],b[m]) -> (a,b)[n⊓m]
+pull ([x], [y]) = [(x, y)]
+Following their approach, we developed inference rules for pairs and lists.
+When a data structure value p is applied to a function f, the function application
+f p is implicitly interpreted as f (pull p). As a dual, a pattern match for a data
+structure value case p of pi 7→ti is interpreted as case (push p) of pi 7→ti.
+Appendix B.5 provides the complete set of extended rules.
+5
+Implementation
+We implement the VL compiler5 on GHC (v9.2.4) with haskell-src-exts6 as its
+parser with an extension of versioned control terms, and z3 [18] as its constraint
+5 https://github.com/yudaitnb/vl
+6 https://hackage.haskell.org/package/haskell-src-exts
+
+14
+Y. Tanabe et al.
+version
+join
+vjoin
+udot, sortVector, roundVector
+< 0.15 available undefined
+undefined
+≥0.16 deleted
+available
+available
+Table 1. Availability of functions in hmatrix before and after tha update.
+solver. The VL compiler performs the code generation by compiling VLMini
+programs back into λ-calculus via Girard’s translation and then translating them
+into Haskell ASTs using the version in the result version labels.
+Ad-hoc Version Polymorphism via Duplication The VL compiler repli-
+cates external variables to assign individual versions to homonymous external
+variables. Duplication is performed before type checking of individual versions
+and renames every external variable along with the type and constraint envi-
+ronments generated from the import declarations. Such ad hoc conversions are
+necessary because VLMini is monomorphic, and the type inference of VLMini
+generates constraints by referring only to the variable’s name in the type environ-
+ment. Therefore, assigning different versions to homonymous variables requires
+manual renaming in the preliminary step of the type inference. A further dis-
+cussion on version polymorphism can be found in Section 7.
+Constraints Solving with z3 We use sbv7 as the binding of z3. The sbv
+library internally converts constraints into SMT-LIB2 scripts [1] and supplies it
+to z3. Dependency constraints are represented as vectors of symbolic integers,
+where the length of the vector equals the number of external modules, and the
+elements are unique integers signifying each module’s version number. Constraint
+resolution identifies the expected vectors for symbolic variables, corresponding
+to the label on which external identifiers in VL should depend. If more than one
+label satisfies the constraints, the default action is to select a newer one.
+6
+Case Study and Evaluation
+6.1
+Case Study
+We demonstrate that VL programming achieves the two benefits of program-
+ming with versions. The case study simulated the incompatibility of hmatrix,8
+a popular Haskell library for numeric linear algebra and matrix computations,
+in the VL module Matrix. This simulation involved updating the applications
+Main depending on Matrix to reflect incompatible changes.
+Table 1 shows the changes introduced in version 0.16 of hmatrix. Before ver-
+sion 0.15, hmatrix provided a join function for concatenating multiple vectors.
+The update from version 0.15 to 0.16 replaced join with vjoin. Moreover,
+7 https://hackage.haskell.org/package/sbv-9.0
+8 https://github.com/haskell-numerics/hmatrix/blob/master/packages/base/
+CHANGELOG
+
+Compilation Semantics for a Programming Language with Versions
+15
+module Main where
+import Matrix
+import List
+main = let
+vec = [2, 1]
+sorted = sortVector vec
+m22 = join -- [[1,2],[2,1]]
+(singleton sorted)
+(singleton vec)
+in determinant m22
+-- error: version inconsistent
+module Main where
+import Matrix
+import List
+main = let
+vec = [2, 1]
+sorted = unversion
+(sortVector vec)
+m22 = join -- [[1,2],[2,1]]
+(singleton sorted)
+(singleton vec)
+in determinant m22 -- ->* -3
+Fig. 7. Snippets of Main before (left) and after (right) rewriting.
+several new functions were introduced. We implement two versions of Matrix
+to simulate backward incompatible changes in VL. Also, due to the absence of
+user-defined types in VL, we represent Vector a and Matrix a as List Int
+and List (List Int) respectively, using List, a partial port of Data.List
+from the Haskell standard library.
+We implement Main working with two conflicting versions of Matrix. The
+left side of Figure 7 shows a snippet of Main in the process of updating Matrix
+from version 0.15.0 to 0.16.0. main uses functions from both versions of Matrix
+together: join and sortVector are available only in version 0.15.0 and 0.16.0
+respectively, hence Main has conflicting dependencies on both versions of Matrix.
+Therefore, it will be impossible to successfully build this program in existing lan-
+guages unless the developer gives up using either join or sortVector.
+– Detecting Inconsistent Version: VL can accept Main in two stages. First,
+the compiler flags a version inconsistency error. It is unclear which Matrix
+version the main function depends on as join requires version 0.15.0 while
+sortVector requires version 0.16.0. The error prevents using such incom-
+patible version combinations, which are not allowed in a single expression.
+– Simultaneous Use of Multiple Versions: In this case, using join and
+sortVector simultaneously is acceptable, as their return values are vec-
+tors and matrices. Therefore, we apply unversion t for t to collaborate
+with other versions. The right side of Figure 7 shows a rewritten snippet of
+Main, where sortVector vec is replaced by unversion (sortVector
+vec). Assuming we avoid using programs that depend on a specific version
+elsewhere in the program, we can successfully compile and execute main.
+6.2
+Scalability of Constraint Resolution
+We conducted experiments on the constraint resolution time of the VL compiler.
+In the experiment, we duplicated a VL module, renaming it to #mod like List i,
+
+16
+Y. Tanabe et al.
+Fig. 8. Constraint resolution time for the duplicated List by #mod × #ver.
+and imported each module sequentially. Every module had the same number of
+versions, denoted as #ver. Each module version was implemented identically
+to List, with top-level symbols distinguished by the module name, such as
+concat List i. The experiments were performed ten times on a Ryzen 9 7950X
+running Ubuntu 22.04, with #mod and #ver ranging from 1 to 5.
+Figure 8 shows the average constraint resolution time. The data suggests
+that the resolution time increases polynomially (at least square) for both #mod
+and #ver. Several issues in the current implementation contribute to this in-
+efficiency: First, we employ sbv as a z3 interface, generating numerous redun-
+dant variables in the SMT-Lib2 script. For instance, in a code comprising 2600
+LOC (with #mod = 5 and #ver = 5), the VL compiler produces 6090 version
+resource variables and the sbv library creates SMT-Lib2 scripts with approxi-
+mately 210,000 intermediate symbolic variables. Second, z3 solves versions for all
+AST nodes, whereas the compiler’s main focus should be on external variables
+and the subterms of unversion. Third, the current VL nests the constraint
+network, combined with ∨, #mod times at each bundling. This approach results
+in an overly complex constraint network for standard programs. Hence, to ac-
+celerate constraint solving, we can develop a more efficient constraint compiler
+for SMT-Lib2 scripts, implement preprocess to reduce constraints, and employ
+a greedy constraint resolution for each module.
+7
+Related Work, Future Work, and Conclusion
+Managing Dependency Hell Mainstream techniques for addressing depen-
+dency hell stand in stark contrast to our approach, which seeks to manage de-
+pendencies at a finer granularity. Container [17] encapsulates each application
+
+Compilation Semantics for a Programming Language with Versions
+17
+with all its dependencies in an isolated environment, a container, facilitating
+multiple library versions to coexist on one physical machine. However, it does
+not handle internal dependencies within the container. Monorepository [21,10]
+versions logically distinct libraries within a single repository, allowing updates
+across multiple libraries with one commit. It eases testing and bug finding but
+can lower the system modularity.
+Toward a Language Considering Compatibility The next step in this
+research is to embed compatibility tracking within the language system. The
+current VL considers different version labels incompatible unless a programmer
+uses unversion. Since many updates maintain backward compatibility and
+change only minor parts of the previous version, the existing type system is
+overly restrictive.
+To illustrate, consider Figure 3 again with more version history. The mod-
+ule Hash uses the MD5 algorithm for mkHash and match in the 1.x.x series.
+However, it adopts the SHA-3 algorithm in version 2.0.0, leaving other functions
+the same. The hash by mkHash version 1.0.1 (an MD5 hash) aligns with any
+MD5 hash from the 1.x.x series. Therefore, we know that comparing the hash
+using match version 1.0.0 is appropriate. However, the current VL compiler
+lacks mechanisms to express such compatibility in constraint resolution. The
+workaround involves using unversion, risking an MD5 hash’s use with match
+version 2.0.0.
+One promising approach to convey compatibilities is integrating semantic
+versioning [22] into the type system. If we introduce semantics into version labels,
+the hash generated in version 1.0.1 is backward compatible with version 1.0.0.
+Thus, by constructing a type system that respects explicitly defined version
+compatibilities, we can improve VL to accept a broader range of programs.
+It is important to get reliable versions to achieve this goal. Lam et al. [14]
+emphasize the need for tool support to manage package modifications and the
+importance of analyzing compatibility through program analysis. Delta-oriented
+programming [26,25,24] could complement this approach by facilitating the way
+modularizing addition, overriding, and removal of programming elements and
+include application conditions for those modifications. This could result in a
+sophisticated package system that provides granular compatibility information.
+Such a language could be an alternative to existing technologies for automatic
+update, collectively known as adoptation. These methods generate replacement
+rules based on structural similarities [5,32] and extract API replacement pat-
+terns from migrated code bases [27]. Some techniques involve library maintain-
+ers recording refactorings [7,12] and providing annotations [4] to describe how
+to update client code. However, the reported success rate of these techniques is
+less than 20% on average [6].
+Supporting Type Incompatibility One of the apparent problems with the
+current VL does not support type incompatibilities. VL forces terms of different
+versions to have the same type, both on the theoretical (typing rules in λVL)
+
+18
+Y. Tanabe et al.
+and implementation (bundling in VLMini) aspects. Supporting type incompat-
+ibility is important because type incompatibility is one of the top reasons for
+error-causing incompatibilities [23]. The current VL is designed in such a way
+because it retains the principle that equates the types of promotions and ver-
+sioned records in λVL, easing the formalization of the semantics.
+A promising approach to address this could be to decouple version inference
+from type inference and develop a version inference system on the polymorphic
+record calculus [19]. The idea stems from the fact that versioned types 2{l1,l2}A
+are structurally similar to record types {l1 : A, l2 : A} of Λ∀,•. Since Λ∀,• al-
+lows different record-element types for different labels and has concrete inference
+algorithms with polymorphism, implementing version inference on top of Λ∀,•
+would also make VL more expressive.
+Adequate Version Polymorphism In the current VL, there is an issue
+that the version label of top-level symbols in imported modules must be spec-
+ified one, whereas users can select specific versions of external variables using
+unversion within the importing module. Consider using a generic function
+like List.concat in Figure 7. If it is used in one part of the program within
+the context of Matrix version 1.0.0, the solution of the resource variable of
+List.concat version 1.0.0 becomes confined to {Matrix = 1.0.0, List =
+. . .}. As a result, it is impossible to utilize List.concat version 1.0.0 with
+Matrix version 2.0.0 elsewhere in the program. This problem becomes appar-
+ent when we define a generic module like a standard library.
+It is necessary to introduce full-version polymorphism in the core calculus
+instead of duplication to address this problem. The idea is to generate a type
+scheme by solving constraints for each module during bundling and instanti-
+ate each type and resource variable at each occurrence of an external variable.
+Such resource polymorphism is similar to that already implemented in Gr [20].
+However, unlike Gr, VLMini provides a type inference algorithm that collects
+constraints on a per-module basis, so we need the well-defined form of the prin-
+cipal type. This extension is future work.
+Conclusion This paper proposes a method for dependency analysis and version
+control at the expression level by incorporating versions into language semantics,
+which were previously only identifiers of packages. This enables the simultaneous
+use of multiple versions and identifies programs violating version consistency at
+the expression level, which is impossible with conventional languages.
+Our next step is to extend the version label, which currently only identi-
+fies versions, to semantic versions and to treat the notion of compatibility with
+language semantics. Like automatic updates by modern build tools based on
+semantic versioning, it would be possible to achieve incremental updates, which
+would be done step-by-step at the expression level. Working with existing pack-
+age managers to collect compatibility information at the expression level would
+be more feasible to realize the goal.
+
+Compilation Semantics for a Programming Language with Versions
+19
+References
+1. Barrett, C., Stump, A., Tinelli, C., et al.: The smt-lib standard: Version 2.0. In:
+Proceedings of the 8th international workshop on satisfiability modulo theories
+(Edinburgh, UK). vol. 13, p. 14 (2010)
+2. Bavota, G., Canfora, G., Di Penta, M., Oliveto, R., Panichella, S.: How the apache
+community upgrades dependencies: An evolutionary study. Empirical Software En-
+gineering 20(5), 1275–1317 (Oct 2015). https://doi.org/10.1007/s10664-014-9325-
+9, https://doi.org/10.1007/s10664-014-9325-9
+3. Brunel, A., Gaboardi, M., Mazza, D., Zdancewic, S.: A core quantitative coef-
+fect calculus. In: Proceedings of the 23rd European Symposium on Programming
+Languages and Systems - Volume 8410. p. 351–370. Springer-Verlag, Berlin, Hei-
+delberg (2014). https://doi.org/10.1007/978-3-642-54833-8 19, https://doi.org/10.
+1007/978-3-642-54833-8 19
+4. Chow,
+Notkin:
+Semi-automatic
+update
+of
+applications
+in
+response
+to
+li-
+brary
+changes.
+In:
+1996
+Proceedings
+of
+International
+Conference
+on
+Software
+Maintenance.
+pp.
+359–368.
+IEEE,
+New
+York,
+USA
+(1996).
+https://doi.org/10.1109/ICSM.1996.565039
+5. Cossette,
+B.,
+Walker,
+R.,
+Cottrell,
+R.:
+Using
+structural
+generaliza-
+tion
+to
+discover
+replacement
+functionality
+for
+api
+evolution
+(2014).
+https://doi.org/10.11575/PRISM/10182,
+https://prism.ucalgary.ca/handle/
+1880/49996
+6. Cossette, B.E., Walker, R.J.: Seeking the ground truth: A retroactive study
+on the evolution and migration of software libraries. In: Proceedings of the
+ACM SIGSOFT 20th International Symposium on the Foundations of Software
+Engineering. FSE ’12, Association for Computing Machinery, New York, NY,
+USA (2012). https://doi.org/10.1145/2393596.2393661, https://doi.org/10.1145/
+2393596.2393661
+7. Dig, D., Johnson, R.: How do APIs evolve? a story of refactoring. Journal
+of Software Maintenance and Evolution: Research and Practice 18(2), 83–107
+(2006).
+https://doi.org/https://doi.org/10.1002/smr.328,
+https://onlinelibrary.
+wiley.com/doi/abs/10.1002/smr.328
+8. Dunfield,
+J.,
+Krishnaswami,
+N.R.:
+Complete
+and
+easy
+bidirectional
+type-
+checking
+for
+higher-rank
+polymorphism.
+SIGPLAN
+Not.
+48(9),
+429–442
+(9
+2013).
+https://doi.org/10.1145/2544174.2500582,
+https://doi.org/10.1145/
+2544174.2500582
+9. Dunfield, J., Krishnaswami, N.R.: Sound and complete bidirectional typechecking
+for higher-rank polymorphism with existentials and indexed types. Proc. ACM
+Program. Lang. 3(POPL) (1 2019). https://doi.org/10.1145/3290322, https://doi.
+org/10.1145/3290322
+10. Durham
+Goode:
+Facebook
+Engineering:
+Scaling
+Mercurial
+at
+Facebook.
+https://code.fb.com/core-data/scaling-mercurial-at-facebook/ (Jan 2014)
+11. Girard, J.Y.: Linear logic. Theor. Comput. Sci. 50(1), 1–102 (Jan 1987).
+https://doi.org/10.1016/0304-3975(87)90045-4,
+https://doi.org/10.1016/
+0304-3975(87)90045-4
+12. Henkel, J., Diwan, A.: Catchup! capturing and replaying refactorings to sup-
+port API evolution. In: Proceedings. 27th International Conference on Software
+Engineering, 2005. ICSE 2005. pp. 274–283. IEEE, New York, USA (2005).
+https://doi.org/10.1109/ICSE.2005.1553570
+
+20
+Y. Tanabe et al.
+13. Hughes, J., Vollmer, M., Orchard, D.: Deriving distributive laws for graded
+linear types. In: Dal Lago, U., de Paiva, V. (eds.) Proceedings Second Joint
+International Workshop on Linearity & Trends in Linear Logic and Applica-
+tions, Online, 29-30 June 2020. Electronic Proceedings in Theoretical Com-
+puter Science, vol. 353, pp. 109–131. Open Publishing Association (2021).
+https://doi.org/10.4204/EPTCS.353.6
+14. Lam, P., Dietrich, J., Pearce, D.J.: Putting the Semantics into Semantic Versioning,
+p. 157–179. Association for Computing Machinery, New York, NY, USA (2020),
+https://doi.org/10.1145/3426428.3426922
+15. Lubis, L.A., Tanabe, Y., Aotani, T., Masuhara, H.: Batakjava: An object-
+oriented programming language with versions. In: Proceedings of the 15th
+ACM SIGPLAN International Conference on Software Language Engineering.
+p. 222–234. SLE 2022, Association for Computing Machinery, New York, NY,
+USA (2022). https://doi.org/10.1145/3567512.3567531, https://doi.org/10.1145/
+3567512.3567531
+16. McDonnell, T., Ray, B., Kim, M.: An empirical study of API stability and
+adoption in the Android ecosystem. In: 2013 IEEE International Conference
+on Software Maintenance, ICSM. pp. 70–79. IEEE, New York, USA (09 2013).
+https://doi.org/10.1109/ICSM.2013.18
+17. Merkel, D.: Docker: Lightweight linux containers for consistent development and
+deployment. Linux J. 2014(239) (Mar 2014)
+18. de Moura, L., Bjørner, N.: Z3: An efficient smt solver. In: Ramakrishnan, C.R., Re-
+hof, J. (eds.) Tools and Algorithms for the Construction and Analysis of Systems.
+pp. 337–340. Springer Berlin Heidelberg, Berlin, Heidelberg (2008)
+19. Ohori,
+A.:
+A
+polymorphic
+record
+calculus
+and
+its
+compilation.
+ACM
+Trans.
+Program.
+Lang.
+Syst.
+17(6),
+844–895
+(11
+1995).
+https://doi.org/10.1145/218570.218572, https://doi.org/10.1145/218570.218572
+20. Orchard, D., Liepelt, V.B., Eades III, H.: Quantitative program reasoning
+with graded modal types. Proc. ACM Program. Lang. 3(ICFP) (Jul 2019).
+https://doi.org/10.1145/3341714, https://doi.org/10.1145/3341714
+21. Potvin,
+R.,
+Levenberg,
+J.:
+Why
+google
+stores
+billions
+of
+lines
+of
+code
+in
+a
+single
+repository.
+Commun.
+ACM
+59(7),
+78–87
+(Jun
+2016).
+https://doi.org/10.1145/2854146, https://doi.org/10.1145/2854146
+22. Preston-Werner, T.: Semantic versioning 2.0.0 (2013), http://semver.org
+23. Raemaekers, S., van Deursen, A., Visser, J.: Semantic versioning and impact of
+breaking changes in the maven repository. Journal of Systems and Software 129,
+140 – 158 (2017). https://doi.org/https://doi.org/10.1016/j.jss.2016.04.008, http:
+//www.sciencedirect.com/science/article/pii/S0164121216300243
+24. Schaefer,
+I.,
+Bettini,
+L.,
+Damiani,
+F.:
+Compositional
+type-checking
+for
+delta-oriented
+programming.
+In:
+Proceedings
+of
+the
+Tenth
+International
+Conference
+on
+Aspect-Oriented
+Software
+Development.
+p.
+43–56.
+AOSD
+’11,
+Association
+for
+Computing
+Machinery,
+New
+York,
+NY,
+USA
+(2011).
+https://doi.org/10.1145/1960275.1960283,
+https://doi.org/10.1145/1960275.
+1960283
+25. Schaefer, I., Bettini, L., Damiani, F., Tanzarella, N.: Delta-oriented programming
+of software product lines. In: Proceedings of the 14th International Conference
+on Software Product Lines: Going Beyond. p. 77–91. SPLC’10, Springer-Verlag,
+Berlin, Heidelberg (2010)
+26. Schaefer, I., Damiani, F.: Pure delta-oriented programming. In: Proceedings
+of the 2nd International Workshop on Feature-Oriented Software Development.
+
+Compilation Semantics for a Programming Language with Versions
+21
+p. 49–56. FOSD ’10, Association for Computing Machinery, New York, NY,
+USA (2010). https://doi.org/10.1145/1868688.1868696, https://doi.org/10.1145/
+1868688.1868696
+27. Sch¨afer, T., Jonas, J., Mezini, M.: Mining framework usage changes from in-
+stantiation code. In: Proceedings of the 30th International Conference on Soft-
+ware Engineering. p. 471–480. ICSE ’08, Association for Computing Machin-
+ery, New York, NY, USA (2008). https://doi.org/10.1145/1368088.1368153, https:
+//doi.org/10.1145/1368088.1368153
+28. Tanabe, Y., Aotani, T., Masuhara, H.: A context-oriented programming ap-
+proach to dependency hell. In: Proceedings of the 10th International Work-
+shop
+on
+Context-Oriented
+Programming:
+Advanced
+Modularity
+for
+Run-
+time
+Composition.
+pp.
+8–14.
+COP
+’18,
+ACM,
+New
+York,
+NY,
+USA
+(2018).
+https://doi.org/10.1145/3242921.3242923,
+http://doi.acm.org/10.1145/
+3242921.3242923
+29. Tanabe, Y., Lubis, L.A., Aotani, T., Masuhara, H.: A functional programming
+language with versions. The Art, Science, and Engineering of Programming 6(1),
+5:1–5:30 (Jul 2021). https://doi.org/10.22152/programming-journal.org/2022/6/5,
+https://doi.org/10.22152%2Fprogramming-journal.org%2F2022%2F6%2F5
+30. Tanabe, Y., Lubis, L.A., Aotani, T., Masuhara, H.: A step toward programming
+with versions in real-world functional languages. In: Proceedings of the 14th ACM
+International Workshop on Context-Oriented Programming and Advanced Modu-
+larity. p. 44–51. COP ’22, Association for Computing Machinery, New York, NY,
+USA (2022). https://doi.org/10.1145/3570353.3570359, https://doi.org/10.1145/
+3570353.3570359
+31. Tolnay, D.: The semver trick. https://github.com/dtolnay/semver-trick (Jul 2017)
+32. Wu, W.: Modeling framework api evolution as a multi-objective optimization prob-
+lem. In: 2011 IEEE 19th International Conference on Program Comprehension. pp.
+262–265. IEEE, New York, USA (2011). https://doi.org/10.1109/ICPC.2011.43
+
+22
+Y. Tanabe et al.
+A
+λVL Definitions
+A.1
+λVL Syntax
+λVL syntax
+t
+::=
+n | x | t1 t2 | λp.t |
+let [x] = t1 in t2 | u.l | ⟨li = ti | lj⟩| u
+(terms)
+p
+::=
+x | [x]
+(patterns)
+u
+::=
+[t] | {li = ti}
+(versioned values)
+v
+::=
+λp.t | n | u
+(values)
+A, B
+::=
+Int | A →B | 2rA
+(types)
+r
+::=
+⊥| {li}
+(version resources)
+L ∋l
+::=
+{Mi = Vi}
+(version labels)
+where Mi ∈M and Vi ∈VMi are metavariables over module names and versions
+of Mi, respectively.
+λVL contexts
+Γ, ∆
+::=
+∅| Γ, x : A | Γ, x : [A]r
+(contexts)
+R
+::=
+−| r
+(resource contexts)
+E
+::=
+[·] | E t | E.l | let [x] = E in t
+(evaluation contexts)
+A.2
+λVL Well-formedness
+Type well-formedness
+⊢A
+⊢Int (TwInt)
+⊢A
+⊢B
+⊢A →B
+(Tw→)
+⊢r
+⊢A
+⊢2rA
+(Tw□)
+Resource well-formedness
+⊢r
+⊢⊥(Rw⊥)
+li ∈L
+⊢{li} (RwLabel)
+Type environment well-formedness
+⊢Γ
+⊢∅(Tew∅)
+⊢Γ
+⊢A
+x /∈dom(Γ)
+⊢Γ, x : A
+(TewLin)
+⊢Γ
+⊢A
+⊢r
+x /∈dom(Γ)
+⊢Γ, x : [A]r
+(TewGr)
+
+Compilation Semantics for a Programming Language with Versions
+23
+Resource environment well-formedness
+⊢R
+⊢−(Rew−)
+⊢Rw r
+⊢Rew r
+(Rewr)
+where we use the notations ⊢Rw and ⊢Rew in (Rewr) to represent the judgements
+of resource and resource environment well-formedness respectively, to avoid am-
+biguity between two syntactically indistinguishable judgements.
+A.3
+λVL Type System (Declarative)
+λVL typing
+Γ ⊢t : A
+∅⊢n : Int (int)
+⊢A
+x : A ⊢x : A (var) −⊢p : A  ∆
+Γ, ∆⊢t : B
+Γ ⊢λp.t : A →B
+(abs)
+Γ1 ⊢t1 : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = t1 in t2 : B
+(let)
+Γ1 ⊢t1 : A →B
+Γ2 ⊢t2 : A
+Γ1 + Γ2 ⊢t1 t2 : B
+(app)
+Γ ⊢t : A
+⊢∆
+Γ, [∆]0 ⊢t : A (weak)
+Γ, x : A ⊢t : B
+Γ, x : [A]1 ⊢t : B (der)
+[Γ] ⊢t : A
+⊢r
+r · [Γ] ⊢[t] : 2rA (pr)
+Γ, x : [A]r, Γ ′ ⊢t : B
+r ⊑s
+⊢s
+Γ, x : [A]s, Γ ′ ⊢t : B
+(sub)
+Γ ⊢u : 2rA
+l ∈r
+Γ ⊢u.l : A
+(extr)
+[Γi] ⊢ti : A
+⊢{li}
+S{li} · [Γi] ⊢{li = ti} : 2{li}A (ver) [Γi] ⊢ti : A
+⊢{li}
+lk ∈{li}
+S{li} · [Γi] ⊢⟨li = ti | lk⟩: A
+(veri)
+where 0 = ⊥, 1 = ∅and ⊑= ⊆.
+λVL pattern typing
+R ⊢p : A  ∆
+⊢A
+−⊢x : A  x : A (pVar)
+⊢r
+⊢A
+r ⊢x : A  x : [A]r
+([pVar])
+r ⊢x : A  ∆
+−⊢[x] : 2rA  ∆(p□)
+A.4
+λVL Dynamic Semantics
+Evaluation
+t −→t′
+t ; t′
+E[t] −→E[t′]
+
+24
+Y. Tanabe et al.
+Reduction
+t ; t′
+(λx.t) t′ ; (t′  x)t (E-abs1) (λ[x].t) t′ ; let [x] = t′ in t (E-abs2)
+[t].l ; t@l (E-ex1) {li = ti}.li ; ti@li
+(E-ex2)
+let [x] = u in t ; (u  [x])t (E-clet)
+⟨li = ti | lk⟩; tk@lk
+(E-veri)
+Substitutions
+(t′  x)t
+=
+[t′/x]t
+([t′]  [x])t
+=
+(t′  x)t
+({li = ti}  [x])t
+=
+[⟨li = ti | lk⟩/x]t
+(lk ∈{li})
+Default version overwriting
+n@l
+=
+n
+x@l
+=
+x
+(λp.t)@l
+=
+λp.(t@l)
+(t u)@l
+=
+(t@l) (u@l)
+(let [x] = t1 in t2)@l
+=
+let [x] = (t1@l) in (t2@l)
+[t]@l
+=
+[t]
+{li = ti}@l
+=
+{li = ti}
+(u.l′)@l
+=
+(u@l).l′
+⟨li = ti | li⟩@l′
+=
+(
+⟨li = ti | l′⟩
+(l′ ∈{li})
+⟨li = ti | li⟩
+(l′ /∈{li})
+
+Compilation Semantics for a Programming Language with Versions
+25
+B
+VLMini Definitions
+B.1
+VLMini Syntax (w/o version control terms/data constructors)
+VLMini syntax
+t
+::=
+n | x | t1 t2 | λp.t | [t]
+(terms)
+p
+::=
+x | [x]
+(patterns)
+A, B
+::=
+α | Int | A →B | 2rA
+(types)
+κ
+::=
+Type | Labels
+(kinds)
+r
+::=
+α | ⊥| {li}
+(version resources)
+L ∋l
+::=
+{Mi = Vi}
+(version labels)
+where Mi ∈M and Vi ∈VMi are metavariables over module names and versions
+of Mi, respectively.
+VLMini contexts
+Γ, ∆
+::=
+∅| Γ, x : A | Γ, x : [A]r
+(contexts)
+Σ
+::=
+∅| Σ, α : κ
+(type variable kinds)
+R
+::=
+−| r
+(resource contexts)
+VLMini constraints
+C
+::=
+⊤| C1 ∧C2 | C1 ∨C2 | α ⪯α′ | α ⪯D
+(dependency constraints)
+D
+::=
+⟨⟨Mi = Vi⟩⟩
+(dependent labels)
+Θ
+::=
+⊤| Θ1 ∧Θ2 | {A ∼B}
+(type constraints)
+VLMini type substitutions
+θ
+::=
+∅| θ ◦[α 7→A] | θ ◦[α 7→r]
+(type substitutions)
+η
+::=
+∅| η ◦[α 7→{l}]
+(label substituions)
+B.2
+VLMini Well-formedness and Kinding
+Type variable kinds well-formedness
+⊢Σ
+⊢∅(Kw∅)
+⊢Σ
+κ ∈{Type, Labels}
+α /∈dom(Σ)
+⊢Σ, α : κ
+(Kwα)
+
+26
+Y. Tanabe et al.
+VLMini kinding
+Σ ⊢A : κ
+⊢Σ
+Σ ⊢Int : Type (κInt)
+Σ ⊢A : Type
+Σ ⊢B : Type
+Σ ⊢A →B : Type
+(κ→)
+Σ ⊢r : Labels
+Σ ⊢A : Type
+Σ ⊢2rA : Type
+(κ□)
+⊢Σ
+Σ(α) = κ
+Σ ⊢α : κ
+(κα)
+⊢Σ
+Σ ⊢⊥: Labels (κ⊥)
+⊢Σ
+li ∈L
+Σ ⊢{li} : Labels (κLabel)
+Type environment well-formedness
+Σ ⊢A
+⊢Σ
+Σ ⊢∅(Tew∅)
+Σ ⊢Γ
+Σ ⊢A : Type
+x /∈dom(Γ)
+Σ ⊢Γ, x : A
+(TewLin)
+Σ ⊢Γ
+Σ ⊢A : Type
+Σ ⊢r : Labels
+x /∈dom(Γ)
+Σ ⊢Γ, x : [A]r
+(TewGr)
+Resource environment well-formedness
+Σ ⊢R
+⊢Σ
+Σ ⊢−(Rew−)
+⊢Σ
+Σ ⊢r : Labels
+Σ ⊢r
+(Rewr)
+Type substitutions well-formedness
+Σ ⊢θ
+⊢Σ
+Σ ⊢∅(Sw∅)
+Σ ⊢θ
+Σ ⊢α : Type
+Σ ⊢A : Type
+Σ ⊢θ ◦[α 7→A]
+(SwTy)
+Σ ⊢θ
+Σ ⊢α : Labels
+Σ ⊢r : Labels
+Σ ⊢θ ◦[α 7→r]
+(SwRes)
+B.3
+VLMini Algorithmic Type Inference System
+VLMini type synthesis
+Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C
+⊢Σ
+Σ ⊢Γ
+Σ; Γ ⊢n ⇒Int; Σ; ∅; ⊤; ⊤(⇒int)
+⊢Σ
+Σ ⊢Γ
+x : A ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : A; ⊤; ⊤(⇒lin)
+⊢Σ
+Σ ⊢Γ
+x : [A]r ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : [A]1; ⊤; ⊤(⇒gr)
+Σ1, α : Type; −⊢p : α  Γ ′; Σ2; Θ1
+Σ2; Γ, Γ ′ ⊢t ⇒B; Σ3; ∆; Θ2; C
+Σ1; Γ ⊢λp.t ⇒α →B; Σ3; ∆\Γ ′; Θ1 ∧Θ2; C
+(⇒abs)
+
+Compilation Semantics for a Programming Language with Versions
+27
+Σ1; Γ ⊢t1 ⇒A1; Σ2; ∆1; Θ1; C1
+Σ2; Γ ⊢t2 ⇒A2; Σ3; ∆2; Θ2; C2
+Σ1; Γ ⊢t1 t2 ⇒β; Σ3, β : Type; ∆1 + ∆2;
+Θ1 ∧Θ2 ∧{A1 ∼A2 →β}; C1 ∧C2
+(⇒app)
+Σ1 ⊢[Γ ∩FV(t)]Labels  Γ ′
+Σ1; Γ ′ ⊢t ⇒A; Σ2; ∆; Θ; C1
+Σ3 = Σ2, α : Labels
+Σ3 ⊢α ⊑c Γ ′  C2
+Σ1; Γ ⊢[t] ⇒2αA; Σ3; α · ∆; Θ; C1 ∧C2
+(⇒pr)
+VLMini pattern type synthesis
+Σ; R ⊢p : A  Γ; Σ′; Θ; C
+⊢Σ
+Σ ⊢A : Type
+Σ; −⊢x : A  x : A; Σ; ⊤; ⊤(pVar)
+⊢Σ
+Σ ⊢A : Type
+Σ ⊢r : Labels
+Σ; r ⊢x : A  x : [A]r; Σ; ⊤; ⊤
+([pVar])
+Σ, α : Labels, β : Type; α ⊢x : β  ∆; Σ′; Θ; C
+Σ; −⊢[x] : A  ∆; Σ′; Θ ∧{A ∼2αβ}; C
+(p□)
+VLMini context grading
+Σ ⊢[Γ]Labels  Γ ′
+Σ ⊢[∅]Labels  ∅(∅)
+Σ ⊢[Γ]Labels  Γ ′
+Σ ⊢[Γ, x : A]Labels  Γ ′, x : [A]1
+([lin])
+Σ ⊢[Γ]Labels  Γ ′
+Σ ⊢[Γ, x : [A]r]Labels  Γ ′, x : [A]r
+([gr])
+where 1 = ∅.
+VLMini constraints generation
+Σ ⊢α ⊑c [Γ]  C
+Σ ⊢α ⊑c ∅ ⊤(⊑VD
+∅)
+Σ ⊢α ⊑c [Γ]  C
+Σ ⊢α ⊑c ([Γ], x : [A]r)  (C ∧(α ⪯r)) (⊑VD
+Γ )
+VLMini type unification
+Σ ⊢A ∼B  θ
+Σ ⊢α : Type
+Σ ⊢A : Type
+Σ ⊢α ∼A  α 7→A
+(Uα)
+Σ ⊢A : Type
+Σ ⊢A ∼A  ∅(U=)
+Σ ⊢A′ ∼A  θ1
+Σ ⊢θ1B ∼θ1B′  θ2
+Σ ⊢A →B ∼A′ →B′  θ1 ⊎θ2
+(U→)
+Σ ⊢A ∼A′  θ1
+Σ ⊢θ1r ∼θ1r′  θ2
+Σ ⊢2rA ∼2r′A′  θ1 ⊎θ2
+(U2)
+otherwise fail.
+
+28
+Y. Tanabe et al.
+VLMini unification
+Σ ⊢Θ  θ
+Σ ⊢⊤ ∅(U∅)
+Σ ⊢Θ  θ1
+Σ ⊢θ1A ∼θ1B  θ2
+Σ ⊢Θ ∧{A ∼B}  θ1 ⊎θ2
+(UΘ)
+Type substitutions
+θInt
+=
+Int
+θα
+=
+(
+A
+(θ(α) = A)
+α
+(otherwise)
+θ(A →B)
+=
+θA →θB
+θ(2rA)
+=
+2(θr)(θA)
+θ⊥
+=
+⊥
+θ{li}
+=
+{li}
+Substitution compositions
+∅⊎θ2 = θ2
+(θ1, α 7→A) ⊎θ2 =
+(
+(θ1 ⊎(θ2\α) ⊎θ), α 7→θA
+θ2(α) = B ∧Σ ⊢A ∼B  θ
+(θ1 ⊎θ2), α 7→A
+α /∈dom(θ2)
+B.4
+Extensions for Version Control Terms
+VLMini syntax
+t
+::=
+. . . | version l of t | unversion t
+(terms)
+VLMini algorithmic type synthesis
+Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C
+l ∈L
+Σ1 ⊢[Γ ∩FV(t)]Labels  Γ ′
+Σ1 ⊢Γ ′ ⊑c ⟨⟨l⟩⟩ C2
+Σ1; Γ ′ ⊢t ⇒A; Σ2; ∆1; Θ1; C1
+Σ1; Γ ⊢version l of t ⇒A; Σ2; ∆1; Θ1; C1 ∧C2
+(⇒Ver)
+Σ1; Γ ⊢t ⇒A; Σ2; ∆; Θ; C
+A = 2rA′
+Σ3 = Σ2, α : Labels
+⊢Σ3
+Σ1; Γ ⊢unversion t ⇒2αA′; Σ3; ∆; Θ; C
+(⇒Unver)
+VLMini constraints generation
+Σ ⊢[Γ] ⊑c D  C
+Σ ⊢∅⊑c D  ⊤(⊑LD
+∅)
+Σ ⊢[Γ] ⊑c D  C
+Σ ⊢([Γ], x : [A]r) ⊑c D  (C ∧(r ⪯D)) (⊑LD
+Γ )
+Note that type environment resources in VLMini always contain only type vari-
+ables, so r = α (∃α).
+
+Compilation Semantics for a Programming Language with Versions
+29
+B.5
+Extensions for Data Constructors
+VLMini syntax
+t
+::=
+. . . | C ti | case t of pi 7→ti
+(terms)
+p
+::=
+. . . | C pi
+(patterns)
+C
+::=
+(, ) | [, ]
+(constructors)
+A, B
+::=
+. . . | K Ai
+(types)
+K
+::=
+(, ) | [, ]
+(type constructors)
+VLMini algorithmic type synthesis
+Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C
+Σi−1; Γ ⊢ti ⇒Ai; Σi; ∆i; Θi; Ci
+Σ0; Γ ⊢(t1, .. , tn) ⇒(A1, .. , An); Σn; ∆1, ..∆n; V Θi; V Ci
+(⇒(,))
+Σi−1; Γ ⊢ti ⇒A; Σi; ∆i; Θi; Ci
+Σ0; Γ ⊢[t1, .. , tn] ⇒[A]; Σn; ∆1, ..∆n; V Θi; V Ci
+(⇒[,])
+Σ0; Γ ⊢t ⇒A; Σ1; Γ ′
+1; Θ0; C0
+Σi−1; −⊢pi : A  ∆i; Σ′
+i; Θ′
+i
+Σ′
+i; Γ, ∆i ⊢ti ⇒B; Σi; ∆′
+i; Θi; Ci
+Σ0; Γ ⊢case t of pi 7→ti ⇒B; Σn; Γ ′
+1 + S(∆′
+i\∆i); V Θi; V Ci
+(⇒case)
+VLMini pattern type synthesis
+Σ; R ⊢p : A  Γ; Σ′; Θ; C
+Σ′
+i−1 = Σi−1, αi : Type
+Σ′
+i−1; −⊢pi : αi  Γi; Σi; Θi; C
+Σ0; −⊢C p1 .. pn : A  Γi, .., Γn; Σn; {K αi ∼A} ∧V Θi; C (pCon)
+Σ′
+i−1 = Σi−1, αi : Type
+Σ′
+i−1; r ⊢pi : αi  Γi; Σi; Θi; C
+Σ′
+i ⊢r : Labels
+Σ0; r ⊢C p1 .. pn : A  Γi, .., Γn; Σn; {K αi ∼A} ∧V Θi; C ([pCon])
+VLMini type unification
+Σ ⊢A ∼B  θ
+Σ ⊢A1 ∼B1  θ1
+Σ ⊢θi−1Ai ∼θi−1Bi  θi (i ≥2)
+Σ ⊢K Ai ∼K Bi  U θi
+(UCon)
+Type substitutions
+θ(K Ai)
+=
+K θAi
+
+30
+Y. Tanabe et al.
+C
+λVL Type Safety
+C.1
+Resource Properties
+Definition 1 (Version resource semiring). The version resource semiring
+is given by the structural semiring (semiring with preorder) (R, ⊕, 0, ⊗, 1, ⊑),
+defined as follows.
+0 = ⊥
+1 = ∅
+⊥⊑r
+r1 ⊆r2
+r1 ⊑r2
+r1 ⊕r2 =
+
+
+
+
+
+r1
+r2 = ⊥
+r2
+r1 = ⊥
+r1 ∪r2
+otherwise
+r1 ⊗r2
+=
+
+
+
+
+
+⊥
+r1 = ⊥
+⊥
+r2 = ⊥
+r1 ∪r2
+otherwise
+where ⊥is the smallest element of R, and r1 ⊆r2 is the standard subset relation
+over sets defined only when both r1 and r2 are not ⊥.
+Lemma 1 (Version resource semiring is a structural semiring).
+Proof. Version resource semiring (R, ⊕, ⊥, ⊗, ∅, ⊑) induces a semilattice with ⊕
+(join).
+– (R, ⊕, ⊥, ⊗, ∅) is a semiring, that is:
+• (R, ⊕, ⊥) is a commutative monoid, i.e., for all p, q, r ∈R
+∗(Associativity) (p ⊕q) ⊕r = p ⊕(q ⊕r) holds since ⊕is defined in
+associative manner with ⊥.
+∗(Commutativity) p⊕q = q⊕p holds since ⊕is defined in commutative
+manner with ⊥.
+∗(Identity element) ⊥⊕p = p ⊕⊥= p
+• (R, ⊗, ∅) is a monoid, i.e., for all p, q, r ∈R
+∗(Associativity) (p ⊗q) ⊗r = p ⊗(q ⊗r) holds since ⊕is defined in
+associative manner with ⊥.
+∗(Identity element) ∅⊗p = p ⊗∅= p
+· if p = ⊥then ∅⊗⊥= ⊥⊗∅= ⊥
+· otherwise if p ̸= ⊥then ∅⊗p = ∅∪p = p and p ⊗∅= p ∪∅= p
+• multiplication ⊗distributes over addition ⊕, i.e., for all p, q, r ∈R, r ⊗
+(p ⊕q) = (r ⊗p) ⊕(r ⊗q) and (p ⊕q) ⊗r = (p ⊗r) ⊕(q ⊗r)
+∗if r = ⊥then r ⊗(p ⊕q) = ⊥and (r ⊗p) ⊕(r ⊗q) = ⊥⊕⊥= ⊥.
+∗otherwise if r ̸= ⊥and p = ⊥and q ̸= ⊥then r ⊗(p ⊕q) = r ⊗q =
+r ∪q = (r ∪r) ∪q = r ∪(r ∪q) = (r ⊕p) ∪(r ∪q) = (r ⊗p) ⊕(r ⊗q)
+∗otherwise if r ̸= ⊥and p = ⊥and q = ⊥then r⊗(p⊕q) = r⊗⊥= ⊥
+and (r ⊗p) ⊕(r ⊗q) = ⊥⊕⊥= ⊥.
+∗otherwise if r ̸= ⊥and p ̸= ⊥and q ̸= ⊥then r⊗(p⊕q) = r∪(p∪q) =
+(r ∪p) ∪(r ∪q) = (r ⊗p) ⊕(r ⊗q)
+The other cases are symmetrical cases.
+• ⊥is absorbing for multiplication: p ⊗⊥= ⊥⊗p = ⊥for all p ∈R
+
+Compilation Semantics for a Programming Language with Versions
+31
+– (R, ⊑) is a bounded semilattice, that is
+• ⊑is a partial order on R such that the least upper bound of every two
+elements p, q ∈R exists and is denoted by p ⊕q.
+• there is a least element; for all r ∈R, ⊥⊑r.
+– (Motonicity of ⊕) p ⊑q implies p ⊕r ⊑q ⊕r for all p, q, r ∈R
+• if r = ⊥then p ⊕r ⊑q ⊕r ⇔p ⊆q, so this case is trivial.
+• otherwise if r ̸= ⊥, p = q = ⊥then p ⊕r ⊑q ⊕r ⇔r ⊆r, so this case is
+trivial.
+• otherwise if r ̸= ⊥, p = ⊥, q ̸= ⊥then p ⊕r ⊑q ⊕r ⇔r ⊆q ∪r, and
+r ⊆q ∪r holds in standard subset relation.
+• otherwise if r ̸= ⊥, p ̸= ⊥, q ̸= ⊥then p ⊕r ⊑q ⊕r ⇔p ∪r ⊆q ∪r, and
+p ⊆q implies p ∪r ⊆q ∪r.
+– (Motonicity of ⊗) p ⊑q implies p ⊗r ⊑q ⊗r for all p, q, r ∈R
+• if r = ⊥then p ⊗r ⊑q ⊗r ⇔⊥⊆⊥, so this case is trivial.
+• otherwise if r ̸= ⊥, p = q = ⊥then p ⊗r ⊑q ⊗r ⇔⊥⊆⊥, so this case
+is trivial.
+• otherwise if r ̸= ⊥, p = ⊥, q ̸= ⊥then p ⊗r ⊑q ⊗r ⇔⊥⊆q ∪r, so this
+case is trivial.
+• otherwise if r ̸= ⊥, p ̸= ⊥, q ̸= ⊥then p ⊗r ⊑q ⊗r ⇔p ∪r ⊆q ∪r, and
+p ⊆q implies p ∪r ⊆q ∪r.
+Definition 2 (Version resource summation). Using the addition + of ver-
+sion resource semiring, summation of version resouce is defined as follows:
+X
+i
+ri = r1 ⊕· · · ⊕rn
+C.2
+Context Properties
+Definition 3 (Context concatenation). Two typing contexts can be concate-
+nated by ”,” if they contain disjoint assumptions. Furthermore, the versioned
+assumptions appearing in both typing contexts can be combined using the context
+concatenation + defined with the addition ⊕in the version resource semiring as
+follows.
+∅+ Γ = Γ
+(Γ, x : A) + Γ ′ = (Γ + Γ ′), x : A
+iff x /∈dom(Γ ′)
+Γ + ∅= Γ
+Γ + (Γ ′, x : A) = (Γ + Γ ′), x : A
+iff x /∈dom(Γ)
+(Γ, x : [A]r) + (Γ ′, x : [A]s) = (Γ + Γ ′), x : [A]r ⊕s
+Definition 4 (Context multiplication by version resource). Assuming
+that a context contains only version assumptions, denoted [Γ] in typing rules,
+then Γ can be multiplied by a version resource r ∈R by using the product ⊗in
+the version resource semiring, as follows.
+r · ∅= ∅
+r · (Γ, x : [A]s) = (r · Γ), x : [A]r ⊗s
+
+32
+Y. Tanabe et al.
+Definition 5 (Context summation). Using the context concatenation +, sum-
+mation of typing contexts is defined as follows:
+n
+[
+i=1
+Γi = Γ1 + · · · + Γn
+Definition 6 (Context partition). For typing contexts Γ1 and Γ2, we define
+Γ1|Γ2 and Γ1|Γ2 as follows.
+Γ1|Γ2 ≜{x : A | x ∈dom(Γ1) ∧x ∈dom(Γ2)}
+Γ1|Γ2 ≜{x : A | x ∈dom(Γ1) ∧x /∈dom(Γ2)}
+Γ1|Γ2 is a subsequence of Γ1 that contains all the term variables that are included
+in Γ2, and Γ1|Γ2 is a subsequence of Γ1 that contains all the term variables that
+are not included in Γ2.
+Using Γ1|Γ2 and Γ1|Γ2, we state some corollaries about typing contexts. These
+theorems follow straightforwardly from the definitions of 6.
+Lemma 2 (Context collapse). For typing contexts Γ1 and Γ2,
+Γ1|Γ2 + Γ1|Γ2 = Γ1
+Lemma 3 (Context shuffle). For typing contexts Γ1, Γ2, Γ3 and Γ4, and
+variable x and type A:
+(Γ1, x : A, Γ ′
+1) + Γ2 = (Γ1 + Γ2|Γ1), x : A, (Γ ′
+1 + Γ2|Γ1)
+(1)
+Γ1 + (Γ2, x : A, Γ ′
+2) = (Γ1|Γ ′
+2 + Γ2), x : A, (Γ1|Γ ′
+2 + Γ ′
+2)
+(2)
+(Γ1, Γ2) + (Γ3, Γ4) =
+
+(Γ1 + Γ3|Γ1 + Γ4|Γ1), (Γ2 + Γ3|Γ1 + Γ4|Γ1)
+
+(3)
+Lemma 4 (Composition of context shuffle). For typing contexts Γi and Γ ′
+i
+for i ∈N, there exixts typing contexts Γ and Γ ′ such that:
+[
+i
+(Γi, Γ ′
+i) = Γ, Γ ′ ∧
+[
+i
+(Γi + Γ ′
+i) = Γ + Γ ′
+Lemma 5 (Distribution of version resouce over context addition). For
+a typing context Γ and resources ri ∈R:
+(r1 · Γ) + (r2 · Γ) = (r1 ⊕r2) · Γ
+[
+i
+(ri · Γ) = (
+X
+i
+ri) · Γ
+Lemma 6 (Disjoint context collapse). Given typing contexts Γ1, ∆, and Γ2
+such that Γ1 and Γ2 are disjoint, then we can conclude the following.
+(Γ1 + ∆+ Γ2) = (Γ1 + ∆|Γ1), ∆|(Γ1,Γ2), (Γ2 + ∆|Γ2)
+
+Compilation Semantics for a Programming Language with Versions
+33
+C.3
+Substituions Properties
+Lemma 7 (Well-typed linear substitution).
+∆⊢t′ : A
+Γ, x : A, Γ ′ ⊢t : B
+)
+=⇒
+Γ + ∆+ Γ ′ ⊢[t′/x]t : B
+Proof. This proof is given by induction on the structure of Γ, x : A, Γ ′ ⊢t : B
+(assumption 2). Consider the cases for the last rule used in the typing derivation
+of assumption 2.
+– Case (int)
+∅⊢n : Int (int)
+In this case, the above typing context is empty (= ∅), so this case holds
+trivially.
+– Case (var)
+⊢B
+y : B ⊢y : B
+(var)
+We are given
+Γ = Γ ′ = ∅,
+x = t = y,
+A = B .
+Now the conclusion of the lemma is
+∆⊢[t′/y]y : B .
+Since [t′/y]y = t′ from the definition of substitution, the conclusion of the
+lemma is assumption 1 itself.
+– Case (abs)
+−⊢p : B1  ∆′
+Γ, x : A, Γ ′, ∆′ ⊢t : B2
+Γ, x : A, Γ ′ ⊢λp.t : B1 →B2
+(abs)
+In this case, by applying the induction hypothesis to the second premise, we
+know the following:
+Γ + ∆+ (Γ ′, ∆′) ⊢[t′/x]t : B2
+where y : B is disjoint with Γ, ∆, and Γ ′. Thus, Γ + ∆+ (Γ ′, ∆′) = (Γ +
+∆+ Γ ′), ∆′ from Lemma 3 (2), the typing derivation above is equal to the
+following:
+(Γ + ∆+ Γ ′), ∆′ ⊢[t′/x]t : B2
+We then reapply (abs) to obtain the following:
+
+34
+Y. Tanabe et al.
+−⊢p : B1  ∆′
+(Γ + ∆+ Γ ′), ∆′ ⊢[t′/x]t : B2
+Γ + ∆+ Γ ′ ⊢λp.[t′/x]t : B1 →B2
+(abs)
+By the definition of substitution λp.[t′/x]t = [t′/x](λp.t), and we obtain the
+conclusion of the lemma.
+– Case (let)
+Γ1 ⊢t1 : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = t1 in t2 : B
+(let)
+This case is similar to the case (app).
+– Case (app)
+Γ1 ⊢t1 : B1 →B2
+Γ2 ⊢t2 : B1
+Γ1 + Γ2 ⊢t1 t2 : B2
+(app)
+We are given
+Γ, x : A, Γ ′ = Γ1 + Γ2,
+t = t1 t2,
+B = B2 .
+By the definition of the context addition +, the linear assumption x : A is
+contained in only one of Γ1 or Γ2.
+• Suppose (x : A) ∈Γ1 and (x : A) /∈Γ2.
+Let Γ ′
+1 and Γ ′′
+1 be typing contexts such that they satisfy Γ1 = (Γ ′
+1, x :
+A, Γ ′′
+1 ). The last typing derivation of (app) is rewritten as follows.
+Γ ′
+1, x : A, Γ ′′
+1 ⊢t1 : B1 →B2
+Γ2 ⊢t2 : B1
+(Γ ′
+1, x : A, Γ ′′
+1 ) + Γ2 ⊢t1 t2 : B2
+(app)
+Now, we compare the typing contexts between the lemma and the above
+conclusion as follows:
+(Γ, x : A, Γ ′) = (Γ1 + Γ2)
+= (Γ ′
+1, x : A, Γ ′′
+1 ) + Γ2
+(∵Γ1 = (Γ ′
+1, x : A, Γ ′′
+1 ))
+= (Γ ′
+1 + Γ2|Γ ′
+1), x : A, (Γ ′′
+1 + Γ2|Γ ′
+1)
+(∵Lemma 3 (1))
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that
+they satisfy the above equation. So here we know Γ = (Γ ′
+1 + Γ2|Γ ′
+1) and
+Γ ′ = (Γ ′′
+1 + Γ2|Γ ′
+1).
+We then apply the induction hypothesis to each of the two premises and
+reapply (app) as follows:
+Γ ′
+1 + ∆+ Γ ′′
+1 ⊢[t′/x]t1 : B1 →B2
+Γ2 ⊢t2 : B1
+(Γ ′
+1 + ∆+ Γ ′′
+1 ) + Γ2 ⊢([t′/x]t1) t2 : B2
+(app)
+
+Compilation Semantics for a Programming Language with Versions
+35
+Since ([t′/x]t1) t2 = [t′/x](t1 t2) if x /∈FV (t2), the conclusion of the
+above derivation is equivalent to the conclusion of the lemma except for
+the typing contexts.
+Finally, we must show that (Γ + ∆+ Γ ′) = ((Γ1 + ∆+ Γ ′′
+1 ) + Γ2). This
+holds from the following reasoning:
+(Γ + ∆+ Γ ′) = (Γ ′
+1 + Γ2|Γ ′
+1) + ∆+ (Γ ′′
+1 + Γ2|Γ ′
+1)
+(∵Γ = (Γ ′
+1 + Γ2|Γ ′
+1) and Γ ′ = (Γ ′′
+1 + Γ2|Γ ′
+1))
+= Γ ′
+1 + Γ2|Γ ′
+1 + ∆+ Γ ′′
+1 + Γ2|Γ ′
+1
+(∵+ associativity)
+= Γ ′
+1 + ∆+ Γ ′′
+1 + Γ2|Γ ′
+1 + Γ2|Γ ′
+1
+(∵+ commutativity)
+= (Γ ′
+1 + ∆+ Γ ′′
+1 ) + (Γ2|Γ ′
+1 + Γ2|Γ ′
+1)
+(∵+ associativity)
+= (Γ ′
+1 + ∆+ Γ ′′
+1 ) + Γ2
+(∵Lemma 2)
+Thus, we obtain the conclusion of the lemma.
+• Suppose (x : A) /∈Γ1 and (x : A) ∈Γ2
+Let Γ ′
+2 and Γ ′′
+2 be typing contexts such that they satisfy Γ2 = (Γ ′
+2, x :
+A, Γ ′′
+2 ). The last typing derivation of (app) is rewritten as follows.
+Γ1 ⊢t1 : B1 →B2
+Γ ′
+2, x : A, Γ ′′
+2 ⊢t2 : B1
+Γ1 + (Γ ′
+2, x : A, Γ ′′
+2 ) ⊢t1 t2 : B2
+(app)
+This case is similar to the case (x : A) ∈Γ1, but using 3 (2) instead of 3
+(1).
+– Case (weak)
+Γ1, x : A, Γ2 ⊢t : B
+⊢∆′
+(Γ1, x : A, Γ2) + [∆′]0 ⊢t : B (weak)
+In this case, the linear assumption x : A is not contained in versioned context
+[∆′]0. We then compare the typing contexts between the conclusion of the
+lemma and that of (weak) as follows:
+(Γ, x : A, Γ ′) = (Γ1, x : A, Γ2) + [∆′]0
+= (Γ1 + ([∆′]0)|Γ1), x : A, (Γ2 + ([∆′]0)|Γ1) (∵Lemma 3 (1))
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that they
+satisfy the above equation. So here we obtain Γ = Γ1 + ([∆′]0)|Γ1 and Γ ′ =
+Γ2+([∆′]0)|Γ1. We then apply the induction hypothesis to each of the premise
+and reapply (weak) as follows:
+Γ1 + ∆+ Γ2 ⊢[t′/x]t : B
+⊢∆′
+(Γ1 + ∆+ Γ2) + [∆′]0 ⊢[t′/x]t : B (weak)
+Since ([t′/x]t1) ([t′/x]t2) = [t′/x](t1 t2), the conclusion of the above deriva-
+tion is equivalent to the conclusion of the lemma except for typing contexts.
+
+36
+Y. Tanabe et al.
+Finally, we must show that (Γ1 + ∆+ Γ2) + [∆′]0 = Γ + ∆+ Γ ′. This holds
+from the following reasoning:
+(Γ + ∆+ Γ ′) = (Γ1 + ([∆′]0)|Γ1) + ∆+ (Γ2 + ([∆′]0)|Γ1)
+(∵Γ = Γ1 + ([∆′]0)|Γ1 and Γ ′ = Γ2 + ([∆′]0)|Γ1)
+= Γ1 + ([∆′]0)|Γ1 + ∆+ Γ2 + ([∆′]0)|Γ1
+(∵+ associativity)
+= Γ1 + ∆+ Γ2 + ([∆′]0)|Γ1 + ([∆′]0)|Γ1
+(∵+ commutativity)
+= (Γ1 + ∆+ Γ2) + (([∆′]0)|Γ1 + ([∆′]0)|Γ1)
+(∵+ associativity)
+= (Γ1 + ∆+ Γ2) + [∆′]0
+(∵Lemma 2)
+Thus, we obtain the conclusion of the lemma.
+– Case (der)
+Γ, x : A, Γ ′′, y : B1 ⊢t : B2
+Γ, x : A, Γ ′′, y : [B1]1 ⊢t : B2
+(der)
+In this case, a linear assumption x : A cannot be a versioned assumption
+y : [B1]1. Applying the induction hypothesis to the premise, we obtain the
+following:
+Γ + ∆+ (Γ ′′, y : B1) ⊢[t′/x]t : B2
+Note that Γ + ∆+ (Γ ′′, y : B1) = (Γ + ∆+ Γ ′′), y : B1 holds because y : B1
+is a linear assumption and is disjoint with Γ, ∆, and Γ ′′. Thus, the above
+judgement is equivalent to the following:
+(Γ + ∆+ Γ ′′), y : B1 ⊢[t′/x]t : B2
+We then reapply (der) to obtain the following:
+(Γ + ∆+ Γ ′′), y : B1 ⊢[t′/x]t : B2
+(Γ + ∆+ Γ ′′), y : [B1]1 ⊢[t′/x]t : B2
+(der)
+Finally, since y : [B1]1 is disjoint with Γ +∆+Γ ′′, ((Γ +∆+Γ ′′), y : [B1]1) =
+Γ + ∆+ (Γ ′′, y : [B1]1) holds. Thus, the conclusion of the above derivation
+is equivalent to the following:
+Γ + ∆+ (Γ ′′, y : [B1]1) ⊢[t′/x]t : B2
+Thus, we obtain the conclusion of the lemma.
+– Case (pr)
+[Γ] ⊢t : B
+⊢r
+r · [Γ] ⊢[t] : 2rB
+(pr)
+
+Compilation Semantics for a Programming Language with Versions
+37
+This case holds trivially, because the typing context [Γ] contains only ver-
+sioned assumptions and does not contain any linear assumptions.
+– Case (ver)
+[Γi] ⊢ti : A
+⊢{li}
+S
+i({li} · [Γi]) ⊢{li = ti} : 2{li}A
+(ver)
+This case holds trivially, because the typing context of the conclusion con-
+tains only versioned assumptions (by [Γi] in the premise) and does not con-
+tain any linear assumptions.
+– Case (veri)
+[Γi] ⊢ti : A
+⊢{li}
+lk ∈{li}
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: A
+(veri)
+This case holds trivially, because the typing context of the conclusion con-
+tains only versioned assumptions (by [Γi] in the premise) and does not con-
+tain any linear assumptions.
+– Case (extr)
+Γ ⊢t : 2rA
+l ∈r
+Γ ⊢t.l : A
+(extr)
+In this case, we apply the induction hypothesis to the premise and then
+reapply (extr), we obtain the conclusion of the lemma.
+– Case (sub)
+Γ, y : [B′]r, Γ ′ ⊢t : B
+r ⊑s
+⊢s
+Γ, y : [B′]s, Γ ′ ⊢t : B
+(sub)
+In this case, a linear assumption x : A cannot be a versioned assumption
+y : [B1]s, and only one of (x : A) ∈Γ or (x : A) ∈Γ ′ holds. In either case,
+applying the induction hypothesis to the premise and reappling (sub), we
+obtain the conclusion of the lemma.
+Lemma 8 (Well-typed versioned substitution).
+[∆] ⊢t′ : A
+Γ, x : [A]r, Γ ′ ⊢t : B
+)
+=⇒
+Γ + r · ∆+ Γ ′ ⊢[t′/x]t : B
+Proof. This proof is given by induction on structure of Γ, x : [A]r, Γ ′ ⊢t : B
+(assumption 2). Consider the cases for the last rule used in the typing derivation
+of assumption 2.
+
+38
+Y. Tanabe et al.
+– Case (int)
+∅⊢n : Int (int)
+This case holds trivially because the typing context of (int) is empty (= ∅).
+– Case (var)
+⊢B
+y : B ⊢y : B (var)
+In this case, x : [A]r is a versioned assumption and y : B is a linear assump-
+tion, so x ̸= y holds, and yet the typing context besides y : B is empty. Thus,
+there are no versioned variables to be substituted, so this case holds trivially.
+– Case (abs)
+−⊢p : B1  ∆′
+Γ, x : [A]r, Γ ′, ∆′ ⊢t : B2
+Γ, x : [A]r, Γ ′ ⊢λp.t : B1 →B2
+(abs)
+In this case, we know the following by applying induction hypothesis to the
+partial derivation of (abs):
+Γ + r · ∆+ (Γ ′, ∆′) ⊢[t′/x]t : B2
+where ∆′ (dom(∆′) = {y}) is disjoint with Γ, ∆, and Γ ′. Thus, Γ + r · ∆+
+(Γ ′, ∆′) = (Γ +r·∆+Γ ′), ∆′ from Lemma 3 (2), the typing derivation above
+is equal to the following:
+(Γ + r · ∆+ Γ ′), ∆′ ⊢[t′/x]t : B2
+We then reapply (abs) to obtain the following:
+−⊢p : B1  ∆′
+(Γ + r · ∆+ Γ ′), ∆′ ⊢[t′/x]t : B2
+Γ + r · ∆+ Γ ′ ⊢λp.[t′/x]t : B1 →B2
+(abs)
+Since λp.[t′/x]t = [t′/x](λp.t) from the definition of substitution, we obtain
+the conclusion of the lemma.
+– Case (app)
+Γ1 ⊢t1 : B1 →B2
+Γ2 ⊢t2 : B1
+Γ1 + Γ2 ⊢t1 t2 : B2
+(app)
+We are given
+Γ, x : [A]r, Γ ′ = Γ1 + Γ2,
+t = t1 t2,
+B = B2 .
+By the definition of the context addition +, the linear assumption x : A is
+contained in either or both of the typing context Γ1 or Γ2.
+
+Compilation Semantics for a Programming Language with Versions
+39
+• Suppose (x : [A]r) ∈Γ1 and x /∈dom(Γ2)
+Let Γ ′
+1 and Γ ′′
+1 be typing contexts such that they satisfy Γ1 = (Γ ′
+1, x :
+[A]r, Γ ′′
+1 ). The last derivation of (app) is rewritten as follows:
+Γ ′
+1, x : [A]r, Γ ′′
+1 ⊢t1B1 →B2
+Γ2 ⊢t2 : B1
+(Γ ′
+1, x : [A]r, Γ ′′
+1 ) + Γ2 ⊢t1 t2 : B2
+(app)
+We compare the typing contexts between the conclusion of the lemma
+and that of the above derivation to obtain the following:
+(Γ, x : [A]r, Γ ′) = (Γ ′
+1, x : [A]r, Γ ′′
+1 ) + Γ2
+= (Γ ′
+1 + Γ2|Γ ′
+1), x : [A]r, (Γ ′′
+1 + Γ2|Γ ′
+1) (∵Lemma 3 (1))
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that
+they satisfy the above equation. So here we know Γ = (Γ ′
+1 + Γ2|Γ ′
+1) and
+Γ ′ = (Γ ′′
+1 + Γ2|Γ ′
+1).
+We then apply the induction hypothesis to each of the two premises of
+the last derivation and reapply (app) as follows:
+Γ ′
+1 + r · ∆+ Γ ′′
+1 ⊢[t′/x]t1 : B1 →B2
+Γ2 ⊢[t′/x]t2 : B1
+(Γ ′
+1 + r · ∆+ Γ ′′
+1 ) + Γ2 ⊢([t′/x]t1) ([t′/x]t2) : B2
+(app)
+Since ([t′/x]t1) ([t′/x]t2) = [t′/x](t1 t2), the conclusion of the above deriva-
+tion is equivalent to the conclusion of the lemma except for the typing
+contexts. Finally, we must show that (Γ + r · ∆+ Γ ′) = ((Γ1 + r · ∆+
+Γ ′′
+1 ) + Γ2). This holds from the following reasoning:
+(Γ + r · ∆+ Γ ′) = (Γ ′
+1 + Γ2|Γ ′
+1) + r · ∆+ (Γ ′′
+1 + Γ2|Γ ′
+1)
+(∵Γ = (Γ ′
+1 + Γ2|Γ ′
+1) & Γ ′ = (Γ ′′
+1 + Γ2|Γ ′
+1))
+= Γ ′
+1 + Γ2|Γ ′
+1 + r · ∆+ Γ ′′
+1 + Γ2|Γ ′
+1
+(∵+ associativity)
+= Γ ′
+1 + r · ∆+ Γ ′′
+1 + Γ2|Γ ′
+1 + Γ2|Γ ′
+1
+(∵+ commutativity)
+= (Γ ′
+1 + r · ∆+ Γ ′′
+1 ) + (Γ2|Γ ′
+1 + Γ2|Γ ′
+1)
+(∵+ associativity)
+= (Γ ′
+1 + r · ∆+ Γ ′′
+1 ) + Γ2
+(∵Lemma 2)
+Thus, we obtain the conclusion of the lemma.
+• Suppose x /∈dom(Γ1) and (x : [A]r) ∈Γ2
+Let Γ ′
+2 and Γ ′′
+2 be typing contexts such that they satisfy Γ2 = (Γ ′
+2, x :
+[A]r, Γ ′′
+2 ). The last typing derivation of (app) is rewritten as follows:
+Γ1 ⊢t1 : B1 →B2
+Γ ′
+2, x : [A]r, Γ ′′
+2 ⊢t2 : B1
+Γ1 + (Γ ′
+2, x : [A]r, Γ ′′
+2 ) ⊢t1 t2 : B2
+(app)
+This case is similar to the case (x : [A]r) ∈Γ1 and x /∈dom(Γ2), but
+using 3 (2) instead of 3 (1).
+
+40
+Y. Tanabe et al.
+• Suppose (x : [A]r1) ∈Γ1 and (x : [A]r2) ∈Γ2 where r = r1 ⊕r2.
+Let Γ ′
+1, Γ ′′
+1 , Γ ′
+2, and Γ ′′
+2 be typing contexts such that they satisfy Γ1 =
+(Γ ′
+1, x : [A]r1, Γ ′′
+1 ) and Γ2 = (Γ ′
+2, x : [A]r2, Γ ′′
+2 ). The last derivation of
+(app) is rewritten as follows:
+Γ ′
+1, x : [A]r1, Γ ′′
+1 ⊢t1 : B1 →B2
+Γ ′
+2, x : [A]r2, Γ ′′
+2 ⊢t2 : B1
+(Γ ′
+1, x : [A]r1, Γ ′′
+1 ) + (Γ ′
+2, x : [A]r2, Γ ′′
+2 ) ⊢t1 t2 : B2
+(app)
+Now, we compare the typing contexts between the lemma and the above
+conclusion as follows:
+(Γ, x : [A]r, Γ ′) = (Γ ′
+1, x : [A]r1, Γ ′′
+1 ) + (Γ ′
+2, x : [A]r2, Γ ′′
+2 )
+= (Γ ′
+1, Γ ′′
+1 , x : [A]r1) + (Γ ′
+2, Γ ′′
+2 , x : [A]r2)
+(∵, commutativity)
+= ((Γ ′
+1, Γ ′′
+1 ) + (Γ ′
+2, Γ ′′
+2 )), x : [A]r1⊕r2
+(∵+ definiton)
+= ((Γ ′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1), (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1)), x : [A]r1⊕r2
+(∵Lemma 3 (3))
+= (Γ ′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1), (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1), x : [A]r1⊕r2
+(∵, associativity)
+= (Γ ′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1), x : [A]r1⊕r2, (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1)
+(∵, commutativity)
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that
+they satisfy the above equation. So here we know Γ = (Γ ′
+1+Γ ′
+2|Γ ′
+1+Γ ′′
+2 |Γ ′
+1)
+and Γ ′ = (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1).
+We then apply the induction hypothesis to each of the two premises of
+the last derivation and reapply (app) as follows:
+Γ ′
+1 + r1 · ∆+ Γ ′′
+1 ⊢[t′/x]t1 : B1 →B2
+Γ ′
+2 + r2 · ∆+ Γ ′′
+2 ⊢[t′/x]t2 : B1
+(Γ ′
+1 + r1 · ∆+ Γ ′′
+1 ) + (Γ ′
+2 + r2 · ∆+ Γ ′′
+2 ) ⊢([t′/x]t1) ([t′/x]t2) : B2
+(app)
+Since ([t′/x]t1) ([t′/x]t2) = [t′/x](t1 t2), the conclusion of the above deriva-
+tion is equivalent to the conclusion of the lemma except for the typing
+contexts. Finally, we must show that Γ + r · ∆+ Γ ′ = (Γ ′
+1 + r1 · ∆+
+Γ ′′
+1 ) + (Γ ′
+2 + r2 · ∆+ Γ ′′
+2 ).
+(Γ + r · ∆+ Γ ′) = (Γ ′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1) + (r1 ⊕r2) · ∆+ (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1)
+(∵r = r1 ⊕r2 & Γ = (Γ ′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1) & Γ ′ = (Γ ′′
+1 + Γ ′
+2|Γ ′
+1 + Γ ′′
+2 |Γ ′
+1))
+= Γ ′
+1 + (r1 ⊕r2) · ∆+ Γ ′′
+1 + (Γ ′
+2|Γ ′
+1 + Γ ′
+2|Γ ′
+1) + (Γ ′′
+2 |Γ ′
+1 + Γ ′′
+2 |Γ ′
+1)
+(∵+ associativity & commutativity)
+= Γ ′
+1 + (r1 ⊕r2) · ∆+ Γ ′′
+1 + Γ ′
+2 + Γ ′′
+2
+(∵Lemma 2)
+= Γ ′
+1 + r1 · ∆+ r2 · ∆+ Γ ′′
+1 + Γ ′
+2 + Γ ′′
+2
+(∵Lemma 5)
+= (Γ ′
+1 + r1 · ∆+ Γ ′′
+1 ) + (Γ ′
+2 + r2 · ∆+ Γ ′′
+2 )
+(∵+ associativity and commutativity)
+
+Compilation Semantics for a Programming Language with Versions
+41
+Thus, we obtain the conclusion of the lemma.
+– Case (weak)
+Γ ′′ ⊢t : B
+⊢∆′
+Γ ′′ + [∆′]0 ⊢t : B (weak)
+In this case, we know (Γ, x : [A]r, Γ ′) = Γ ′′+[∆′]0. There are two cases where
+the versioned assumption x : [A]r is contained in [∆′]0 and not included.
+• Suppose (x : [A]r) ∈[∆′]0
+We know r = 0. Let ∆1 and ∆2 be typing context such that ∆′ = (∆1, x :
+[A]0, ∆2). The last derivation is rewritten as follows:
+Γ ′′ ⊢t : B
+⊢∆1 + ∆+ ∆2
+Γ ′′ + [∆1, x : [A]0, ∆2]0 ⊢t : B (weak)
+We compare the typing contexts between the conclusion of the lemma
+and that of the above derivation to obtain the following:
+(Γ, x : [A]0, Γ ′) = Γ ′′ + [∆1, x : [A]0, ∆2]0
+(∵∆′ = (∆1, x : [A]0, ∆2))
+= Γ ′′ + ([∆1]0, x : [A]0, [∆2]0)
+(∵definiton of [Γ]0)
+= (Γ ′′
+|[∆2]0 + [∆1]0), x : [A]0, (Γ ′′
+|[∆2]0 + [∆2]0)
+(∵Lemma 3 (2))
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that
+they satisfy the above equation. So here we know Γ = (Γ ′′|[∆2]0 + [∆1]0)
+and Γ ′ = (Γ ′′
+|[∆2]0 + [∆2]0).
+We then apply the induction hypothesis to the premise of the last deriva-
+tion and reapply (weak) as follows:
+Γ ′′ ⊢[t′/x]t : B
+⊢∆1 + ∆+ ∆2
+Γ ′′ + [∆1 + ∆+ ∆2]0 ⊢[t′/x]t : B (weak)
+where we choose ∆1 + ∆+ ∆2 as the newly added typing context. Since
+x is unused by t, thus note that [t′/x]t = t, the conclusion of the above
+derivation is equivalent to the conclusion of the lemma except for typing
+contexts.
+Finally, we must show that (Γ + r · ∆+ Γ ′) = Γ ′′ + [∆1 + ∆+ ∆2]0.
+(Γ + r · ∆+ Γ ′) = (Γ ′′
+|[∆2]0 + [∆1]0) + [∆]0 + (Γ ′′
+|[∆2]0 + [∆2]0)
+(∵r = 0 & Γ = (Γ ′′|[∆2]0 + [∆1]0) & Γ ′ = (Γ ′′
+|[∆2]0 + [∆2]0))
+= (Γ ′′
+|[∆2]0 + Γ ′′
+|[∆2]0) + ([∆1]0 + [∆]0 + [∆2]0)
+(∵+ associativity and commutativity)
+= Γ ′′ + ([∆1]0 + [∆]0 + [∆2]0)
+(∵Lemma 2)
+= Γ ′′ + [∆1 + ∆+ ∆2]0
+(∵definition of [Γ]0)
+Thus, we obtain the conclusion of the lemma.
+
+42
+Y. Tanabe et al.
+• Suppose (x : [A]r) /∈[∆′]0
+Let Γ1 and Γ2 be typing context such that Γ ′′ = (Γ1, x : [A]r, Γ2). The
+last typing derivation of (weak) is rewritten as follows:
+(Γ1, x : [A]r, Γ2) ⊢t : B
+⊢∆′
+(Γ1, x : [A]r, Γ2) + [∆′]0 ⊢t : B (weak)
+We then compare the typing context between the conclusion of the
+lemma and that of the that of above derivation as follows:
+(Γ, x : [A]r, Γ ′) = (Γ1, x : [A]r, Γ2) + [∆′]0
+= (Γ1 + ([∆′]0)|Γ1), x : [A]r, (Γ2 + ([∆′]0)|Γ1)
+(∵Lemma 3 (1))
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that
+they satisfy the above equation. So here we know Γ = (Γ1 + ([∆′]0)|Γ1)
+and Γ ′ = (Γ2 + ([∆′]0)|Γ1). We then apply the induction hypothesis to
+the premise of the last derivation and reapply (weak) as follows:
+Γ1 + r · ∆+ Γ2 ⊢[t′/x]t : B
+⊢∆′
+(Γ1 + r · ∆+ Γ2) + [∆′]0 ⊢[t′/x]t : B (weak)
+The conclusion of the above derivation is equivalent to the conclusion of
+the lemma except for the typing contexts. Finally, we must show that
+(Γ + r · ∆+ Γ ′) = (Γ1 + r · ∆+ Γ2) + [∆′]0.
+(Γ + r · ∆+ Γ ′) = (Γ1 + ([∆′]0)|Γ1) + r · ∆+ (Γ2 + ([∆′]0)|Γ1)
+(∵Γ = (Γ1 + ([∆′]0)|Γ1) & Γ ′ = (Γ2 + ([∆′]0)|Γ1))
+= (Γ1 + r · ∆+ Γ2) + ([∆′]0|Γ1 + [∆′]0|Γ1)
+(∵+ associativity and commutativity)
+= (Γ1 + r · ∆+ Γ2) + [∆′]0
+(∵Lemma 2)
+Thus, we obtain the conclusion of the lemma.
+– Case (der)
+Γ ′′, y : B1 ⊢t : B2
+Γ ′′, y : [B1]1 ⊢t : B2
+(der)
+In this case, we know (Γ ′′, y : [B1]1) = (Γ, x : [A]r, Γ ′). There are two cases
+in which the versioned assumption x : [A]r is equivalent to y : [B1]1 and not
+equivalent to.
+• Suppose x : [A]r = y : [B1]1
+We know x = y, A = B1, r = 1, Γ = Γ ′′, and Γ ′ = ∅. The last derivation
+is rewritten as follows:
+Γ ′′, x : A ⊢t : B2
+Γ ′′, x : [A]1 ⊢t : B2
+(der)
+
+Compilation Semantics for a Programming Language with Versions
+43
+We then apply Lemma 7 to the premise to obtain the following:
+Γ ′′ + ∆⊢[t′/x]t : B2
+Note that ∆is a versioned assumption by the assumption 1 and thus
+Γ ′′ +∆= Γ ′′ +r·∆where r = 1, we obtain the conclusion of the lemma.
+• Suppose x : [A]r ̸= y : [B1]1
+Let Γ1 and Γ2 be typing contexts such that Γ ′′ = (Γ1, x : [A]r, Γ ′
+1). The
+last derivation is rewritten as follows:
+(Γ1, x : [A]r, Γ ′
+1), y : B1 ⊢t : B2
+(Γ1, x : [A]r, Γ ′
+1), y : [B1]1 ⊢t : B2
+(der)
+We then apply the induction hypothesis to the premise of the last deriva-
+tion and reapply (der) to obtain the following:
+(Γ + r · ∆+ Γ ′′), y : B1 ⊢[t′/x]t : B2
+(Γ + r · ∆+ Γ ′′), y : [B1]1 ⊢[t′/x]t : B2
+(der)
+Since y : [B1]1 is desjoint with Γ +r·∆+Γ ′′ and thus ((Γ +r·∆+Γ ′′), y :
+[B1]1) = Γ +r·∆+(Γ ′′, y : [B1]1), we obtain the conclusion of the lemma.
+– Case (pr)
+[Γ1] ⊢t : B
+⊢r′
+r′ · [Γ1] ⊢[t] : 2r′B (pr)
+Let r′′ be a version resouce and Γ ′
+1 and Γ ′′
+1 be typing contexts such that
+r′′ ⊑r′ and [Γ1] = [Γ ′
+1, x : [A]r′′, Γ ′′
+1 ]. The last derivation is rewritten as
+follows:
+[Γ ′
+1, x : [A]r′′, Γ ′′
+1 ] ⊢t : B
+r′ · [Γ ′
+1, x : [A]r′′, Γ ′′
+1 ] ⊢[t] : 2r′B (pr)
+We then compare the conclusion of the lemma and the above conclusion.
+(Γ, x : [A]r, Γ ′) = r′ · [Γ1]
+= r′ · [Γ ′
+1, x : [A]r′′, Γ ′′
+1 ]
+(∵[Γ1] = [Γ ′
+1, x : [A]r′′, Γ ′′
+1 ])
+= r′ · [Γ ′
+1], x : [A]r′′⊗r′, r′ · [Γ ′′
+1 ]
+(∵· definition)
+= r′ · [Γ ′
+1], x : [A]r′, r′ · [Γ ′′
+1 ]
+(∵r′′ ⊑r′)
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that they
+satisfy the above equation. So here we know Γ = (r′·[Γ ′
+1]) and Γ ′ = (r′·[Γ ′′
+1 ]).
+We then apply the induction hypothesis to the premise of the last derivation
+and reapply (pr) to obtain the following:
+[Γ ′
+1 + r′′ · ∆+ Γ ′′
+1 ] ⊢[t′/x]t : B
+⊢r′
+r′ · [Γ ′
+1 + r′′ · ∆+ Γ ′′
+1 ] ⊢[[t′/x]t] : 2r′B (pr)
+where we use [Γ ′
+1, x : [A]r′′, Γ ′′
+1 ] = [Γ ′
+1], x : [A]r′′, [Γ ′′
+1 ] and [Γ ′
+1 +r′′ ·∆+Γ ′′
+1 ] =
+[Γ ′
+1] + r′′ · ∆+ [Γ ′′
+1 ] before applying (pr).
+
+44
+Y. Tanabe et al.
+Since [[t′/x]t] = [t′/x][t] by the definiton of substitution, the above conclusion
+is equivalent to the conclusion of the lemma except for the typing contexts.
+Finally, we must show that (Γ + r′ · ∆+ Γ ′) = r′ · [Γ ′
+1 + r′′ · ∆+ Γ ′′
+1 ] by the
+following reasoning:
+(Γ + r′ · ∆+ Γ ′) = r′ · [Γ ′
+1] + r′ · ∆+ r′ · [Γ ′
+1]
+(∵Γ = (r′ · [Γ ′
+1]) & Γ ′ = (r′ · [Γ ′′
+1 ]))
+= r′ · [Γ ′
+1] + (r′ ⊗r′′) · ∆+ r′ · [Γ ′
+1]
+(∵r′′ ⊑r′)
+= r′ · [Γ ′
+1] + r′ · (r′′ · ∆) + r′ · [Γ ′
+1]
+(∵⊗associativity)
+= r′ · [Γ ′
+1 + r′′ · ∆+ Γ ′
+1]
+(∵· distributive law over +)
+Thus, we obtain the conclusion of the lemma.
+– Case (ver)
+[Γi] ⊢ti : B
+⊢{li}
+S
+i({li} · [Γi]) ⊢{li = ti} : 2{li}B (ver)
+We compare the typing contexts between the lemma and the above conclu-
+sion as follows:
+(Γ, x : [A]r, Γ ′) =
+[
+i
+({li} · [Γi])
+=
+[
+i∈Ix
+({li} · [Γ ′
+i, x : [A]ri, Γ ′′
+i ]) +
+[
+i∈Jx
+({li} · [Γ ′
+i, Γ ′′
+i ])
+(∵Ix = {i | x ∈dom(Γi)} and Jx = {i | x /∈dom(Γi)})
+We then reorganise the typing context S
+i∈Ix ({li} · [Γ ′
+i, x : [A]ri, Γ ′′
+i ]) as
+follows:
+[
+i∈Ix
+({li} · [Γ ′
+i, x : [A]ri, Γ ′′
+i ])
+=
+[
+i∈Ix
+({li} · [x : [A]ri, Γ ′
+i, Γ ′′
+i ])
+(∵, associativity)
+=
+[
+i∈Ix
+({li} · (x : [A]ri), {li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+(∵· distributive law)
+=
+[
+i∈Ix
+({li} · (x : [A]ri)) ,
+[
+i∈Ix
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+(∵Sum of each disjoint sub context)
+=
+[
+i∈Ix
+ x : [A]{li}⊗ri
+
+,
+[
+i∈Ix
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+(∵· definition)
+= x : [A]P
+i∈Ix{li}⊗ri,
+[
+i∈Ix
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ]) (∵S and + definition)
+
+Compilation Semantics for a Programming Language with Versions
+45
+Thus, we obtain the following:
+(Γ, x : [A]r, Γ ′)
+=
+ 
+x : [A]P
+i∈Ix{li}⊗ri,
+[
+i∈Ix
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+!
++
+[
+i∈Jx
+({li} · [Γ ′
+i, Γ ′′
+i ])
+= x : [A]P
+i∈Ix{li}⊗ri,
+[
+i
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+(∵S
+i∈Jx ({li} · [Γ ′
+i, Γ ′′
+i ]) are disjoint with x : [A]P
+i∈Ix{li}⊗ri)
+Therefore, By Lemma 4, there exists typing contexts Γ ′
+i and Γ ′′
+i such that:
+Γ ′
+i, Γ ′′
+i =
+[
+i
+({li} · [Γ ′
+i], {li} · [Γ ′′
+i ])
+Γ ′
+i + Γ ′′
+i =
+[
+i
+({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+Thus, we obtain the following:
+(Γ, x : [A]r, Γ ′) = x : [A]P
+i∈Ix{li}⊗ri, Γ ′
+i, Γ ′′
+i
+= Γ ′
+i, x : [A]P
+i∈Ix{li}⊗ri, Γ ′′
+i
+(∵, commutativity)
+By the commutativity of ”,”, we can take Γ and Γ ′ arbitrarily so that they
+satisfy the above equation. So here we know Γ = Γ ′
+i, Γ ′ = Γ ′′
+i , and r =
+P
+i∈Ix({li} ⊗ri). We then apply the induction hypothesis to the premise
+whose typing context contains x. Here, we define a typing context ∆i as
+follows:
+∆i =
+(
+∆
+(i ∈Ix)
+∅
+(i ∈Jx)
+By using ∆i, we reapply (ver) as follows:
+[Γ ′
+i + ri · ∆i + Γ ′′
+i ] ⊢[t′/x]ti : B
+⊢{li}
+S
+i({li} · [Γ ′
+i + ri · ∆i + Γ ′′
+i ]) ⊢{li = [t′/x]ti} : 2{li}B
+(ver)
+Since {li = [t′/x]ti | lk} = [t′/x]{li = ti | lk} by the definition of substitution,
+the above conclusion is equivalent to the conclusion of the lemma except for
+typing contexts. Finally, we must show that (Γ +r ·∆+Γ ′) = S
+i({li}·[Γ ′
+i +
+
+46
+Y. Tanabe et al.
+ri · ∆i + Γ ′′
+i ]).
+(Γ + r · ∆+ Γ ′) = Γ ′
+i + r · ∆+ Γ ′′
+i
+(∵Γ = Γ ′
+i & Γ ′ = Γ ′′
+i )
+= r · ∆+ (Γ ′
+i + Γ ′′
+i )
+(+ associativity & commutativity)
+= r · ∆+
+[
+i
+({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+(∵Γ ′
+i + Γ ′′
+i = S
+i ({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ]))
+= (
+X
+i∈Ix
+({li} ⊗ri)) · ∆+
+[
+i
+({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+(∵r = P
+i∈Ix({li} ⊗ri))
+=
+[
+i∈Ix
+({li} · (ri · ∆)) +
+[
+i
+({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+(∵S definition)
+=
+[
+i
+({li} · (ri · ∆i)) +
+[
+i
+({li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+(∵∆i definition)
+=
+[
+i
+({li} · (ri · ∆i) + {li} · [Γ ′
+i] + {li} · [Γ ′′
+i ])
+(∵+ commutativity & associativity)
+=
+[
+i
+({li} · ((ri · ∆i) + [Γ ′
+i] + [Γ ′′
+i ])) (∵districutive law)
+=
+[
+i
+({li} · ([Γ ′
+i] + (ri · ∆i) + [Γ ′′
+i ]))
+(∵+ commutativity)
+=
+[
+i
+({li} · [Γ ′
+i + ri · ∆i + Γ ′′
+i ])
+(∵[·] definition)
+Thus, we obtain the conclusion of the lemma.
+– Case (veri)
+[Γi] ⊢ti : B
+⊢{li}
+lk ∈{li}
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: B (veri)
+This case is similar to the case of (ver).
+– Case (extr)
+Γ ⊢t : 2rA
+l ∈r
+Γ ⊢t.l : A
+(extr)
+In this case, we apply the induction hypothesis to the premise and then
+reapply (extr), we obtain the conclusion of the lemma.
+
+Compilation Semantics for a Programming Language with Versions
+47
+– Case (sub)
+Γ1, y : [B′]r1, Γ2 ⊢t : B
+r1 ⊑r2
+⊢r2
+Γ1, y : [B′]r2, Γ2 ⊢t : B
+(sub)
+In this case, we know (Γ, x : [A]r, Γ ′) = (Γ, y : [B′]r2, Γ ′). There are three
+cases where the versioned assumption x : [A]r is included in Γ1, included in
+Γ2, or equal to y : [B′]r2.
+• Suppose (x : [A]r) ∈Γ1.
+Let Γ ′
+1 and Γ ′′
+1 be typing contexts such that Γ1 = (Γ ′
+1, x : [A]r, Γ ′′
+1 ). The
+last derivation is rewritten as follows:
+Γ ′
+1, x : [A]r, Γ ′′
+1 , y : [B′]r1, Γ2 ⊢t : B
+r1 ⊑r2
+⊢r2
+Γ ′
+1, x : [A]r, Γ ′′
+1 , y : [B′]r2, Γ2 ⊢t : B
+(sub)
+We then apply the induction hypothesis to the premise of the last deriva-
+tion to obtain the following:
+Γ ′
+1 + r · ∆+ (Γ ′′
+1 , y : [B′]r1, Γ2) ⊢[t′/x]t : B
+(1)
+The typing context of the above conclusion can be transformed as follows:
+Γ ′
+1 + r · ∆+ (Γ ′′
+1 , y : [B′]r1, Γ2)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r1,Γ2)),
+
+(Γ ′′
+1 , y : [B′]r1, Γ2) + (r · ∆)|(Γ ′′
+1 ,y:[B′]r1,Γ2)
+
+(∵Lemma 6)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r1,Γ2)),
+
+(Γ ′′
+1 , y : [B′]r1, Γ2) +
+
+(r · ∆)|Γ ′′
+1 , (r · ∆)|(y:[B′]r1), (r · ∆)|Γ2)
+
+(∵6)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r1,Γ2)),
+ Γ ′′
+1 + (r · ∆)|Γ ′′
+1
+
+,
+
+y : [B′]r1 + (r · ∆)|(y:[B′]r1)
+
+,
+ Γ2 + (r · ∆)|Γ2
+
+(∵Lemma 3)
+= Γ3, y : [B′]r1⊕r3, Γ ′
+3
+The last equational transformation holds by the following equation 2.
+Let Γ3 and Γ ′
+3 be typing contexts that satisfy the following:
+Γ3 = (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r1,Γ2)),
+ Γ ′′
+1 + (r · ∆)|Γ ′′
+1
+
+Γ ′
+3 =
+ Γ2 + (r · ∆)|Γ2
+
+For (r·∆)|(y:[B′]r1), Let r3 and r′
+3 be typing contexts such that r3 = r⊗r′
+3
+and stisfy the following:
+(r · ∆)|(y:[B′]r1) =
+(
+r · (y : [B′]r′
+3) = y : [B′]r⊗r′
+3 = y : [B′]r3
+(y ∈dom(∆))
+∅
+(y /∈dom(∆))
+
+48
+Y. Tanabe et al.
+Thus, we obtain the following equation.
+y : [B′]r1 + (r · ∆)|(y:[B′]r1) =
+(
+y : [B′]r1⊕r3
+(y ∈dom(∆))
+y : [B′]r1⊕r3 = y : [B′]r1
+(y /∈dom(∆))
+(2)
+Applying all of the above transformations and reapplying (sub) to the
+expression 1, we obtain the following:
+Γ3, y : [B′]r1⊕r3, Γ ′
+3 ⊢[t′/x]t : B
+(r1 ⊕r3) ⊑(r2 ⊕r3)
+⊢r2 ⊕r3
+Γ3, y : [B′]r2⊕r3, Γ ′
+3 ⊢[t′/x]t : B
+(sub)
+The conclusion of the above derivation is equivalent to the conclusion of
+the lemma except for the typing contexts.
+Finally, we must show that Γ ′
+1 + r · ∆+ (Γ ′′
+1 , y : [B′]r2, Γ2) = (Γ3, y :
+[B′]r2⊕r3, Γ ′
+3).
+Γ ′
+1 + r · ∆+ (Γ ′′
+1 , y : [B′]r2, Γ2)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r2,Γ2)),
+
+(Γ ′′
+1 , y : [B′]r2, Γ2) + (r · ∆)|(Γ ′′
+1 ,y:[B′]r2,Γ2)
+
+(∵Lemma 6)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r2,Γ2)),
+
+(Γ ′′
+1 , y : [B′]r2, Γ2) +
+
+(r · ∆)|Γ ′′
+1 , (r · ∆)|(y:[B′]r2), (r · ∆)|Γ2)
+
+(∵6)
+= (Γ ′
+1 + (r · ∆)|Γ ′
+1), (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r2,Γ2)),
+ Γ ′′
+1 + (r · ∆)|Γ ′′
+1
+
+,
+
+y : [B′]r2 + (r · ∆)|(y:[B′]r2)
+
+,
+ Γ2 + (r · ∆)|Γ2
+
+(∵Lemma 3)
+= Γ3, y : [B′]r2⊕r3, Γ ′
+3
+The last transformation is based on the following equation that can be
+derived from the definition 6.
+(r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r1,Γ2)) = (r · ∆)|(Γ ′
+1,(Γ ′′
+1 ,y:[B′]r2,Γ2))
+(r · ∆)|(y:[B′]r1) = (r · ∆)|(y:[B′]r2)
+Thus, we obtain the conclusion of the lemma.
+• Suppose (x : [A]r) ∈Γ2.
+This case is similar to the case of (x : [A]r) ∈Γ1.
+• Suppose (x : [A]r) = y : [B′]r2.
+The last derivation is rewritten as follows:
+Γ1, x : [A]r′, Γ2 ⊢t : B
+r′ ⊑r
+⊢r
+Γ1, x : [A]r, Γ2 ⊢t : B
+(sub)
+We apply the induction hypothesis to the premise and then reapply
+(sub), we obtain the conclusion of the lemma.
+
+Compilation Semantics for a Programming Language with Versions
+49
+C.4
+Type Safety
+Lemma 9 (Inversion lemma). Let v be a value such that Γ ⊢v : A. The
+followings hold for a type A.
+– A = Int =⇒v = n for some integer constant n.
+– A = 2rB =⇒v = [t′] for some term t′, or v = {li = ti} for some terms ti
+and some labels li ∈r.
+– A = B →B′ =⇒v = λp.t for some pattern p and term t.
+Lemma 10 (Type safety for default version overwriting).
+For any version label l:
+Γ ⊢t : A
+=⇒
+Γ ⊢t@l : A
+Proof. The proof is given by induction on the typing derivation of Γ ⊢t : A.
+Consider the cases for the last rule used in the typing derivation of assumption.
+– Case (int)
+∅⊢n : Int (int)
+This case holds trivially because n@l ≡n for any labels l.
+– Case (var)
+⊢A
+x : A ⊢x : A (var)
+This case holds trivially because x@l = x for any labels l.
+– Case (abs)
+−⊢p : B1  ∆′
+Γ, ∆′ ⊢t1 : A2
+Γ ⊢λp.t1 : A1 →A2
+(abs)
+By induction hypothesis, there exists a term t1@l such that:
+Γ, ∆′ ⊢t1@l : A2
+We then reapply (abs) to obtain the following:
+−⊢p : B1  ∆′
+Γ, ∆′ ⊢t1@l : A2
+Γ ⊢λp.(t1@l) : A1 →A2
+(abs)
+Thus, note that (λp.t1)@l ≡λp.(t1@l), we obtain the conclusion of the
+lemma.
+
+50
+Y. Tanabe et al.
+– Case (app)
+Γ1 ⊢t1 : B →A
+Γ2 ⊢t2 : B
+Γ1 + Γ2 ⊢t1 t2 : A
+(app)
+By induction hypothesis, there exists terms t1@l and t2@l such that:
+Γ1 ⊢t1@l : B →A
+Γ2 ⊢t2@l : B
+We then reapply (app) to obtain the following:
+Γ1 ⊢t1@l : B →A
+Γ2 ⊢t2@l : B
+Γ1 + Γ2 ⊢(t1@l) (t2@l) : A
+(app)
+Thus, note that (t1 t2)@l ≡(t1@l) (t2@l), we obtain the conclusion of the
+lemma.
+– Case (let)
+Γ1 ⊢t1 : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = t1 in t2 : B
+(let)
+By induction hypothesis, there exists terms t1@l and 2@l such that:
+Γ1 ⊢t1@l : 2rA
+Γ2, x : [A]r ⊢t2@l : B
+We then reapply (let) to obtain the following:
+Γ1 ⊢t1@l : 2rA
+Γ2, x : [A]r ⊢t2@l : B
+Γ1 + Γ2 ⊢let [x] = (t1@l) in (t2@l) : B
+(let)
+Thus, note that (let [x] = t1 in t2)@l ≡let [x] = (t1@l) in (t2@l), we ob-
+tain the conclusion of the lemma.
+– Case (weak)
+Γ1 ⊢t : A
+⊢∆′
+Γ1 + [∆′]0 ⊢t : A (weak)
+By induction hypothesis, we know the following:
+Γ1 ⊢t@l : A
+We then reapply (weak) to obtain the following:
+Γ1 ⊢t@l : A
+Γ1 + [∆′]0 ⊢t@l : A (weak)
+
+Compilation Semantics for a Programming Language with Versions
+51
+Thus, we obtain the conclusion of the lemma.
+– Case (der)
+Γ1, x : B ⊢t : A
+Γ1, x : [B]1 ⊢t : A
+(der)
+By induction hypothesis, there exists terms t@l such that:
+Γ1, x : B ⊢t@l : A
+We then reapply (der) to obtain the following:
+Γ1, x : B ⊢t@l : A
+Γ1, x : [B]1 ⊢t@l : A (der)
+Thus, we obtain the conclusion of the lemma.
+– Case (pr)
+[Γ] ⊢t : B
+⊢r
+r · [Γ] ⊢[t] : 2rB
+(pr)
+This case holds trivially because [t]@l ≡[t] for any labels l.
+– Case (ver)
+[Γi] ⊢ti : A
+⊢{li}
+S
+i({li} · [Γi]) ⊢{li = ti} : 2{li}A
+(ver)
+This case holds trivially because {li = ti}@l ≡{li = ti} for any labels l.
+– Case (veri)
+[Γi] ⊢ti : A
+⊢{li}
+lk ∈{li}
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: A (veri)
+In this case, there are two possibilities for the one step evaluation of t.
+• Suppose l ∈{li}.
+We can apply the default version overwriting as follows:
+l ∈{li}
+⟨li = ti | lk⟩@l ≡⟨li = ti | l⟩
+In this case, we can derive the type of ⟨li = ti | l⟩as follows:
+[Γi] ⊢ti : A
+S
+i({li} · [Γi]) ⊢⟨li = ti | l⟩: A
+(veri)
+Thus, we obtain the conclusion of the lemma.
+• Suppose l /∈{li}.
+We can apply the default version overwriting as follows:
+
+52
+Y. Tanabe et al.
+l /∈{li}
+⟨li = ti | lk⟩@l ≡⟨li = ti | lk⟩
+This case holds trivially because ⟨li = ti | lk⟩@l = ⟨li = ti | lk⟩.
+– Case (extr)
+Γ ⊢t1 : 2rA
+lk ∈r
+Γ ⊢t1.lk : A
+(extr)
+By induction hypothesis, there exists a term t1@l such that:
+Γ ⊢t1@l : 2rA
+We then reapply (extr) to obtain the following:
+Γ ⊢t1@l : 2rA
+lk ∈r
+Γ ⊢(t1@l).lk : A
+(extr)
+Thus, note that (t1.lk)@l ≡(t1@l).lk, we obtain the conclusion of the lemma.
+– Case (sub)
+Γ1, x : [B]r, Γ2 ⊢t : A
+r ⊑s
+⊢s
+Γ1, x : [B]s, Γ2 ⊢t : A
+(sub)
+By induction hypothesis, there exists a term t@l such that:
+Γ1, x : [B]r, Γ2 ⊢t@l : A
+We then reapply (sub) to obtain the following:
+Γ1, x : [B]r, Γ2 ⊢t@l : A
+r ⊑s
+⊢s
+Γ1, x : [B]s, Γ2 ⊢t@l : A
+(sub)
+Thus, we obtain the conclusion of the lemma.
+Lemma 11 (Type-safe extraction for versioned values).
+[Γ] ⊢u : 2rA
+=⇒
+∀lk ∈r. ∃t′.
+(
+u.lk −→t′
+(progress)
+[Γ] ⊢t′ : A
+(preservation)
+Proof. By inversion lemma (9), u has either a form [t′′] or {li = ti}.
+– Suppose u = [t′′].
+We can apply (E-ex1) as follows:
+[t′′].lk ; t′′@lk
+(E-ex1)
+
+Compilation Semantics for a Programming Language with Versions
+53
+Also, we get the following derivation for v.
+[Γ ′] ⊢t′′ : A
+⊢r (pr)
+r · [Γ ′] ⊢[t′′] : 2rA (weak) or (sub)
+...
+(weak) or (sub)
+[Γ] ⊢[t′′] : 2rA
+By Lemma 10, we know the following:
+[Γ ′] ⊢t′′@lk : A
+Finally, we can rearrange the typing context as follows:
+[Γ ′] ⊢t′′@lk : A (weak) or (sub)
+...
+(weak) or (sub)
+[Γ] ⊢t′′@lk : A
+Here, we follow the same manner as for the derivation of [t′′] (which may use
+(weak) and (sub)) to get [Γ] from r · [Γ ′].
+Thus, we obtain the conclusion of the lemma.
+– Suppose u = {li = ti}.
+We can apply (E-ex2) as follows:
+{li = ti}.lk ; tk@lk
+(E-ex2)
+Also, we get the following derivation for v.
+[Γ ′
+i] ⊢ti : A
+⊢{li}
+(ver)
+S
+i({li} · [Γ ′
+i]) ⊢{li = ti} : 2{li}A
+(weak) or (sub)
+...
+(weak) or (sub)
+[Γ] ⊢{li = ti} : 2{li}A
+By Lemma 10, we know the following:
+[Γ ′
+k] ⊢tk@lk : A
+Finally, we can rearrange the typing context as follows:
+[Γ ′
+k] ⊢tk@lk : A
+rkj ⊑rkj ⊗{lk} (sub) ∗|Γ ′
+k|
+{lk} · [Γ ′
+k] ⊢tk@lk : A
+|
+{z
+}
+P
+P
+rkj ⊗{lk} ⊑P
+i(rij ⊗{li}) (sub) ∗|Γ ′
+k|
+S
+i({li} · [Γ ′
+i]) ⊢tk@lk : A (weak) or (sub)
+...
+(weak) or (sub)
+[Γ] ⊢tk@lk : A
+
+54
+Y. Tanabe et al.
+Here in the multiple application of (sub), the second premise compares the
+resources of j-th versioned assumption between the first premise and con-
+clusion. Also, we follow the same manner as for the derivation of {li = ti}
+(which may use (weak) and (sub)) to get [Γ] from S
+i({li} · [Γ ′
+i]).
+Thus, we obtain the conclusion of the lemma.
+Theorem 1 (Type preservation for reductions).
+Γ ⊢t : A
+t ; t′
+)
+=⇒
+Γ ⊢t′ : A
+Proof. The proof is given by induction on the typing derivation of t. Consider
+the cases for the last rule used in the typing derivation of the first assumption.
+– Case (int)
+∅⊢n : Int (int)
+This case holds trivially because there are no reduction rules that can be
+applied to n.
+– Case (var)
+⊢A
+x : A ⊢x : A (var)
+This case holds trivially because there are no reduction rules that can be
+applied to x.
+– Case (abs)
+−⊢p : B1  ∆′
+Γ, ∆′ ⊢t1 : A2
+Γ ⊢λp.t1 : A1 →A2
+(abs)
+This case holds trivially because there are no reduction rules that can be
+applied to λp.t1.
+– Case (app)
+Γ1 ⊢t1 : B →A
+Γ2 ⊢t2 : B
+Γ1 + Γ2 ⊢t1 t2 : A
+(app)
+We perform case analysis for the ruduction rule applied last.
+• Case (E-abs1)
+(λx.t′
+1) t2
+|
+{z
+}
+t
+; (t2  x) t′
+1
+(E-abs1)
+
+Compilation Semantics for a Programming Language with Versions
+55
+where t1 = λx.t′
+1 for a term t′
+1. Then we can apply (var) to obtain the
+following:
+(t2  x) t′
+1 = [t2/x]t′
+1
+(var)
+In this case, we know the typing derivation of t has the following form:
+Γ ′
+1, x : B ⊢t′
+1 : A
+(abs)
+Γ ′
+1 ⊢λx.t′
+1 : B →A (weak), (der), or (sub)
+...
+(weak), (der), or (sub)
+Γ1 ⊢λx.t′
+1 : B →A
+Γ2 ⊢t2 : B (app)
+Γ1 + Γ2 ⊢(λx.t′
+1) t2 : A
+By Lemma 7, we know the following:
+Γ2 ⊢t2 : B
+Γ ′
+1, x : B ⊢t′
+1 : A
+)
+=⇒
+Γ ′
+1 + Γ2 ⊢[t2/x]t′
+1 : A
+Finally, we can rearrange the typing context as follows:
+Γ ′
+1 + Γ2 ⊢[t2/x]t′
+1 : A (weak), (der), or (sub)
+...
+(weak), (der), or (sub)
+Γ1 + Γ2 ⊢[t2/x]t′
+1 : A
+Here, there exists a derive tree to get Γ1 + Γ2 from Γ ′
+1 + Γ2 as for the
+derivation of λx.t′
+1 which may use (weak), (der) and (sub).
+By choosing t′ = [t2/x]t′
+1, we obtain the conclusion of the theorem.
+• Case (E-abs2)
+(λ[x].t′
+1) t2
+|
+{z
+}
+t
+; let [x] = t2 in t′
+1
+|
+{z
+}
+t′
+(E-abs2)
+In this case, we know the typing derivation of t has the following form:
+([pVar])
+r ⊢x : B  x : [B]r
+(p□)
+−⊢[x] : 2rB  x : [B]r
+Γ1, x : [B]r ⊢t′
+1 : A (abs)
+Γ1 ⊢λ[x].t′
+1 : 2rB →A
+|
+{z
+}
+P
+P
+Γ2 ⊢t2 : 2rB
+(app)
+Γ1 + Γ2 ⊢(λ[x].t′
+1) t2 : A
+Therefore, we can construct the derivation tree for t′ as follows.
+Γ2 ⊢t2 : 2rB
+Γ1, x : [B]r ⊢t′
+1 : A (app)
+Γ1 + Γ2 ⊢let [x] = t2 in t′
+1 : A
+Hence, we have the conclusion of the theorem.
+– Case (let)
+
+56
+Y. Tanabe et al.
+Γ1 ⊢t1 : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = t1 in t2 : B
+(let)
+The only reduction rule we can apply is (E-clet) with two substitution
+rules, depending on whether t1 has the form [t′
+1] or {li = t′′
+i }.
+• Suppose t1 = [t′
+1].
+We can apply (E-clet) to obtain the following.
+let [x] = [t′
+1] in t2
+|
+{z
+}
+t
+; ([t′
+1]  [x])t2
+(E-clet)
+Thus, we can apply (□) and (var) to obtain the following.
+(var)
+(t′
+1  x)t2 = [t′
+1/x]t2
+(□)
+([t′
+1]  [x])t2 = [t′
+1/x]t2
+In this case, we know the typing derivation of t has the following form:
+[Γ ′
+1] ⊢t′
+1 : A
+⊢r (pr)
+r · [Γ ′
+1] ⊢[t′
+1] : 2rA (weak) or (sub)
+...
+(weak) or (sub)
+Γ1 ⊢[t′
+1] : 2rA
+Γ2, x : [A]r ⊢t2 : B (let)
+Γ1 + Γ2 ⊢let [x] = [t′
+1] in t2 : B
+By Lemma 8, we know the following:
+[Γ ′
+1] ⊢t′
+1 : A
+Γ2, x : [A]r ⊢t2 : B
+)
+=⇒
+Γ2 + r · [Γ ′
+1] ⊢[t′
+1/x]t2 : B
+Finally, we can rearrange the typing context as follows:
+Γ2 + r · [Γ ′
+1] ⊢[t′
+1/x]t2 : B (weak) or (sub)
+...
+(weak) or (sub)
+Γ2 + Γ1 ⊢[t′
+1/x]t2 : B
+Here, there exists a derive tree to get Γ2 + Γ1 from Γ2 + r · [Γ ′
+1] as for
+the derivation of [t′
+1] which may use (weak) and (sub).
+Thus, by choosing t′ = [t′
+1/x]t2, we obtain the conclusion of the theorem.
+• Suppose t1 = {li = t′′
+i }.
+We can apply (E-clet) to obtain the following:
+let [x] = {li = t′′
+i } in t2
+|
+{z
+}
+t
+; ({li = t′′
+i }  [x])t2
+(E-clet)
+Thus, we can apply (ver) and (var) to obtain the following.
+(var)
+(⟨li = t′′
+i | lk⟩ x)t2 = [⟨li = t′′
+i | lk⟩/x]t2 (ver)
+({li = t′′
+i }  [x])t2 = [⟨li = t′′
+i | lk⟩/x]t2
+In this case, we know the typing derivation of t has the following form:
+
+Compilation Semantics for a Programming Language with Versions
+57
+[Γ ′
+i] ⊢t′′
+i : A
+⊢{li}
+(ver)
+S
+i({li} · [Γ ′
+i]) ⊢{li = t′′
+i } : 2{li}A
+(weak) or (sub)
+...
+(weak) or (sub)
+Γ1 ⊢{li = t′′
+i } : 2{li}A
+|
+{z
+}
+P
+P
+Γ2, x : A ⊢t2 : B
+(der)
+Γ2, x : [A]1 ⊢t2 : B
+(sub)∗|{li}|
+Γ2, x : [A]{li} ⊢t2 : B
+(let)
+Γ1 + Γ2 ⊢let [x] = {li = t′′
+i } in t2 : B
+Then we can derive the type of ⟨li = t′′
+i | lk⟩as follows:
+[Γ ′
+i] ⊢t′′
+i : A
+S
+i({li} · [Γ ′
+i]) ⊢⟨li = t′′
+i | lk⟩: A
+(veri)
+By Lemma 7, we know the following:
+S
+i({li} · [Γ ′
+i]) ⊢⟨li = t′′
+i | lk⟩: A
+Γ2, x : A ⊢t2 : B
+)
+=⇒
+Γ2+S
+i({li} · [Γ ′
+i])
+⊢[⟨li = t′′
+i | lk⟩/x]t2 : B
+Finally, we can rearrange the typing context as follows:
+Γ2 + S
+i({li} · [Γ ′
+i]) ⊢[⟨li = t′′
+i | lk⟩/x]t2 : B (weak) or (sub)
+...
+(weak) or (sub)
+Γ2 + Γ1 ⊢[⟨li = t′′
+i | lk⟩/x]t2 : B
+Here, there exists a derive tree to get Γ2 + Γ1 from Γ2 + S
+i({li} · [Γ ′
+i])
+as for the derivation of {li = t′′
+i } which may use (weak) and (sub).
+Thus, by choosing t′ = [⟨li = t′′
+i | lk⟩/x]t2, we obtain the conclusion of
+the theorem.
+– Case (weak)
+Γ1 ⊢t : A
+⊢∆′
+Γ1 + [∆′]0 ⊢t : A (weak)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′′ such that:
+t ; t′′ ∧Γ1 ⊢t′′ : A
+(ih)
+We then reapply (weak) to obtain the following:
+Γ1 ⊢t′′ : A
+⊢∆′
+Γ1 + [∆′]0 ⊢t′′ : A (weak)
+
+58
+Y. Tanabe et al.
+Thus, by choosing t′ = t′′, we obtain the conclusion of the theorem.
+– Case (der)
+Γ1, x : B ⊢t : A
+Γ1, x : [B]1 ⊢t : A
+(der)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′′ such that:
+t ; t′′ ∧Γ1, x : B ⊢t′′ : A
+(ih)
+We then reapply (der) to obtain the following:
+Γ1, x : B ⊢t′′ : A
+Γ1, x : [B]1 ⊢t′′ : A (der)
+Thus, by choosing t′ = t′′, we obtain the conclusion of the theorem.
+– Case (pr)
+[Γ] ⊢t′′ : B
+⊢r
+r · [Γ] ⊢[t′′] : 2rB (pr)
+This case holds trivially because there are no reduction rules that can be
+applied to [t′′].
+– Case (ver)
+[Γi] ⊢ti : A
+⊢{li}
+S
+i({li} · [Γi]) ⊢{li = ti} : 2{li}A
+(ver)
+This case holds trivially because there are no reduction rules that can be
+applied to {li = ti}.
+– Case (veri)
+[Γi] ⊢ti : A
+⊢{li}
+lk ∈{li}
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: A (veri)
+In this case, the only reduction rule we can apply is (E-veri).
+⟨li = ti | lk⟩
+|
+{z
+}
+t
+; tk@lk
+(E-veri)
+By Lemma 10, we obtain the following:
+[Γk] ⊢tk : A
+=⇒
+[Γk] ⊢tk@lk : A
+Finally, we can rearrange the typing context as follows:
+
+Compilation Semantics for a Programming Language with Versions
+59
+[Γk] ⊢tk@lk : A (weak), (der) or (sub)
+...
+(weak), (der) or (sub)
+S
+i({li} · [Γi]) ⊢tk@lk : A
+Thus, by choosing t′ = tk@lk, we obtain the conclusion of the theorem.
+– Case (extr)
+Γ ⊢t1 : 2rA
+lk ∈r
+Γ ⊢t1.lk : A
+(extr)
+In this case, there are two reduction rules that we can apply to t, dependenig
+on whether t1 has the form [t′
+1] or {li = t′′
+i }.
+• Suppose t1 = [t′
+1].
+We know the typing derivation of t has the following form:
+[Γ ′] ⊢t′
+1 : A
+⊢r (pr)
+r · [Γ ′] ⊢[t′
+1] : 2rA (weak) or (sub)
+...
+(weak) or (sub)
+Γ ⊢[t′
+1] : 2rA
+lk ∈r (extr)
+Γ ⊢[t′
+1].lk : A
+By Lemma 11, we know the following:
+r · [Γ ′] ⊢[t′
+1] : 2rA
+=⇒
+∃t′.
+(
+[t′
+1].lk −→t′
+r · [Γ ′] ⊢t′ : A
+Finally, we can rearrange the typing context as follows:
+r · [Γ ′] ⊢t′ : A (weak) or (sub)
+...
+(weak) or (sub)
+Γ ⊢t′ : A
+Here, we follow the same manner as for the derivation of [t′
+1] (which may
+use (weak) and (sub)) to get Γ from r · [Γ ′].
+Thus, we obtain the conclusion of the theorem.
+• Suppose t1 = {li = ti}.
+The last derivation is rewritten as follows:
+[Γ ′
+i] ⊢ti : A
+⊢{li}
+(ver)
+S
+i{li} · [Γ ′
+i] ⊢{li = ti} : 2{li}A
+(weak) or (sub)
+...
+(weak) or (sub)
+Γ ⊢{li = ti} : 2{li}A
+lk ∈{li}
+(extr)
+Γ ⊢{li = ti}.lk : A
+
+60
+Y. Tanabe et al.
+By Lemma 11, we know the following:
+S
+i{li} · [Γ ′
+i] ⊢{li = ti} : 2{li}A
+=⇒
+∃t′.
+(
+{li = ti}.lk −→t′
+S
+i{li} · [Γ ′
+i] ⊢t′ : A
+Finally, we can rearrange the typing context as follows:
+S
+i{li} · [Γ ′
+i] ⊢t′ : A (weak) or (sub)
+...
+(weak) or (sub)
+Γ ⊢t′ : A
+Here, we follow the same manner as for the derivation of {li = ti} (which
+may use (weak) and (sub)) to get Γ from S
+i{li} · [Γ ′
+i].
+Thus, we obtain the conclusion of the theorem.
+– Case (sub)
+Γ1, x : [B]r, Γ2 ⊢t : A
+r ⊑s
+⊢s
+Γ1, x : [B]s, Γ2 ⊢t : A
+(sub)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′′ such that:
+t ; t′′ ∧Γ1, x : [B]r, Γ2 ⊢t′′ : A
+(ih)
+We then reapply (sub) to obtain the following:
+Γ1, x : [B]r, Γ2 ⊢t′′ : A
+r ⊑s
+⊢s (sub)
+Γ1, x : [B]s, Γ2 ⊢t′′ : A
+Thus, by choosing t′ = t′′, we obtain the conclusion of the theorem.
+Theorem 2 (Type preservation for evaluations).
+Γ ⊢t : A
+t −→t′
+)
+=⇒
+Γ ⊢t′ : A
+Proof. The proof is given by induction on the typing derivation of t. Consider
+the cases for the last rule used in the typing derivation of the first assumption.
+– Case (int)
+∅⊢n : Int (int)
+This case holds trivially because there are no evaluation rules that can be
+applied to n.
+– Case (var)
+
+Compilation Semantics for a Programming Language with Versions
+61
+⊢A
+x : A ⊢x : A (var)
+This case holds trivially because there are no evaluation rules that can be
+applied to x.
+– Case (abs)
+−⊢p : B1  ∆′
+Γ, ∆′ ⊢t1 : A2
+Γ ⊢λp.t1 : A1 →A2
+(abs)
+This case holds trivially because there are no evaluation rules that can be
+applied to λp.t1.
+– Case (app)
+Γ1 ⊢t1 : B →A
+Γ2 ⊢t2 : B
+Γ1 + Γ2 ⊢t1 t2 : A
+(app)
+In this case, there are two evaluation rules that can be applied to t.
+• Suppose the evaluation rule matches to [·].
+We perform the case analysis for the last ruduction rule.
+∗Case (E-abs1) We know the evaluation of the assumption has the
+following form:
+E-abs1
+(λx.t′
+1) t2 ; (t2  x) t′
+1
+(λx.t′
+1) t2
+|
+{z
+}
+t
+−→(t2  x) t′
+1
+|
+{z
+}
+t′
+By Lemma 1, we know the following:
+Γ1 + Γ2 ⊢(λx.t′
+1) t2 : A
+(λx.t′
+1) t2 ; (t2  x) t′
+1
+)
+=⇒
+Γ1 + Γ2 ⊢(t2  x) t′
+1 : A
+Thus, we obtain the conclusion of the theorem.
+∗Case (E-abs2)
+E-abs2
+(λ[x].t′
+1) t2 ; let [x] = t2 in t′
+1
+(λ[x].t′
+1) t2
+|
+{z
+}
+t
+−→let [x] = t2 in t′
+1
+|
+{z
+}
+t′
+In this case, we know the typing derivation of t has the following
+form:
+([pVar])
+r ⊢x : B  x : [B]r
+(p□)
+−⊢[x] : 2rB  x : [B]r
+Γ1, x : [B]r ⊢t′
+1 : A (abs)
+Γ1 ⊢λ[x].t′
+1 : 2rB →A
+|
+{z
+}
+P
+
+62
+Y. Tanabe et al.
+P
+Γ2 ⊢t2 : 2rB
+(app)
+Γ1 + Γ2 ⊢(λ[x].t′
+1) t2 : A
+Therefore, we can construct the derivation tree for t′ as follows.
+Γ2 ⊢t2 : 2rB
+Γ1, x : [B]r ⊢t′
+1 : A (app)
+Γ1 + Γ2 ⊢let [x] = t2 in t′
+1 : A
+Hence, we have the conclusion of the theorem.
+• Suppose the evaluation rule matches to E t.
+We know the evaluation of the assumption has the following form:
+t′
+1 ; t′′
+1
+E[t′
+1] t2
+| {z }
+t
+−→E[t′′
+1] t2
+where t1 = E[t′
+1].
+By induction hypothesis, we know the following:
+Γ1 ⊢E[t′
+1] : B →A
+E[t′
+1] −→E[t′′
+1]
+)
+=⇒
+Γ1 ⊢E[t′′
+1] : B →A
+(ih)
+We then reapply (app) to obtain the following:
+Γ1 ⊢E[t′′
+1] : B →A
+Γ2 ⊢t2 : B
+Γ1 + Γ2 ⊢E[t′′
+1] t2 : A
+(app)
+Thus, we obtain the conclusion of the theorem.
+– Case (let)
+Γ1 ⊢t1 : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = t1 in t2 : B
+(let)
+In this case, there are two evaluation rules that we can apply to t.
+• Suppose the evaluation rule matches to [·].
+We know the evaluation of the assumption has the following form:
+(E-clet)
+let [x] = [t′
+1] in t2 ; ([t′
+1]  [x])t2
+let [x] = [t′
+1] in t2
+|
+{z
+}
+t
+−→([t′
+1]  [x])t2
+By Lemma 1, we know the following:
+Γ1 + Γ2 ⊢let [x] = [t′
+1] in t2 : B
+let [x] = [t′
+1] in t2 ; ([t′
+1]  [x])t2
+)
+=⇒
+Γ1 + Γ2 ⊢([t′
+1]  [x])t2 : B
+Thus, we obtain the conclusion of the theorem.
+• Suppose the evaluation rule matches to let [x] = E in t.
+We know the evaluation of the assumption has the following form:
+
+Compilation Semantics for a Programming Language with Versions
+63
+t′
+1 ; t′′
+1
+let [x] = E[t′
+1] in t2
+|
+{z
+}
+t
+−→let [x] = E[t′′
+1] in t2
+where t1 = E[t′
+1].
+By induction hypothesis, we know the following:
+Γ1 ⊢E[t′
+1] : 2rA
+E[t′
+1] −→E[t′′
+1]
+)
+=⇒
+Γ1 ⊢E[t′′
+1] : 2rA
+(ih)
+We then reapply (let) to obtain the following:
+Γ1 ⊢E[t′′
+1] : 2rA
+Γ2, x : [A]r ⊢t2 : B
+Γ1 + Γ2 ⊢let [x] = E[t′′
+1] in t2 : B
+(let)
+Thus, we obtain the conclusion of the theorem.
+– Case (weak)
+Γ1 ⊢t : A
+⊢∆′
+Γ1 + [∆′]0 ⊢t : A (weak)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′ such that:
+t −→t′ ∧Γ1 ⊢t′ : A
+(ih)
+We then reapply (weak) to obtain the following:
+Γ1 ⊢t′ : A
+⊢∆′
+Γ1 + [∆′]0 ⊢t′ : A (weak)
+Thus, we obtain the conclusion of the theorem.
+– Case (der)
+Γ1, x : B ⊢t : A
+Γ1, x : [B]1 ⊢t : A
+(der)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′ such that:
+t −→t′ ∧Γ1, x : B ⊢t′ : A
+(ih)
+We then reapply (der) to obtain the following:
+Γ1, x : B ⊢t′ : A
+Γ1, x : [B]1 ⊢t′ : A (der)
+Thus, we obtain the conclusion of the theorem.
+
+64
+Y. Tanabe et al.
+– Case (pr)
+[Γ] ⊢t′′ : B
+⊢r
+r · [Γ] ⊢[t′′] : 2rB (pr)
+This case holds trivially because there are no evaluation rules that can be
+applied to [t′′].
+– Case (ver)
+[Γi] ⊢ti : A
+⊢{li}
+S
+i({li} · [Γi]) ⊢{li = ti} : 2{li}A
+(ver)
+This case holds trivially because there are no evaluation rules that can be
+applied to {li = ti}.
+– Case (veri)
+[Γi] ⊢ti : A
+⊢{li}
+lk ∈{li}
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: A (veri)
+In this case, the only evaluation rule we can apply is evaluation for [·]. We
+know the evaluation of the assumption has the following form:
+E-veri
+⟨li = ti | lk⟩; tk@lk
+⟨li = ti | lk⟩
+|
+{z
+}
+t
+−→tk@lk
+By Lemma 1, we know the following:
+S
+i({li} · [Γi]) ⊢⟨li = ti | lk⟩: A
+⟨li = ti | lk⟩; tk@lk
+)
+=⇒
+S
+i({li} · [Γi]) ⊢tk@lk : A
+Thus, we obtain the conclusion of the theorem.
+– Case (extr)
+Γ ⊢t1 : 2rA
+lk ∈r
+Γ ⊢t1.lk : A
+(extr)
+In this case, there are two evaluation rules that we can apply to t.
+• Suppose the evaluation rule matches to [·].
+We know the evaluation of the assumption has the following form:
+E-ex1 or E-ex2
+t1.lk ; t′
+1
+t1.lk
+|{z}
+t
+−→t′
+1
+
+Compilation Semantics for a Programming Language with Versions
+65
+By Lemma 1, we know the following:
+Γ ⊢t1.lk : A
+t1.lk ; t′
+1
+)
+=⇒
+Γ ⊢t′
+1 : A
+Thus, we obtain the conclusion of the theorem.
+• Suppose the evaluation rule matches to E.l.
+We know the evaluation of the assumption has the following form:
+t′
+1 ; t′′
+1
+E[t′
+1].lk
+| {z }
+t
+−→E[t′′
+1].lk
+where t1 = E[t′
+1].
+By induction hypothesis, we know the following:
+Γ ⊢E[t′
+1] : 2rA
+E[t′
+1] −→E[t′′
+1]
+)
+=⇒
+Γ ⊢E[t′′
+1] : 2rA
+(ih)
+We the reapply (extr) to obtain the following:
+Γ ⊢E[t′′
+1] : 2rA
+lk ∈r
+Γ ⊢E[t′′
+1].lk : A
+(extr)
+Thus, we obtain the conclusion of the theorem.
+– Case (sub)
+Γ1, x : [B]r, Γ2 ⊢t : A
+r ⊑s
+⊢s
+Γ1, x : [B]s, Γ2 ⊢t : A
+(sub)
+In this case, t does not change between before and after the last derivation.
+The induction hypothesis implies that there exists a term t′ such that:
+t −→t′ ∧Γ1, x : [B]r, Γ2 ⊢t′ : A
+(ih)
+We then reapply (sub) to obtain the following:
+Γ1, x : [B]r, Γ2 ⊢t′ : A
+r ⊑s
+⊢s (sub)
+Γ1, x : [B]s, Γ2 ⊢t′ : A
+Thus, we obtain the conclusion of the theorem.
+Theorem 3 (λVL progress).
+∅⊢t : A =⇒(value t) ∨(∃t′.t −→t′)
+Proof. The proof is given by induction on the typing derivation of t. Consider
+the cases for the last rule used in the typing derivation of the assumption.
+
+66
+Y. Tanabe et al.
+– Case (int)
+∅⊢n : Int (int)
+This case holds trivially because value n.
+– Case (var) This case holds trivially because x : A cannot be ∅.
+– Case (abs)
+−⊢p : A1  ∆′
+∆′ ⊢t : A2
+∅⊢λp.t : A1 →A2
+(abs)
+This case holds trivially because value λp.t.
+– Case (app)
+∅⊢t1 : B →A
+∅⊢t2 : B
+∅⊢t1 t2 : A
+(app)
+There are two cases whether t1 is a value or not.
+• Suppose t1 is a value.
+By the inversion lemma (9), we know that there exists a term t′
+1 and
+t1 = λp.t′
+1. Thus, we can apply two rules to t as follows.
+∗Case (E-abs1)
+(E-abs1)
+(λx.t′
+1) t2 ; (t2  x) t′
+1
+(λx.t′
+1) t2
+|
+{z
+}
+t
+−→(t2  x) t′
+1
+Furthermore, we know the following:
+(t2  x) t′
+1 = [t2/x]t′
+1
+(var)
+By choosing t′ = [t2/x]t′
+1, we obtain the conclusion of the theorem.
+∗Case (E-abs2)
+E-abs2
+(λ[x].t′
+1) t2 ; let [x] = t2 in t′
+1
+(λ[x].t′
+1) t2
+|
+{z
+}
+t
+−→let [x] = t2 in t′
+1
+|
+{z
+}
+t′
+By choosing t′ = let [x] = t2 in t′
+1, we obtain the conclusion of the
+theorem.
+• Suppose t1 is not a value.
+There exists a term t′
+1 such that:
+t1 ; t′
+1
+t1 −→t′
+1
+Also, we can apply evaluation for application to t.
+
+Compilation Semantics for a Programming Language with Versions
+67
+t1 ; t′
+1
+t1 t2
+|{z}
+t
+−→t′
+1 t2
+Thus, by choosing t′ = t′
+1 t2, we obtain the conclusion of the theorem.
+– Case (let)
+∅⊢t1 : 2rA
+x : [A]r ⊢t2 : B
+∅⊢let [x] = t1 in t2 : B
+(let)
+There are two cases whether t1 is a value or not.
+• Suppose t1 is a value.
+By the inversion lemma (9), we know that t1 has either a form of [t′
+1] or
+and {li = t′′
+i }.
+∗Case t1 = [t′
+1].
+In this case, we can apply (E-clet) to obtain the following.
+let [x] = [t′
+1] in t2 ; ([t′
+1]  [x])t2
+(E-clet)
+Thus, we can apply (□) and (var) to obtain the following.
+(var)
+(t′
+1  x)t2 = [t′
+1/x]t2
+(□)
+([t′
+1]  [x])t2 = [t′
+1/x]t2
+Thus, by choosing t′ = [t′
+1/x]t2, we obtain the conclusion of the
+theorem.
+∗Case t1 = {li = t′′
+i }.
+In this case, we can apply (E-clet) to obtain the following:
+(E-clet)
+let [x] = {li = t′′
+i } in t2 ; (⟨li = t′′
+i | lk⟩ [x])t2
+let [x] = {li = t′′
+i } in t2
+|
+{z
+}
+t
+−→(⟨li = t′′
+i | lk⟩ [x])t2
+Also, we can apply (ver) and (var) to obtain the following.
+(var)
+(⟨li = t′′
+i | lk⟩ x)t2 = [⟨li = t′′
+i | lk⟩/x]t2 (ver)
+({li = t′′
+i }  [x])t2 = [⟨li = t′′
+i | lk⟩/x]t2
+Thus, by choosing t′ = [⟨li = t′′
+i | lk⟩/x]t2, we obtain the conclusion
+of the theorem.
+• Suppose t1 is not a value.
+There exists terms t′
+1 such that:
+t1 ; t′
+1
+t1 −→t′
+1
+Also, we can apply evaluation for contextual let bindings to t.
+t1 ; t′
+1
+let [x] = t1 in t2
+|
+{z
+}
+t
+−→let [x] = t′
+1 in t2
+
+68
+Y. Tanabe et al.
+Thus, by choosing t′ = (let [x] = t′
+1 in t2), we obtain the conclusion of
+the theorem.
+– Case (weak)
+∅⊢t : A
+⊢∅
+∅⊢t : A
+(weak)
+In this case, t does not change between before and after the last derivation.
+Thus, we can obtain the conclusion of the theorem by induction hypothesis.
+– Case (der)
+This case hold trivially because Γ1, x : [B]1 cannot be ∅.
+– Case (pr)
+∅⊢t : B
+⊢r
+∅⊢[t] : 2rB
+(pr)
+This case holds trivially because [t] is a value.
+– Case (ver)
+∅⊢ti : A
+⊢{li}
+∅⊢{li = ti} : 2{li}A
+(ver)
+This case holds trivially because {li = ti} is a value.
+– Case (veri)
+∅⊢ti : A
+⊢{li}
+lk ∈{li}
+∅⊢⟨li = ti | lk⟩: A
+(veri)
+In this case, we can apply (E-veri).
+(E-veri)
+⟨li = ti | lk⟩; tk@lk
+⟨li = ti | lk⟩−→tk@lk
+Thus, by choosing t′ = tk@lk, we obtain the conclusion of the theorem.
+– Case (extr)
+∅⊢t1 : 2rA
+lk ∈r
+∅⊢t1.lk : A
+(extr)
+In this case, we have two cases whether t1 is a value or not.
+
+Compilation Semantics for a Programming Language with Versions
+69
+• Suppose t1 is a value. (t1 = v1)
+By Lemma 11, we know the following:
+∅⊢v1 : 2rA
+=⇒
+∃t′.
+(
+v1.lk −→t′
+∅⊢t′ : A
+Thus, we obtain the conclusion of the theorem.
+• Suppose t1 is not a value.
+There exists a term t1 such that:
+t1 ; t′
+1
+t1 −→t′
+1
+Also, we can apply an exaluation rule for extraction to t.
+t1 ; t′
+1
+t1.lk
+|{z}
+t
+−→t′
+1.lk
+Thus, by choosing t′ = t′
+1.lk, we obtain the conclusion of the theorem.
+– Case (sub)
+Γ1, x : [B]r, Γ2 ⊢t : A
+r ⊑s
+⊢s
+Γ1, x : [B]s, Γ2 ⊢t : A
+(sub)
+In this case, t does not change between before and after the last derivation.
+Thus, by induction hypothesis, we obtain the conclusion of the theorem.
+
+70
+Y. Tanabe et al.
+D
+VLMini Proofs
+Definition 7 (Solution of Algorithmic Type Synthesis). Suppose that
+Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C. A solution for this judgement is a pair (θ, η, B)
+such that θ satisfies Θ, η satisfies C, and θηA = B.
+Definition 8 (Solution of Pattern Type Synthesis). Suppose that Σ; R ⊢
+p : A  Γ; Σ′; Θ; C. A solution for this judgement is a pair (η, θ, B) such that θ
+satisfies Θ, η satisfies C, and θηA = B.
+Lemma 12 (Relation of Resource Well-formedness).
+⊢Σ ∧Σ ⊢η ∧FTV (r) ⊆dom(η) ∧Σ ⊢r : Labels
+=⇒
+⊢ηr
+Proof. Straightforward by induction on the derivation of Σ ⊢r : Labels.
+Lemma 13 (Relation of Type Well-formedness).
+⊢Σ ∧Σ ⊢θ ∧Σ ⊢η ∧
+FTV (A) ⊆dom(θ) ∪dom(η) ∧Σ ⊢A : Type
+=⇒
+⊢ηθA
+Proof. Straightforward by induction on the derivation of Σ ⊢A : Type. The
+proof uses Lemma 12.
+Lemma 14 (Relation of Type Environment Well-formedness).
+⊢Σ ∧Σ ⊢θ ∧Σ ⊢η ∧
+FTV (Γ) ⊆dom(θ) ∪dom(η) ∧Σ ⊢Γ
+=⇒
+⊢ηθΓ
+Proof. Straightforward by induction on the derivation of Σ ⊢Γ. The proof uses
+Lemmas 12 and 13.
+Lemma 15 (Relation of Resource Environment Well-formedness).
+⊢Σ ∧Σ ⊢η ∧FTV (R) ⊆dom(η) ∧Σ ⊢R
+=⇒
+⊢ηR
+Proof. Straightforward by induction on the derivation of Σ ⊢R. The proof uses
+Lemma 12.
+Lemma 16 (Soundness of Pattern Type Synthesis).
+Σ; R ⊢p : A  Γ; Σ′; Θ; C
+(θ, η, ηθA) is its solution
+)
+=⇒
+ηR ⊢p : ηθA  ηθΓ
+Proof. By induction on the derivation of Σ; R ⊢p : A  Γ; Σ′; Θ; C. We perform
+case analysis on the rule applied last to derive Σ; R ⊢p : A  Γ; Σ′; Θ; C.
+
+Compilation Semantics for a Programming Language with Versions
+71
+– Case (pInt):
+⊢Σ
+Σ ⊢R
+Σ ⊢A : Type
+Σ; R ⊢n : A  ∅; Σ; {A ∼Int}; ⊤(pInt)
+We are given
+p = n,
+Γ = ∅,
+Θ = {A ∼Int},
+C = ⊤.
+Hence, we have θA = Int and η = ∅, therefore,
+ηθA = Int,
+ηθΓ = ∅.
+By Lemma 15,
+⊢ηR .
+Therefore, by pInt,
+⊢ηR
+ηR ⊢n : Int  ∅
+(pInt)
+– Case (pVar), and ([pVar]):
+Similarly to the case (pInt). We use lemma 13 for the case (pVar), and
+lemmas 12 and 13 for the case ([pVar]).
+– Case (p□):
+Σ, α : Labels, β : Type; α ⊢p′ : β  Γ; Σ′; Θ′; C
+Σ; −⊢[p′] : A  Γ; Σ′; Θ′ ∧{A ∼2αβ}; C
+(p□)
+We are given
+R = −,
+p = [p′],
+Θ = Θ′ ∧{A ∼2αβ} .
+Hence, we have θ unify Θ′, θA = θ(2αβ), and ηθA = ηθ(2αβ), therefore,
+ηθA = ηθ(2αβ) = ηθA,
+ηR = −.
+Hence, by the induction hypothesis,
+ηα ⊢p′ : ηθβ  ηθΓ
+Therefore, by p□,
+ηα ⊢p′ : ηθβ  ηθΓ
+−⊢[p′] : 2ηαηθβ  ηθΓ
+(p□)
+Since θ does not include type substituions for resource variables, ηα = ηθα,
+hence 2ηαηθβ = ηθ(2αβ) = ηθA. Therefore, we get the conclusion for this
+case.
+
+72
+Y. Tanabe et al.
+Theorem 4 (Soundness of Algorithmic Type Synthesis).
+Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C
+(θ, η, ηθA) is its solution
+)
+=⇒
+ηθ∆⊢t : ηθA
+Proof. By induction on the derivation of Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C. We perform
+case analysis on the rule applied last to derive Σ; Γ ⊢t ⇒A; Σ′; ∆; Θ; C.
+– Case (⇒int):
+⊢Σ
+Σ ⊢Γ
+Σ; Γ ⊢n ⇒Int; Σ; ∅; ⊤; ⊤(⇒int)
+We are given
+t = n,
+A = Int,
+∆= ∅,
+Θ = ⊤,
+C = ⊤.
+Hence, we have θ = ∅and η = ∅, therefore,
+ηθ∆= ∅,
+ηθA = Int .
+Therefore, by (int),
+∅⊢n : Int (int)
+– Case (⇒lin):
+⊢Σ
+Σ ⊢Γ
+x : A ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : A; ⊤; ⊤(⇒lin)
+We are given
+t = x,
+∆= x : A,
+Θ = ⊤,
+C = ⊤.
+Hence, we have θ = ∅and η = ∅, therefore,
+ηθ∆= x : A,
+ηθA = A .
+Furthermore, by Lemma 13, we have
+⊢ηθA (= A) .
+Therefore, by (var),
+⊢A
+x : A ⊢x : A (var)
+
+Compilation Semantics for a Programming Language with Versions
+73
+– Case (⇒gr):
+⊢Σ
+Σ ⊢Γ
+x : [A]r ∈Γ
+Σ; Γ ⊢x ⇒A; Σ; x : [A]1; ⊤; ⊤(⇒gr)
+We are given
+t = x,
+∆= x : [A]1,
+Θ = ⊤,
+C = ⊤.
+Hence, we have θ = ∅and η = ∅, therefore,
+ηθ∆= x : [A]1,
+ηθA = A .
+Furthermore, by Lemma 13, we have
+⊢ηθA (= A) .
+Therefore, we conclude the case by the following derivation.
+(var)
+x : A ⊢x : A
+(der)
+x : [A]1 ⊢x : A
+– Case (⇒abs):
+Σ1, α : Type; −⊢p : α  Γ ′; Σ2; Θ1
+Σ2; Γ, Γ ′ ⊢t ⇒B; Σ3; ∆′; Θ2; C
+Σ1; Γ ⊢λp.t ⇒α →B; Σ3; ∆′\Γ ′; Θ1 ∧Θ2; C
+(⇒abs)
+We are given
+t = α →B,
+∆= ∆′\Γ ′,
+Θ = Θ1 ∧Θ2, .
+Hence, we have θ unifies Θ1 and Θ2, η unifies C. Therefore, we have
+ηθ∆= ηθ(∆′\Γ ′),
+ηθA = ηθ(α →B) .
+Furthermore, by Lemma 16 and the induction hypothesis, we have
+−⊢p : ηθα  ηθΓ ′,
+ηθ∆′ ⊢t : ηθB .
+Therefore, by (abs),
+−⊢p : ηθα  ηθΓ ′
+ηθ∆′ ⊢t : ηθB
+ηθ∆′\ηθΓ ′ ⊢λp.t : ηθα →ηθB
+(abs)
+Since ηθ∆′\ηθΓ ′ = ηθ(∆′\Γ ′) and ηθα →ηθB = ηθ(α →B), we have the
+conclusion of the case.
+
+74
+Y. Tanabe et al.
+– Case (⇒app):
+Σ1; Γ ⊢t1 ⇒A1; Σ2; ∆1; Θ1; C1
+Σ2; Γ ⊢t2 ⇒A2; Σ3; ∆2; Θ2; C2
+Σ1; Γ ⊢t1 t2 ⇒β; Σ3, β : Type; ∆1 + ∆2;
+Θ1 ∧Θ2 ∧{A1 ∼A2 →β}; C1 ∧C2
+(⇒app)
+We are given
+t = t1 t2,
+A = β,
+∆= ∆2 + ∆2,
+Θ = Θ1 ∧Θ2 ∧{A1 ∼A2 →β},
+C = C1 ∧C2 .
+Hence, we have θ unifies Θ1 and Θ2, and θA1 = θ(A2 →β). Also, η unifies
+C1 and C2, and then we have ηθA1 = ηθ(A2 →β) = ηθA2 →ηθβ. Therefore,
+we have
+ηθ∆= ηθ(∆2 + ∆2),
+ηθA = ηθβ .
+Furthermore, by the induction hypothesises,
+ηθΓ ⊢t1 : ηθA1 (= ηθA2 →ηθβ),
+ηθΓ ⊢t2 : ηθA2 .
+Therefore, by (app),
+ηθΓ ⊢t1 : ηθA2 →ηθβ
+ηθΓ ⊢t2 : ηθA2
+ηθΓ ⊢t1 t2 : ηθβ
+(app)
+– Case (⇒pr):
+Σ1 ⊢[Γ ∩FV(t)]Labels  Γ ′
+Σ1; Γ ′ ⊢t ⇒A′; Σ2; ∆′; Θ; C1
+Σ3 = Σ2, α : Labels
+Σ3 ⊢α ⊑c Γ ′  C2
+Σ1; Γ ⊢[t] ⇒2αA′; Σ3; α · ∆′; Θ; C1 ∧C2
+(⇒pr)
+We are given
+t = [t],
+A = 2αA′,
+∆= α · ∆′,
+C = C1 ∧C2, .
+Hence, θ unifies Θ and η unifies C1 and C2. Therefore, we have
+ηθ∆= ηθ(α · ∆′) = (ηθα) · (ηθ∆′),
+ηθA = ηθ(2αA′) = 2ηθαηθA′ .
+Furthermore, by the induction hypothesis, we have
+ηθ∆′ ⊢t : ηθA′ .
+Therefore, by (pr),
+ηθ∆′ ⊢t : ηθA′
+⊢ηθα
+(ηθα) · (ηθ∆′) ⊢[t] : 2ηθαηθA′ (pr)
+

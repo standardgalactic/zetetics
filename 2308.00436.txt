@@ -1,0 +1,810 @@
+SELFCHECK:
+USING LLMS TO ZERO-SHOT CHECK
+THEIR OWN STEP-BY-STEP REASONING
+Ning Miao1*
+Yee Whye Teh1
+Tom Rainforth1
+ABSTRACT
+The recent progress in large language models (LLMs), especially the invention of
+chain-of-thoughts (CoT) prompting, makes it possible to solve reasoning problems.
+However, even the strongest LLMs are still struggling with more complicated
+problems that require non-linear thinking and multi-step reasoning. In this work,
+we explore whether LLMs have the ability to recognize their own errors, without
+resorting to external resources. In particular, we investigate whether they can be
+used to identify individual errors within a step-by-step reasoning. To this end, we
+propose a zero-shot verification scheme to recognize such errors. We then use this
+verification scheme to improve question-answering performance, by using it to
+perform weighted voting on different generated answers. We test the method on
+three math datasets—GSM8K, MathQA, and MATH—and find that it successfully
+recognizes errors and, in turn, increases final predictive performance.
+1
+INTRODUCTION
+Recent years have witnessed dramatic changes in the areas of NLP and AI brought by large language
+models. From GPT-3 (Brown et al., 2020), PaLM (Chowdhery et al., 2022), Llama (Touvron
+et al., 2023) to GPT-4 (OpenAI, 2023) and PaLM-2 (Google, 2023), the increasing model sizes and
+exploding amount of training data have empowered LLMs to achieve human-level performance on a
+large range of tasks, including summarization, translation, question answering and basic mathematical
+reasoning.
+However, the performance of even the largest LLMs on complex reasoning problems is still unsatis-
+factory. For example, GPT-4 only correctly answers 42.5% of problems in the MATH dataset, which
+is far below human level. Such problems require careful multi-step reasoning to solve, where LLMs
+are prone to make mistakes. Namely, to solve such complex reasoning problems, LLMs need to
+generate many reasoning steps. Even though their error rate on a single step is low, the probability of
+LLMs generating at least one erroneous step can be fairly high, which makes final predictions less
+accurate.
+It is thus necessary to check for errors in LLMs’ generated reasoning in order to filter out incorrect
+predictions and provide an estimation of confidence for a prediction. Recently, Cobbe et al. (2021)
+finetune GPT-3 to recognize errors in the whole reasoning process, and Li et al. (2022) train a BERT
+model (He et al., 2020) to check the correctness of each reasoning step. Ling et al. (2023) eliminate
+the need to finetune by performing few-shot checking on a special type of reasoning chains called
+Natural Program. To check a reasoning chain, most previous methods look for error patterns that
+match those in training data or instructions. However, there are an infinite number of error patterns,
+some of which are quite covert and deceptive. As a result, these methods do not work well without
+massive training data or examples.
+To address this shortfall, we introduce SelfCheck, a zero-shot checking scheme for LLMs, which is
+based on step regeneration. SelfCheck works as a step-by-step checker, such that it individually checks
+each step in the LLMs reasoning process based on the available context. For each reasoning step in
+an LLM’s output reasoning, SelfCheck first collects related information to form a simpler context
+and then checks it by step-regeneration. Then it integrates the checking results of the individual steps
+to form a confidence score for the whole solution. Using confidence scores as weights to vote among
+multiple solutions for the same question, SelfCheck in turn allows us to improve question answering
+accuracy by focusing on the most accurate answer. SelfCheck mimics the procedure of human beings
+double-checking their solutions and completely bypasses the problem of pattern-matching style
+1Department of Statistics, University of Oxford. *Email: <ning.miao@stats.ox.ac.uk>.
+1
+arXiv:2308.00436v2  [cs.AI]  2 Aug 2023
+
+checking. Its design is based on the key observation that LLMs are trained on far more generation
+tasks than checking tasks. SelfCheck works in a fully zero-shot manner to keep generalizability to
+different LLMs and tasks as well as to reduce the influence of prompt engineering on experimental
+results. Users of SelfCheck can easily change any of its components to a few-shot, or finetuned
+version to achieve better results on specific tasks.
+We evaluate SelfCheck on three math tasks, namely GSM8K, MathQA, and MATH, in increasing
+order of difficulty. For all datasets, we find that using SelfCheck achieves a significant increase
+in prediction accuracies compared with majority voting. We also see that SelfCheck provides an
+accurate confidence estimation for LLM’s solutions, which decreases the proportion of incorrect
+solutions by 9%, 22.8%, and 16.2% on three datasets, after filtering out low-confidence solutions. We
+also perform an extensive analysis on the effect of per-question sample sizes and some critical design
+choices of step-checking methods, which, we hope, could provide some inspiration for future works
+on checking methods. Our code is available at https://github.com/NingMiao/SelfCheck.
+To summarize, the main contributions of this paper are as follows:
+• We propose SelfCheck, an effective new schema for checking step-by-step reasoning in
+LLMs, which provides a better confidence estimation and in turn improves predictive
+accuracy.
+• We demonstrate that LLMs can do effective self-verification without resorting to any external
+resources.
+2
+METHOD: SELFCHECK
+In this section, we propose SelfCheck, which is a scheme to check step-by-step solutions from
+an LLM by itself. For simplicity of illustration, we restrict our discussion to math problems, but
+SelfCheck can be easily applied to other domains that require multi-step reasoning.
+We call the LLM that generates the original step-by-step solution the generator, which can be a zero
+or few-shot LLM. The input to the generator is a question and its output is a multi-step solution in the
+form of [Step 1, Step 2, ..., Step N]. SelfCheck first checks the correctness of each step of the solution
+and then integrate stepwise checking results to form a confidence score for the whole solution. In the
+following, we introduce how we perform step checking and the design of the integration function.
+Please see Figure 1 for a real example of how SelfCheck works.
+2.1
+STEP CHECKING
+To check individual steps of the reasoning process, the first thing we should notice is that the
+correctness of each step is highly dependent on its context, namely the question and previous steps
+in the solution. As a result, it is not possible to check a single step without context. For example,
+we usually need to refer to previous steps for the definition of variables and the meaning of specific
+numbers. The target of the step checking in SelfCheck is thus to check the conditional correctness of
+each step based on the provided context. That is, we only care about catching errors at the current
+step, and can assume all information from its context to be correct.
+A simple idea to achieve this would be feeding the current step as well as all its context to an LLM
+and directly asking the LLM to ‘check the correctness of the step’. However, in practice, we find
+that this task is too difficult for the LLM to do effectively. This is first because the checker needs to
+understand the key content in the step and then collect all related information from the context, before
+actually checking for its correctness. Moreover, ‘checking’ is not a common task in the training
+corpus of most LLMs, which means LLMs do not perform well even if we exemplify in detail how to
+do step-checking in the prompt.
+To solve this problem, SelfCheck decomposes the checking task into 4 stages: target extraction,
+information collection, step regeneration, and result comparison. SelfCheck uses the LLM to execute
+each stage successively and uses the conclusion from the result comparison to predict the correctness
+of the original step. The main idea behind the decomposition is to make the LLM focus on an easier
+task that it is used to at each stage, which can be seen as a way of introducing inductive biases into
+LLMs. Specifically, we prompt the LLM to first figure out the target of the current step and what
+information it uses to achieve the target. Then we ask the LLM to re-achieve the target using only
+the collected information. The clear description of the target and the simplified context make the
+2
+
+Figure 1: A real example illustrating how SelfCheck works. The blocks show the question, the
+outputs of the generator, and the checker, respectively. To check the correctness of a certain step (step
+4 in the example) in a multi-step reasoning procedure, SelfCheck goes through 4 stages before making
+a decision, which is elaborated in Section 2.1. Then the integration function combines the checking
+results of all steps to form a confidence score for the whole solution.
+regeneration stage less challenging for an LLM. As a result, its output should be more reliable to
+serve as a reference. The last step would be comparing the original step with the regeneration output.
+If their main conclusions match/mismatch, we think the original step to be correct/wrong. In the
+following, we describe each of the subtasks and our specific instructions to the LLM.
+Target extraction
+To check a step (for example, step 4 in Figure 1), we first need to figure out what
+the step is trying to do. Without a specific target, the regeneration stage would proceed in a random
+direction, making it impossible to serve as a reference to the original step. We thus use the LLM
+itself to extract the target of a step i using the question and all previous steps (step 0-3 in Figure 1)
+with the following prompt:
+The following is a part of the solution to the problem [question]: [Step 0, Step 1,..., Step i].
+What specific action does the step [Step i] take? Please give a brief answer using a single
+sentence and do not copy the steps.
+During execution, we copy the question and steps into [question] and [step] to form the actual input
+to the LLM. The reason for requesting a brief and single-sentence answer is to avoid getting too much
+detailed information, especially specific equations and values, which can be wrong and, consequently,
+mislead the regeneration stage.
+Information collection
+To relieve the pressure of the regeneration stage and avoid unrelated
+information from affecting the result, we filter out information that is not directly related to the
+current step. Specifically, we ask the LLM to select useful items from the question and all previous
+items with the following prompt:
+This is a math question: [question].
+The following is information extracted from the question:
+Information 0: [Information 0]
+Information 1: [Information 1]
+...
+3
+
+The following are the first a few steps in a solution to the problem:
+Step 0: [Step 0]
+Step 1: [Step 1]
+...
+Step i-1: [Step i-1]
+Which previous steps or information does the next step [Step i] directly follow from?
+[Information j] is simply the j-th sentence in the question. After retrieving the output, we extract step
+or information ids by regular expression. For example in Figure 1, the current step requires step 2
+and 3 and no information from the question as context. The selected steps and information are then
+fed into the regeneration stage.
+Step regeneration
+Given the target and necessary information of the step, we can now ask the
+LLM to regenerate it. Because the step is usually a small jump from previous conclusions, and
+the information collection stage has already filtered out irrelevant information, we can usually trust
+regeneration results. The prompt of this stage is
+We are in the process of solving a math problem.
+We have some information from the problem:
+Information 0: [Information I0]
+Information 1: [Information I1]
+...
+The following are some previous steps:
+Step 0: [Step S0]
+Step 1: [Step S1]
+...
+The target for the next step is: [Target].
+Please try to achieve the target with the information from the problem or previous steps.
+[Target] is the output from the target extraction stage and [Information] and [Step] are selected by the
+information collection stage.
+Result comparison
+The last step is to compare results from the regeneration stage and the original
+step with the following prompt.
+The following are 2 solutions to a math problem.
+Solution 1: [Regeneration output]
+Solution 2: [Step i]
+Compare the key points from both solutions step by step and then check whether Solution
+1 "supports", "contradicts" or "is not directly related to" the conclusion in Solution 2. Pay
+special attention to the difference in numbers.
+If the regeneration output "supports" or "contradicts" the original step, we can conclude that the
+original step should be correct or wrong. Sometimes, the correctness of the original step cannot
+be directly inferred from the regeneration output. For example, when the target is to simplify an
+equation, the original step divides all terms by their common devisor while the regeneration step
+might combine like terms. In such cases, we are not sure about the correctness of the original step,
+which makes ‘is not directly related to’ the third output choice for SelfCheck.
+2.2
+RESULTS INTEGRATION
+After getting a checking result for each step, we need an integration function ϕ to give a prediction of
+the overall correctness of the solution. The input of ϕ should be a vector in the form of [w0, w1, ..., wn],
+where each item wi represents the step checking result for step i. For simplicity, we assume
+wi ∈{−1, 0, 1}, where −1, 0, 1 represents ‘contradict’, ‘is not directly related to’ and ‘support’ in
+the output of the result comparison stage. Specifically,
+ϕ([w0, w1, ..., wn]) = 2 ∗Sigmoid
+ 
+−λ−1
+n
+X
+i=0
+1wi=−1 −λ0
+n
+X
+i=0
+1wi=0
+!
+,
+(1)
+where λ−1 and λ0 are two non-negative hyperparameters, chosen on a validation set. We call the
+output of ϕ the confidence score, which is a float number between 0 and 1. It can be directly used as
+the weight for voting or binarized by setting a threshold t ∈[0, 1] to form a binary checking result
+for a solution. We take negative steps (-1s) and neutral steps (0s) into consideration in Equation (1)
+4
+
+because the occurrance of a (possibly) incorrect step could make a reasoning chain to be incorrect. We
+ignore 0s, which is less critical because a correct step usually keeps but not changes the correctness
+of a reasoning chain.
+3
+RELATED WORK
+How to automatically check the correctness of a sequence of reasoning steps is a long-standing
+question. The following are 3 main research directions on it.
+Training/finetuning a verifier
+The most straightforward idea would be training a separate verifier
+model to check the solution from the generator. For example, Cobbe et al. (2021) finetune a GPT-3
+on GSM8K to predict the correctness of a solution as a whole. Li et al. (2022) take steps into
+consideration and train a binary deberta-v3-large (He et al., 2020) classifier to predict the probability
+of correctness for the solution and each step. Paul et al. (2023) train a critic model to provide
+structured feedback on intermediate reasoning steps. More recently, Lightman et al. (2023) build a
+large dataset, called PRM800K, which contains labels for step-wise correctness by crowdsourcing.
+They finetune a GPT-4 on PRM800K and achieve good results compared with majority voting.
+However, finetuning is not always possible due to the limitation of budget and time. For example,
+Cobbe et al. (2021) and Lightman et al. (2023) require finetuning GPT-3 (175B) and GPT-4 for the
+best performance. Moreover, finetuning or training on specific datasets or focusing on generating a
+specific type of feedback heavily limits the generalisability of the verifier, making them impossible to
+be applied to other domains. In comparison, SelfCheck is a fully zero-shot method, which requires
+no finetuning and zero training data. As a result, SelfCheck can be immediately deployed to work on
+multiple domains.
+Verification with external resources
+Another chain of research focuses on using external resources
+to boost faithfulness or verify LLM results. Lyu et al. (2023) first translate a question into a symbolic
+reasoning chain by an LLM and solve the problem by a deterministic solver. Peng et al. (2023)
+introduce an external database to check for incorrect knowledge in LLM outputs. However, these
+methods are heavily limited by the ability of external tools. For example, deterministic symbolic
+solvers usually have strict constraints on the problem that they can solve. And Peng et al. (2023) can
+only check for factoid mistakes.
+Few-shot verification
+Other works show the potential of using few-shot LLMs to correct errors.
+Bubeck et al. (2023) find that GPT-4 can serve as a judge to compare LLM outputs with reference
+answers. Weng et al. (2022) verify the whole solution by backward prediction. Specifically, they
+mask some information in the question, and make the solution to predict the masked information.
+If the masked information is recovered correctly, they label the solution as correct, and otherwise
+incorrect. However, this method is based on the hypothesis that a correct solution should keep every
+bit of information in the question while an incorrect one should not. It only holds for some very
+simple arithmetic or logic problems, making it unsuitable for more complex tasks. The verifier in
+Ling et al. (2023) relies on a specific solution format called Natural Program to check errors for each
+step. However, besides only being able to check solutions in a specific semi-symbolic form, they
+report worse performance compared with majority voting. Most of these methods directly ask LLMs
+to check reasoning chains, which usually leads to unsatisfactory results because checking is not a
+common task that LLMs are trained on. SelfCheck bypasses this problem by replacing checking with
+regeneration, whose benefits are shown clearly in Section 5.2.
+4
+EXPERIMENTS
+We now run experiments on three math-reasoning datasets to evaluate SelfCheck’s effectiveness in
+checking multi-step reasoning and improving generation accuracies.
+Datasets
+GSM8K (Cobbe et al., 2021), MathQA (Amini et al., 2019), and MATH (Hendrycks et al.,
+2021) are three large-scale datasets consisting of math problems on primary school, middle school,
+and competition levels, containing 1319, 2985, and 5000 test samples, respectively. For GSM8K
+and MathQA, we evaluate our method on their whole test sets while tuning hyper-parameters on a
+small subset of their training set. Because of the limitation of resources, we use a subset of MATH1
+1https://github.com/lz1oceani/verify_cot/tree/main/results/chatgpt3.5/
+natural_program/MATH_np.json
+5
+
+0.66
+0.68
+0.70
+0.72
+0.74
+0.76
+0.78
+0.80
+0.82
+0.84
+Accuracy
+majority voting
+ours
+0.60
+0.62
+0.64
+0.66
+0.68
+0.70
+0.72
+0.74
+0.76
+0.78
+Accuracy
+majority voting
+ours
+0.32
+0.34
+0.36
+0.38
+0.40
+0.42
+0.44
+0.46
+0.48
+0.50
+Accuracy
+majority voting
+ours
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+#Samples per question
+0.00
+0.01
+0.02
+0.03
+0.04
+ Accuracy
+(a) GSM8K
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+#Samples per question
+0.00
+0.01
+0.02
+0.03
+0.04
+ Accuracy
+(b) MathQA
+1
+2
+3
+4
+5
+6
+7
+8
+9 10
+#Samples per question
+0.00
+0.01
+0.02
+0.03
+0.04
+ Accuracy
+(c) MATH∗
+Figure 2: SelfCheck achieves higher accuracies compared with the majority-voting baseline for all
+sample numbers.
+test set from Ling et al. (2023). Besides the level of difficulty, the three datasets differ from each
+other in the following aspects. Firstly, MathQA provides 5 options for each problem, while GSM8K
+and MATH have no options. Secondly, GSM8K only has arithmetic problems, while MathQA and
+MATH contain more diverse problems in geometry, physics, probability, or algebra.
+LLMs
+There are many choices of LLMs, including large-scale ones such as GPTs (Brown et al.,
+2020), PaLMs (Chowdhery et al., 2022) and Claude (Anthropic), as well as open-source ones such
+as LLaMA (Touvron et al., 2023) and FLAN (Wei et al., 2021). However, because of reasons such
+as access, budget, and computation resources, it is only possible for us to run experiments with the
+GPT-3.5 API. We could also set up small open-source LLMs such as LLaMA-13B or FLAN-11B on
+our own server. However, according to Fu et al. (2023), their accuracies are below 20% even on the
+simplest GSM8K dataset, which makes it meaningless to evaluate on them.
+Baselines
+We use majority voting (or self-consistency decoding (Wang et al., 2022) in the context
+of CoT reasoning) as our main baseline following Ling et al. (2023) and Lightman et al. (2023).
+Despite its simplicity, majority voting is quite a strong baseline. Most zero or few-shot methods
+report similar or even worse results compared with it (Weng et al., 2022; Ling et al., 2023). It is
+impossible to compare with finetuning based methods such as Lightman et al. (2023), where we have
+no access to their finetuned models.
+Figure 2 shows the performance gain using confidence scores from SelfCheck to do weighted voting
+compared with vanilla majority voting. The upper row shows that accuracies of SelfCheck and
+majority voting have the same increasing tendency as the number of samples increases, which is a
+result of variance reduction. We can also see that the yellow lines are always above the blue ones,
+which is a result of SelfCheck giving higher weights to more correct solutions. The ∆-Accuracy
+plots in the lower row show that the improvement is significant for all sample numbers, but the gap
+is higher for smaller sample numbers. We leave analysis of this phenomenon and results for higher
+sample numbers on a smaller dataset in Section 5.1.
+Besides serving as a weight calculator to improve the performance of voting, SelfCheck can also
+predict the correctness of a single solution. To do so, the simplest idea would be to set a threshold t to
+the confidence score. Any solution with a score above the threshold would be classified as correct or
+otherwise wrong. The results for different t are shown in Figure 3. For a more detailed analysis, we
+split the solutions into 2 sets, which contain real correct and real wrong solutions, respectively. The
+upper row shows the checking accuracies on each set. For small t, every solution will be classified as
+correct, so the accuracies for real correct samples Accc would be 1.0 while accuracies for real wrong
+samples Accw are 0.0. When t increases, the Accw increases and Accw drops. The lower row shows
+Accm the average of Accw and Accw, which is a indicator of the overall performance. For different
+datasets, Accm ranges from 60% to 65%. It is of course not optimal. However, it is enough to show
+the effectiveness of SelfCheck schema. Users can easily add more examples, finetune the LLM for
+different stages or combine SelfCheck with external tools, such as code intepreter to further improve
+performance.
+6
+
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Accuracy
+pred + in real +
+pred 
+ in real 
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Accuracy
+pred + in real +
+pred 
+ in real 
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Accuracy
+pred + in real +
+pred 
+ in real 
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.50
+0.55
+0.60
+0.65
+Mean acc
+(a) GSM8K
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.50
+0.55
+0.60
+0.65
+Mean acc
+(b) MathQA
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.50
+0.55
+0.60
+0.65
+Mean acc
+(c) MATH∗
+Figure 3: Checking accuracies on reasoning process for different threshold t. ‘pred + in real +’ is
+the ratio of samples predicted as correct in all real correct samples. Similarly, ‘pred −in real −’
+is the ratio of samples labeled as wrong in all real incorrect samples. The lower figures show the
+balanced average checking accuracy on three datasets.
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Condidence
+real + in pred +
+real 
+ in pred 
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Condidence
+real + in pred +
+real 
+ in pred 
+0.0
+0.2
+0.4
+0.6
+0.8
+1.0
+Threshold t
+0.00
+0.20
+0.40
+0.60
+0.80
+1.00
+Condidence
+real + in pred +
+real 
+ in pred 
+Figure 4: When increasing the threshold t, the confidence of the predicted correct samples to be
+real correct increases for GSM8K (67.5%->76.5%), MathQA (59.4%->82.2%) and MATH (34.6%-
+>50.8%).
+From another perspective, Figure 4 shows that for large t, the proportion of correct solutions (real
++) in all verified solutions (pred +) is significantly higher than the case when t = 0. When t = 0,
+all solutions are labeled as correct, which equals the case without checking. Though this is at the
+cost of erroneously labeling about half of real correct samples as incorrect, it is an important feature
+for high-stake scenarios, where the risk of generating an incorrect solution can be much higher than
+rerunning the generation process.
+5
+ANALYSIS
+In this section, we explore several interesting questions related to SelfCheck both empirically and
+theoretically. Limited by budget and time, all experiments in this section are on a small subset of
+MathQA test set with 100 randomly selected questions.
+5.1
+LARGER SAMPLE SIZE PER QUESTION?
+In Figure 2, we can easily see that the performance gain of SelfCheck decreases as sample numbers
+increase from 2 to 10. However, it remains a question what will happen for larger sample numbers.
+If the gap converges to 0, it means SelfCheck is only a variance reduction method for majority
+voting, whose function can be replaced by simply increasing sample numbers for majority voting.
+Interestingly, we find in Figure 6 that though the accuracy of majority voting starts vibrating for
+sample numbers between 10 and 50, the accuracy of SelfCheck increases by about 5%. As shown in
+the lower figure in Figure 6, the performance gap exhibits a falling-rising pattern. To understand this
+pattern, we first need to decompose the prediction error of LLMs into variance and bias.
+7
+
+0.65
+0.70
+0.75
+0.80
+0.85
+Accuracy
+majority voting
+ours
+1
+10
+20
+30
+40
+50
+#Samples per question
+0.00
+0.02
+0.04
+0.06
+0.08
+ Accuracy
+Figure 5: Generation accuracies after we increase
+#sample to 50. p-value < 0.01 for #samples > 30.
+Variance
+For some questions, the probability
+of an LLM giving the correct answer is higher
+than any other answers, but a single run of LLM
+can still make mistakes, which is a result of the
+variance. By the law of large numbers, if we run
+the LLM infinite times, we are guaranteed to get
+the correct answer simply by majority voting. If
+we assume the probability of the correct answer
+to be p, and the probability of the most probable
+wrong answer to be q (< p), some simple calcu-
+lation shows that the probability of getting an in-
+correct answer Pw after voting is exponentially
+decreasing with sample size n, which is upper
+bounded by ⌈1−p
+q ⌉( q
+p)⌈n
+2 ⌉. As a result, when
+n > 10, the probability of making mistakes in
+this case is already very low, so continuing to
+increase n would not significantly increase the
+accuracy of majority voting.
+Bias
+For some other questions, the probability of the correct answer is not the highest among all
+possible answers, which reflects the bias of the LLM. In such cases, very large n makes majority
+voting perform worse by always outputting the incorrect answer. SelfCheck corrects the bias of
+LLMs by giving higher weights to real correct solutions and lower weights to incorrect answers. As
+n increases, the probability of LLM generating at least 1 real correct answer keeps increasing, which
+can be recognized and selected by SelfCheck. This explains the large accuracy increase of SelfCheck
+for large n and shows that LLMs can correct their own biases, without any external supervision.
+5.2
+FURTHER COMPARISONS
+In order to figure out the effect of several critical design choices for SelfCheck, we compare SelfCheck
+with some of its variants. Figure 6 and Table 1 show generation accuracies and balanced checking
+accuracies of each variant. Table 1 shows the difficulty to achieve high checking accuracies for all
+methods. Nonetheless, any methods we considered with a checking accuracy ≥57.2% are helpful to
+prediction performance.
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+#Samples per question
+0.60
+0.65
+0.70
+0.75
+0.80
+0.85
+Accuracy
+ours
+global
+single stage
+regen->check (0-shot)
+regen->check (1-shot)
+majority voting
+Figure 6: Generation accuracies for different vari-
+ants of SelfCheck.
+Global vs step checking
+The first question is
+can we simply ask an LLM to perform a global
+checking on the whole solution without check-
+ing step by step. To answer it, we prompt the
+LLM to perform global checking with the fol-
+lowing instruction:
+The following is a question and
+a solution to it from a student.
+Carefully check whether the so-
+lution is correct step by step. End
+your response with your conclu-
+sion that starts with "Correct",
+"Wrong" or "Not Sure".
+Question: [Question]
+Solution: [Step 0, Step 1,..., Step n]
+However, we find the global checker outputs "correct" most of the time and rarely recognizes an
+error. Consequently, its performance in Figure 6 is very similar to majority voting and in Table 1
+its accuracy is only higher than random guess (50%). Consequently, LLMs cannot deal with the
+difficulty of global checking, which makes step checking necessary.
+Multiple stages vs Single stage
+The second question is do we really need to decompose step
+checking into several stages. To answer the question, we design the following prompt to do single-
+stage step checking.
+The following is a question and the first a few steps in its solution.
+Question: [Question]
+8
+
+Solution: [Step 0, Step 1,..., Step i-1]
+Check the correctness of the next step: [Step i]
+Please consider the information it relies on and check step by step. Please end your response
+with your conclusion that starts with "Correct", "Wrong" or "Not Sure".
+Figure 6 and Table 1 show though single-stage step checking is better than global checking, it is still
+significantly worse than our multi-stage SelfCheck. It indicates that the difficulty of checking a step
+is still too much for the LLM, so we need to decompose step checking into a pipeline of easier tasks.
+Figure 6
+Table 1: Mean checking accuracies for different
+variants of SelfCheck.
+Method
+Accuracy (%)
+Ours
+66.7%
+Global
+55.0%
+Single stage
+57.2%
+Regen->check (0-shot)
+63.1%
+Regen->check (1-shot)
+64.2%
+Regenerate then compare vs error check
+We also need to justify our choice to replace
+direct error checking with step regeneration and
+comparison. To do so, we replace the regener-
+ation stage and comparison stage with a verifi-
+cation stage. We first compare with a zero-shot
+version of the variant with the following prompt:
+Given the following information:
+Information 0: [Information I0]
+Information 1: [Information I1]
+...
+Step 0: [Step S0]
+Step 1: [Step S1]
+...
+Check the correctness of the next step [Step i]
+Please check for grounding errors, reasoning errors and calculation errors step by step.
+Please end your response with your conclusion that starts with "Correct", "Wrong" or "Not
+Sure".
+To make the verification stage stronger, we also compare a one-shot version with an example from
+Ling et al. (2023). Results in Figure 6 and Table 1 show that even with a very detailed and instructive
+example, direct verification still performs worse than our regeneration style checking, which supports
+our argument in Section 2.
+6
+CONCLUSION
+In this paper, we introduce SelfCheck, which is a step-by-step checking scheme for multi-step
+reasoning. By our multi-stage structure and the regeneration style checking, SelfCheck is effective in
+checking for errors, which, in turn, greatly increase prediction accuracies by weighted voting. Since
+SelfCheck works well in the zero-shot setting, we conclude that LLMs can check their own outputs
+without external supervision.
+9
+
+REFERENCES
+Aida Amini, Saadia Gabriel, Shanchuan Lin, Rik Koncel-Kedziorski, Yejin Choi, and Hannaneh
+Hajishirzi. MathQA: Towards interpretable math word problem solving with operation-based
+formalisms. In Proceedings of the 2019 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, Volume 1 (Long and
+Short Papers), pp. 2357–2367, Minneapolis, Minnesota, June 2019. Association for Computational
+Linguistics. doi: 10.18653/v1/N19-1245. URL https://aclanthology.org/N19-1245.
+Anthropic. Meet claude. URL https://www.anthropic.com/product.
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+Sébastien Bubeck, Varun Chandrasekaran, Ronen Eldan, Johannes Gehrke, Eric Horvitz, Ece Kamar,
+Peter Lee, Yin Tat Lee, Yuanzhi Li, Scott Lundberg, et al. Sparks of artificial general intelligence:
+Early experiments with gpt-4. arXiv preprint arXiv:2303.12712, 2023.
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm:
+Scaling language modeling with pathways. arXiv preprint arXiv:2204.02311, 2022.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian, Mark Chen, Heewoo Jun, Lukasz Kaiser,
+Matthias Plappert, Jerry Tworek, Jacob Hilton, Reiichiro Nakano, et al. Training verifiers to solve
+math word problems. arXiv preprint arXiv:2110.14168, 2021.
+Yao Fu, Litu Ou, Mingyu Chen, Yuhao Wan, Hao Peng, and Tushar Khot. Chain-of-thought hub:
+A continuous effort to measure large language models’ reasoning performance. arXiv preprint
+arXiv:2305.17306, 2023.
+Google. Palm 2 technical report. arXiv preprint arXiv:2303.08774, 2023.
+Pengcheng He, Xiaodong Liu, Jianfeng Gao, and Weizhu Chen. Deberta: Decoding-enhanced bert
+with disentangled attention. In International Conference on Learning Representations, 2020.
+Dan Hendrycks, Collin Burns, Saurav Kadavath, Akul Arora, Steven Basart, Eric Tang, Dawn
+Song, and Jacob Steinhardt. Measuring mathematical problem solving with the math dataset. In
+Thirty-fifth Conference on Neural Information Processing Systems Datasets and Benchmarks Track
+(Round 2), 2021.
+Yifei Li, Zeqi Lin, Shizhuo Zhang, Qiang Fu, Bei Chen, Jian-Guang Lou, and Weizhu Chen. On the
+advance of making language models better reasoners. arXiv preprint arXiv:2206.02336, 2022.
+Hunter Lightman, Vineet Kosaraju, Yura Burda, Harri Edwards, Bowen Baker, Teddy Lee, Jan
+Leike, John Schulman, Ilya Sutskever, and Karl Cobbe. Let’s verify step by step. arXiv preprint
+arXiv:2305.20050, 2023.
+Zhan Ling, Yunhao Fang, Xuanlin Li, Zhiao Huang, Mingu Lee, Roland Memisevic, and Hao Su.
+Deductive verification of chain-of-thought reasoning. arXiv preprint arXiv:2306.03872, 2023.
+Qing Lyu, Shreya Havaldar, Adam Stein, Li Zhang, Delip Rao, Eric Wong, Marianna Apidianaki,
+and Chris Callison-Burch. Faithful chain-of-thought reasoning. arXiv preprint arXiv:2301.13379,
+2023.
+OpenAI. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023.
+Debjit Paul, Mete Ismayilzada, Maxime Peyrard, Beatriz Borges, Antoine Bosselut, Robert West,
+and Boi Faltings. Refiner: Reasoning feedback on intermediate representations. arXiv preprint
+arXiv:2304.01904, 2023.
+Baolin Peng, Michel Galley, Pengcheng He, Hao Cheng, Yujia Xie, Yu Hu, Qiuyuan Huang, Lars
+Liden, Zhou Yu, Weizhu Chen, et al. Check your facts and try again: Improving large language
+models with external knowledge and automated feedback. arXiv preprint arXiv:2302.12813, 2023.
+10
+
+Hugo Touvron, Thibaut Lavril, Gautier Izacard, Xavier Martinet, Marie-Anne Lachaux, Timothée
+Lacroix, Baptiste Rozière, Naman Goyal, Eric Hambro, Faisal Azhar, et al. Llama: Open and
+efficient foundation language models. arXiv preprint arXiv:2302.13971, 2023.
+Xuezhi Wang, Jason Wei, Dale Schuurmans, Quoc V Le, Ed H Chi, Sharan Narang, Aakanksha
+Chowdhery, and Denny Zhou. Self-consistency improves chain of thought reasoning in language
+models. In The Eleventh International Conference on Learning Representations, 2022.
+Jason Wei, Maarten Bosma, Vincent Zhao, Kelvin Guu, Adams Wei Yu, Brian Lester, Nan Du,
+Andrew M Dai, and Quoc V Le. Finetuned language models are zero-shot learners. In International
+Conference on Learning Representations, 2021.
+Yixuan Weng, Minjun Zhu, Shizhu He, Kang Liu, and Jun Zhao. Large language models are reasoners
+with self-verification. arXiv preprint arXiv:2212.09561, 2022.
+11
+

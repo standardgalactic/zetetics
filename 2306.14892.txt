@@ -1,0 +1,2050 @@
+Supervised Pretraining Can Learn
+In-Context Reinforcement Learning
+Jonathan N. Lee∗1
+Annie Xie∗1
+Aldo Pacchiano2
+Yash Chandak1
+Chelsea Finn1
+Ofir Nachum3
+Emma Brunskill1
+1Stanford University, 2Microsoft Research, 3Google DeepMind
+Abstract
+Large transformer models trained on diverse datasets have shown a remarkable
+ability to learn in-context, achieving high few-shot performance on tasks they were
+not explicitly trained to solve. In this paper, we study the in-context learning capa-
+bilities of transformers in decision-making problems, i.e., reinforcement learning
+(RL) for bandits and Markov decision processes. To do so, we introduce and study
+Decision-Pretrained Transformer (DPT), a supervised pretraining method where
+the transformer predicts an optimal action given a query state and an in-context
+dataset of interactions, across a diverse set of tasks. This procedure, while simple,
+produces a model with several surprising capabilities. We find that the pretrained
+transformer can be used to solve a range of RL problems in-context, exhibiting both
+exploration online and conservatism offline, despite not being explicitly trained to
+do so. The model also generalizes beyond the pretraining distribution to new tasks
+and automatically adapts its decision-making strategies to unknown structure. The-
+oretically, we show DPT can be viewed as an efficient implementation of Bayesian
+posterior sampling, a provably sample-efficient RL algorithm. We further leverage
+this connection to provide guarantees on the regret of the in-context algorithm
+yielded by DPT, and prove that it can learn faster than algorithms used to generate
+the pretraining data. These results suggest a promising yet simple path towards
+instilling strong in-context decision-making abilities in transformers.
+1
+Introduction
+For supervised learning, transformer-based models trained at scale have shown impressive abilities
+to perform tasks given an input context, often referred to as few-shot prompting or in-context
+learning [1]. In this setting, a pretrained model is presented with a small number of supervised input-
+output examples in its context, and is then asked to predict the most likely completion (i.e. output)
+of an unpaired input, without parameter updates. Over the last few years in-context learning has
+been applied to solve a range of tasks [2] and a growing number works are beginning to understand
+and analyze in-context learning for supervised learning [3, 4, 5, 6]. In this work, our focus is to
+study and understand in-context learning applied to sequential decision-making, specifically in the
+context of reinforcement learning (RL) settings. Decision-making (e.g. RL) is considerably more
+dynamic and complex than supervised learning. Understanding and leveraging in-context learning
+here could potentially unlock significant improvements in an agent’s ability to adapt and make
+few-shot decisions in response to observations from the world. Such capabilities are instrumental for
+practical applications ranging from robotics to recommendation systems.
+For in-context decision-making [7, 8, 9], rather than input-output tuples, the context takes the form
+of state-action-reward tuples representing a dataset of interactions with an unknown environments.
+∗Equal contribution.
+arXiv:2306.14892v1  [cs.LG]  26 Jun 2023
+
+The agent must leverage these interactions to understand the dynamics of the world and what actions
+lead to good outcomes. A hallmark of good decision-making in online RL algorithms is a judicious
+balance of selecting exploratory actions to gather information and selecting increasingly optimal
+actions by exploiting that information [10]. In contrast, an RL agent with access to only a suboptimal
+offline dataset should produce a policy that conservatively selects actions [11]. An ideal in-context
+decision-maker should exhibit similar behaviors.
+To study in-context decision-making formally, we propose a new simple supervised pretraining
+objective, namely, to train (via supervised learning) a transformer to predict an optimal action label2
+given a query state and an in-context dataset of interactions, across a diverse set of tasks. We refer
+to the pretrained model as a Decision-Pretrained Transformer (DPT). Once trained, DPT can be
+deployed as either an online or offline RL algorithm in a new task by passing it an in-context dataset
+of interactions and querying it for predictions of the optimal action in different states. For example,
+online, the in-context dataset is initially empty and DPT’s predictions are uncertain because the new
+task is unknown, but it fills the dataset with its interactions as it learns and becomes more confident
+about the optimal action. We show empirically and theoretically that DPT yields a surprisingly
+effective in-context decision-maker with regret guarantees. As it turns out, DPT effectively performs
+posterior sampling — a provably sample-efficient Bayesian RL algorithm that has historically been
+limited by its computational burden [12]. We summarize our main findings below.
+• Predicting optimal actions alone gives rise to near-optimal decision-making algorithms. The
+DPT objective is solely based on predicting optimal actions from in-context interactions. At the
+outset, it is not immediately apparent that these predictions at test-time would yield good decision-
+making behavior when the task is unknown and behaviors such as online exploration are necessary
+to solve it. Intriguingly, DPT as an algorithm is capable of dealing with this uncertainty in-context.
+For example, despite not being explicitly trained to explore, DPT exhibits an exploration strategy
+on par with hand-designed algorithms, as a means to discover the optimal actions.
+• DPT generalizes to new decision-making problems, offline and online. We show DPT can
+handle reward distributions unseen in its pretraining data on bandit problems as well as unseen
+goals, dynamics, and datasets in simple MDPs. This suggests that the in-context strategies learned
+during pretraining are robust and generalizable without any parameter updates at test time.
+• DPT improves over the data used to pretrain it by exploiting latent structure. As an example,
+in parametric bandit problems, specialized algorithms can leverage structure (such as linear
+rewards) and offer provably better regret, but a representation must be known in advance. Perhaps
+surprisingly, we find that pretraining on linear bandit problems, even with unknown representations,
+leads DPT to select actions and explore in a way that matches an efficient linear bandit algorithm.
+This holds even when the source pretraining data comes from a suboptimal algorithm (i.e., one
+that does not take advantage of any latent structure), demonstrating the ability to learn improved
+in-context strategies beyond what it was trained on.
+• Posterior sampling can be implemented via in-context learning. Posterior sampling (PS), a gen-
+eralization of Thompson Sampling, can provably sample-efficiently solve online RL problems [12],
+but a common criticism is the lack of computationally efficient ways to update and sample from a
+posterior distribution. DPT can be viewed as learning a posterior distribution over optimal actions,
+shortcutting the PS procedure. Under some conditions, we show theoretically that DPT in-context
+is equivalent to PS. Furthermore, DPT’s prior and posterior updates are grounded in data rather
+than needing to be specified a priori. This suggests that in-context learning could help unlock
+practical and efficient RL via posterior sampling.
+2
+Related Work
+Meta-learning. Algorithmically, in-context learning falls under the meta-learning framework [13, 14].
+At a high-level, these methods attempt to learn some underlying shared structure of the training
+distribution of tasks to accelerate learning of new tasks. For decision-making and RL, there is a often
+choice in what shared ‘structure’ is specifically learned such as the dynamics of the task [15, 16, 17],
+a task context identifier [18, 19, 20, 21], temporally extended skills and options [22, 23, 24], or
+2If not explicitly known, the optimal action can be determined by running any (potentially inefficient)
+minimax-optimal regret algorithm for each pretraining task.
+2
+
+initialization of a neural network policy [25, 26]). In-context learning can be viewed as taking a more
+agnostic approach by learning the learning algorithm itself, more similar to [27, 28, 29]. Algorithm
+Distillation (AD) [7, 30] also falls under this category, applying autoregressive supervised learning to
+distill (sub-sampled) traces of a single-task RL algorithm into a task-agnostic model. While DPT
+also leverages autoregressive SL, it does not distill an existing RL algorithm in order to imitate how
+to learn. Instead, we pretrain DPT to predict optimal actions, yielding potentially emergent online
+and offline strategies at test time that automatically leverage the task structure to behave similarly to
+posterior sampling.
+Autoregressive transformers for decision-making. In decision-making fields such as RL and
+imitation learning, transformer models trained using autoregressive supervised action prediction have
+proliferated [31], inspired by the successes of these techniques for large language models [32, 33, 1].
+For example, Decision Transformer (DT) [34, 35] uses a transformer to autoregressively model
+sequences of actions from offline experience data, conditioned on the achieved return. During
+inference, one can then query the model conditioned on a desired return value. This approach has
+been shown to scale favorably to large models and multi-task settings [36], at times exceeding the
+performance of large-scale multi-task imitation learning with transformers [37, 38, 39]. However, DT
+is known to be provably (and unboundedly) sub-optimal in common scenarios [40, 41]. A common
+criticism of DT, and supervised learned transformers in general, is their inability to improve upon
+the dataset. For example, there is little reason for DT to output meaningful behavior if conditioned
+on return higher than any observed in training, without strong extrapolation assumptions [40]. In
+contrast, a major contribution of our work is theoretical and empirical evidence for the ability of DPT
+to improve over behaviors seen in the dataset in terms of regret.
+Value and policy-based offline RL. Offline RL algorithms offer the opportunity to learn from
+existing datasets. To address distributional shift, many prior algorithms incorporate the principle of
+value pessimism [42, 43, 44, 45], or policy regularization [46, 47, 48, 49, 50]. To reduce the amount
+of offline data required in a new task, methods for offline meta-RL can reuse interactions collected
+in a set of related tasks [51, 52, 53]. However, they still must address distribution shift, requiring
+solutions such as policy regularization [51] or additional online interactions [54]. DPT follows
+the success of autoregressive models like DT and AD, avoiding these issues. With our pretraining
+objective, DPT also leverages offline datasets for new tasks more effectively than AD.
+3
+In-Context Learning Model
+Basic decision models. The basic decision model of our study is the finite-horizon Markov decision
+process (MDP). An MDP is specified by the tuple τ = ⟨S, A, T, R, H, ρ⟩to be solved, where S is the
+state space, A is the action space, T : S × A →∆(S) is the transition function, R : S × A →∆(R)
+is the reward function, H ∈N is the horizon, and ρ ∈∆(S) is the initial state distribution. A learner
+interacts with the environment through the following protocol: (1) an initial state s1 is sampled from
+ρ; (2) at time step h, the learner chooses an action ah and transitions to state sh+1 ∼T(·|sh, ah),
+and receives a reward rh ∼R(·|sh, ah). The episode ends after H steps. A policy π maps states to
+distributions over actions and can be used to interact with the MDP. We denote the optimal policy as
+π⋆, which maximizes the value function V (π⋆) = maxπ V (π) := maxπ Eπ
+P
+h rh. When necessary,
+we use the subscript τ to distinguish Vτ and π⋆
+τ for the specific MDP τ. We assume the state space is
+partitioned by h ∈[H] so that π⋆is notationally independent of h. Note this framework encompasses
+multi-armed bandit settings where the state space is a single point, e.g. S = {1}, H = 1, and the
+optimal policy is a⋆∈argmaxa∈A E [r1|a1 = a].
+Pretraining. We give pseudocode in Algorithm 1 and a visualization in Figure 1. Let Tpre be a
+distribution over tasks at the time of pretraining. A task τ ∼Tpre can be viewed as a specification
+of an MDP, τ = ⟨S, A, T, R, H, ρ⟩. The distribution Tpre can span different reward and transition
+functions and even different state and action spaces. We then sample a context (or a prompt) which
+consists of a dataset D ∼Dpre(·; τ) of interactions between the learner and the MDP specified by
+τ. D = {sj, aj, s′
+j, rj}j∈[n] is a collection of transition tuples taken in τ. We refer to D as the
+in-context dataset because it provides the contextual information about τ. D could be generated
+through variety of means, such as: (1) random interactions within τ, (2) demonstrations from an
+expert, and (3) rollouts of an algorithm. Additionally, we independently sample a query state squery
+from the distribution Dquery over states S and a label a⋆is sampled from the optimal policy π⋆
+τ(·|squery)
+for task τ (see Section 5.3 for how to implement this in common practical scenarios). We denote the
+3
+
+Figure 1: A transformer model Mθ is pretrained to predict an optimal action a⋆
+query from a state squery in a task,
+given a dataset of interactions from that task. The resulting Decision-Pretrained Transformer (DPT) learns a
+distribution over the optimal action conditioned on an in-context dataset. Mθ can be deployed in new tasks
+online by collecting data on the fly, or offline by immediately conditioning on a static dataset.
+Algorithm 1 Decision-Pretrained Transformer (DPT): Training and Deployment
+1: // Collecting pretraining dataset
+2: Initialize empty pretraining dataset B
+3: for i in [N] do
+4:
+Sample task τ ∼Tpre, in-context dataset D ∼Dpre(·; τ), query state squery ∼Dquery
+5:
+Sample label a⋆∼π⋆
+τ(·|squery) and add (squery, D, a⋆) to B
+6: end for
+7: // Pretraining model on dataset
+8: Initialize model Mθ with parameters θ
+9: while not converged do
+10:
+Sample (squery, D, a⋆) from B and predict ˆpj(·) = Mθ(·|squery, Dj) for all j ∈[n]
+11:
+Compute loss in (2) with respect to a⋆and backpropagate to update θ.
+12: end while
+13: // Offline test-time deployment
+14: Sample unknown task τ ∼Ttest, sample dataset D ∼Dtest(·; τ)
+15: Deploy Mθ in τ by choosing ah ∈argmaxa∈A Mθ(a|sh, D) at step h
+16: // Online test-time deployment
+17: Sample unknown task τ ∼Ttest and initialize empty D = {}
+18: for ep in max_eps do
+19:
+Deploy Mθ by sampling ah ∼Mθ(·|sh, D) at step h
+20:
+Add (s1, a1, r1, . . .) to D
+21: end for
+joint pretraining distribution over tasks, in-context datasets, query states, and action labels as Ppre:
+Ppre(τ, D, squery, a⋆) = Tpre(τ)Dpre(D; τ)Dquery(squery)π⋆
+τ(a⋆|squery)
+(1)
+Given the in-context dataset D and a query state squery, we can train a model to predict the optimal
+action a⋆in response simply via supervised learning. Let Dj = {(s1, a1, s′
+1, r1), . . . , (sj, aj, s′
+j, rj)}
+denote the partial dataset up to j samples. Formally, we aim to train a causal GPT-2 transformer
+model M parameterized by θ, which outputs a distribution over actions A, to minimize the expected
+loss over samples from the pretraining distribution:
+minθ EPpre
+P
+j∈[n] ℓ(Mθ(· | squery, Dj), a⋆)
+(2)
+Generally, we set the loss to be the negative log-likelihood with ℓ(Mθ(· |squery, Dj), a⋆) :=
+−log Mθ(a⋆| squery, Dj). This framework can work for both discrete and continuous A. For
+our experiments with discrete A, we use a softmax parameterization for the distribution of Mθ,
+essentially treating this as a classification problem. The resulting output model Mθ can be viewed
+as an algorithm that takes in a dataset of interactions D and can be queried with a forward pass for
+predictions of the optimal action via inputting a query state squery. We refer to the trained model Mθ
+as a Decision-Pretrained Transformer (DPT).
+Testing. After pretraining, a new task (MDP) τ is sampled from a test-task distribution Ttest. If the
+DPT is to be tested offline, then a dataset (prompt) is a sampled D ∼Dtest( · ; τ) and the policy that
+4
+
+the model in-context learns is given conditionally as Mθ(· | ·, D). Namely, we evaluate the policy
+by selecting action ah ∈argmaxa Mθ(a|sh, D) when the learner visits state sh. If the model is to
+be tested online through multiple episodes of interaction, then the dataset is initialized as empty
+D = {}. At each episode, Mθ(· | ·, D) is deployed where the model samples ah ∼Mθ(·|sh, D) upon
+observing state sh. Throughout a full episode, it collects interactions {s1, a1, r1, . . . , sH, aH, rH}
+which are subsequently appended to D. The model then repeats the process with another episode,
+and so on until a specified number of episodes has been reached.
+A key distinction of the testing phase is that there are no updates to the parameters of Mθ. This is in
+contrast to hand-designed RL algorithms that would perform parameter updates or maintain statistics
+using D to learn from scratch. Instead, the model Mθ performs a computation through its forward
+pass to generate a distribution over actions conditioned on the in-context D and query state sh.
+Sources of distribution mismatch. Inherent to pretraining, like nearly all foundation models, is
+distribution mismatch on downstream test-time tasks. DPT pretrained on sufficiently diverse data
+should ideally be robust (to some extent) to these mismatches. (1) When deployed, Mθ will execute its
+learned policy which invariably induces a distribution over states different from Dquery. (2) Pretraining
+Tpre likely differs from the downstream Ttest. (3) Similarly, the test-time datasets prompts can also
+differ, especially online where they are collected by Mθ itself.
+4
+Learning in Bandits
+We begin with an empirical investigation of DPT in a multi-armed bandit, a well-studied special case
+of the MDP where the state space S is a singleton and the horizon H = 1 is a single step. We will
+examine the performance of DPT both when aiming to select a good action from offline historical
+data and for online learning where the goal is to maximize cumulative reward from scratch. Offline, it
+is critical to account for uncertainty due to noise as certain actions may not be sampled well enough.
+Online, it is critical to judiciously balance exploration and exploitation to minimize overall regret.
+For detailed descriptions of the experiment setups, see Appendix A.
+Pretraining distribution. For the pretraining task distribution Tpre, we sample 5-armed bandits
+(|A| = 5). The reward function for arm a is a normal distribution R(·|s, a) = N(µa, σ2) where
+µa ∼Unif[0, 1] independently and σ = 0.3. To generate in-context datasets Dpre, we randomly
+generate action frequencies by sampling probabilities from a Dirichlet distribution and mixing them
+with a point-mass distribution on one random arm (see details in Appendix A.3). Then we sample the
+actions accordingly from this distribution. This encourages diversity of the in-context datasets. The
+optimal policy π⋆
+τ for bandit τ is argmaxa µa, which we can easily compute during pretraining. We
+pretrain the model Mθ to predict a⋆from D as described in Section 3 for datasets up to size n = 500.
+Comparisons. We compare to several well-known algorithms for bandits3. All of the algorithms are
+designed to reason in a particular way about uncertainty based on their observations.
+• Empirical mean algorithm (Emp) selects the action with the highest empirical mean reward naively.
+• Upper Confidence Bound (UCB) selects the action with the highest upper confidence bound.
+• Lower Confidence Bound (LCB) selects the action with the highest lower confidence bound.
+• Thompson Sampling (TS) selects the action with the highest sampled mean from a posterior
+distribution over reward models. The prior and likelihood functions are Gaussian.
+Emp and TS [55, 56] can both be used for offline or online learning; UCB [57] is known to be
+provably optimal online by ensuring exploration through optimism under uncertainty; and LCB
+[58, 59] is used to minimize suboptimality given an offline dataset by selecting actions pessimistically.
+It is the opposite of UCB. We evaluate algorithms with standard bandit metrics. Offline, we use the
+suboptimality µa⋆−µˆa where ˆa is the chosen action. Online, we use cumulative regret: P
+k µa⋆−µˆak
+where ˆak is the kth action chosen.
+DPT learns to reason through uncertainty. As shown in Figure 2a, in the offline setting, DPT
+significantly exceeds the performance of Emp and LCB while matching the performance of TS, when
+the in-context datasets are sampled from the same distribution as during pretraining. The results
+suggest that the transformer is capable of reasoning through uncertainty caused by the noisy rewards
+in the dataset. Unlike Emp which can be fooled by noisy, undersampled actions, the transformer has
+3See Appendix A.2 for additional details such as hyperparameters.
+5
+
+0
+100
+200
+300
+400
+500
+Data
+0.1
+0.3
+0.02
+Suboptimality
+Offline Bandit
+Emp
+LCB
+TS
+DPT (ours)
+(a)
+0
+100
+200
+300
+400
+500
+Data
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+Cumulative Regret
+Online Bandit
+Emp
+UCB
+TS
+DPT (ours)
+(b)
+0.0
+0.3
+0.5
+Noise standard deviation
+0
+5
+10
+15
+20
+25
+30
+Final Cumulative Regret
+Online Robustness to Reward Shift
+Emp
+UCB
+TS
+DPT (ours)
+(c)
+Figure 2: (a) Offline performance on in-distribution bandits, given random in-context datasets. (b) Online
+cumulative regret on bandits. (c) Final (after 500 steps) cumulative regret on out-of-distribution bandits with
+different Gaussian noise standard deviations. The mean and standard error are computed over 200 test tasks.
+learned to hedge to a degree. However, it also suggests that this hedging is fundamentally different
+from what LCB does, at least on this specific distribution4.
+Interestingly, the same transformer produces an extremely effective online bandit algorithm when
+sampling actions instead of taking an argmax. As shown in Figure 2b, DPT matches the performance
+of classical optimal algorithms, UCB and TS, which are specifically designed for exploration. This is
+notable because DPT was not explicitly trained to explore, but its emergent strategy is on par with
+some of the best. In Figure 2c, we show this property is robust to noise in the rewards not seen during
+pretraining by varying the standard deviation. In Appendix B, we show this generalization happens
+offline too and even with unseen Bernoulli rewards.
+Leveraging structure from suboptimal data. We now investigate whether DPT can learn to
+leverage the inherent structure of a problem class, even without prior knowledge of this structure
+and even when learning from in-context datasets that do not explicitly utilize it. More precisely,
+we consider Tpre to be a distribution over linear bandits, where the reward function is given by
+E [r | a, τ] = ⟨θτ, ϕ(a)⟩and θτ ∈Rd is a task-specific parameter vector and ϕ : A →Rd is fixed
+feature vector that is the same for all tasks. Given the feature representation ϕ, LinUCB [60], a
+UCB-style algorithm that leverages ϕ, should achieve regret e
+O(d
+√
+K) over K steps, a substantial
+gain over UCB and TS when d ≪|A|. Here, we pretrain a DPT model with in-context datasets
+gathered by TS, which does not leverage the linear structure. Figures 3a and 3b show that DPT can
+exploit the unknown linear structure, essentially learning a surrogate for ϕ, allowing to do more
+informed exploration online and decision-making offline. It is nearly on par with LinUCB (which
+is given ϕ) and significantly outperforms the dataset source, TS, which does not know or use the
+structure. These results present evidence that (1) DPT can automatically leverage structure, and (2)
+supervised learning-based approaches to RL can learn novel explorations that transcend the quality
+of their pretraining data.
+Adapting to expert-biased datasets. A common assumption in offline RL is that datasets tend to
+be a mixture between optimal data (e.g. expert demonstrations) and suboptimal data (e.g. random
+interactions) [61]. Hence, LCB is generally effective in practice and the pretraining and testing
+distributions should be biased towards this setting. Motivated by this, we pretrain a second DPT
+model where Dpre is generated by mixing the in-context datasets with varying fractions of expert
+data, biasing Dpre towards datasets that contain more examples of the optimal action. We denote this
+model by DPT-Exp. In Figure 3c, we plot the test-time performance of both pretrained models when
+evaluated on new offline datasets with varying percentages of expert data5. Our results suggest that
+when the pretraining distribution is also biased towards expert-suboptimal data, DPT-Exp behaves
+similarly to LCB, while DPT continues to resemble TS. This is quite interesting as for other methods,
+such as TS, it is less clear how to automatically incorporate the right amount of expert bias to yield
+the same effect, but DPT can leverage this from pretraining.
+4Note our randomly generated environments are equally likely to have expert-biased datasets and adversarial
+datasets, so LCB is not expected to outperform here [58].
+5That is, 0% is fully random while 100% has only optimal actions in the in-context dataset.
+6
+
+0
+25
+50
+75
+100 125 150 175 200
+Data
+10
+2
+10
+1
+Suboptimality
+Offline Linear Bandit
+TS (source)
+LinReg
+DPT (ours)
+(a)
+0
+25
+50
+75
+100 125 150 175 200
+Data
+0.0
+2.5
+5.0
+7.5
+10.0
+12.5
+15.0
+17.5
+20.0
+Cumulative Regret
+Online Linear Bandit
+TS (source)
+LinUCB
+DPT (ours)
+(b)
+0
+50
+100
+% of Expert Data
+0.00
+0.01
+0.02
+0.03
+0.04
+0.05
+Final Suboptimality
+Offline Adaptation to Expert Datasets
+Emp
+LCB
+TS
+DPT (ours)
+DPT-Exp (ours)
+(c)
+Figure 3: (a) Offline performance of DPT trained on linear bandits from TS source data. LinReg does linear
+regression and outputs the greedy action. (b) Online cumulative regret of the same model. The mean and standard
+error are computed over 200 test tasks. (c) Offline performance on expert-biased datasets. DPT pretrained on a
+different prior continues to match TS, but DPT-Exp trained from a more representative prior excels.
+5
+Learning in Markov Decision Processes
+We next study how DPT can tackle Markov decision processes by testing its ability to perform
+exploration and credit assignment. In the following experiments, the DPT demonstrates generalization
+to new tasks, scalability to image-based observations, and capability to stitch in-context behaviors
+(Section 5.2). This section also examines whether DPT can be pretrained with datasets and action
+labels generated by a different RL algorithm, rather than the exact optimal policy (Section 5.3).
+5.1
+Experimental Setup
+Environments. We consider environments that require targeted exploration to solve the task. The
+first is Dark Room [20, 7], a 2D discrete environment where the agent must locate the unknown
+goal location in a 10 × 10 room, and only receives a reward of 1 when at the goal. We hold out a
+set of goals for generalization evaluation. Our second environment is Miniworld [62], a 3D visual
+navigation problem to test the scalability of DPT to image observations. The agent is in a room with
+four boxes of different colors, and must find the target box, the color of which is unknown to the agent
+initially. It receives a reward of 1 only when near the correct box. Details on these environments and
+the pre-training datasets are in App. A.4 and A.5.
+Comparisons. Our experiments aim to understand the effectiveness of DPT in comparison to that of
+other context-based meta-RL algorithms. To that end, we compare to meta-RL algorithms based on
+supervised and RL objectives.
+• Proximal Policy Optimization (PPO) [63]: We compare to this single-task RL algorithm, which
+trains from scratch without any pretraining data, to contextualize the performance of DPT and
+other meta-RL algorithms.
+• Algorithm Distillation (AD) [7]: AD first generates a dataset of learning histories by running an RL
+algorithm in each training task. Then, given a sampled subsequence hj = (sj, aj, rj, . . . , sj+c)
+from a learning history, a tranformer is trained to predict the next action aj+c from the learning
+history.
+• RL2 [27]: This online meta-RL comparison uses a recurrent neural network to adapt the agent’s
+policy from the given context. Unlike AD and DPT, which are trained with a supervised objective,
+the RL2 agent is trained to maximize the expected return with PPO.
+PPO and RL2 are online algorithms, while AD is capable of learning both offline and online. Details
+on the implementation of these algorithms can be found in Appendix A.2.
+5.2
+Main Results
+Generalizing to new offline datasets and tasks. To study the generalization capabilities of DPT,
+we evaluate the model in Dark Room on a set of 20 held-out goals not in the pretraining dataset.
+When given an expert dataset, DPT achieves near-optimal performance. Even when given a random
+dataset, which has an average total reward of 1.1, DPT obtains a much higher average return of
+61.5 (see Fig. 4a). Qualitatively, we observe that when the in-context dataset contains a transition to
+the goal, DPT immediately exploits this and takes a direct path to the goal. In contrast, while AD
+7
+
+Random
+Expert
+Dataset Composition
+0
+20
+40
+60
+80
+Return
+Offline Dark Room (Test Tasks)
+Dataset
+AD
+DPT (ours)
+(a)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+20
+40
+60
+80
+Return
+Online Dark Room (Test Tasks)
+DPT (ours)
+AD
+PPO
+RL2
+(b)
+Random
+Expert
+Dataset Composition
+0
+10
+20
+30
+40
+Return
+Offline Miniworld
+Dataset
+AD
+DPT (ours)
+(c)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+10
+20
+30
+40
+50
+Return
+Online Miniworld
+DPT (ours)
+AD
+PPO
+RL2
+(d)
+Figure 4: (a) Offline performance on held-out Dark Room goals, given random and expert datasets. (b) Online
+performance on held-out Dark Room goals. (c) Offline performance on Miniworld (images), given random and
+expert datasets. (d) Online performance on Miniworld (images) after 40 episodes. We report the average and
+standard error of the mean over 100 different offline datasets in (a) and (c) and 20 online trials in (b) and (d).
+0.0
+2.5
+5.0
+7.5
+x
+2
+0
+2
+4
+6
+8
+10
+y
+(a)
+Random
+Expert
+Dataset Composition
+0
+20
+40
+60
+80
+100
+Return
+Offline PPO Ablations (Test Tasks)
+DPT
+DPT (Rand, PPO)
+DPT (PPO, PPO)
+AD
+(b)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+20
+40
+60
+80
+Return
+Online PPO Ablations (Test Tasks)
+DPT
+DPT (Rand, PPO)
+DPT (PPO, PPO)
+AD
+(c)
+Figure 5: (a) In Dark Room (Three Tasks), DPT stitches a new, optimal trajectory to the goal (blue) given two
+in-context demonstrations of other tasks (pink and orange). (b) Offline Dark Room performance of DPT trained
+on PPO data. (c) Online Dark Room performance of DPT trained on PPO data.
+demonstrates strong offline performance with expert data, it performs worse in-context learning with
+random data compared to DPT. The difference arises because AD is trained to infer a better policy
+than the in-context data, but not necessarily the optimal one.
+We next evaluate DPT, AD, RL2, and PPO online without any prior data from the 20 test-time Dark
+Room tasks, shown in Fig. 4b. After 40 episodes, PPO does not make significant progress towards
+the goal, highlighting the difficulty of learning from such few interactions alone. RL2 is trained to
+perform adaptation within four episodes each of length 100, and we report the performance after the
+four adaptation episodes. Notably, DPT on average solves each task faster than AD and reaches a
+higher final return than RL2, demonstrating its capability to explore effectively online even in MDPs.
+In Appendix B, we also present results on generalization to new dynamics.
+Learning from image-based observations. In Miniworld, the agent receives RGB image observa-
+tions of 25 × 25 pixels. As shown in Fig. 4d, DPT can solve this high-dimensional task offline from
+both random and expert datasets. Compared to AD and RL2, DPT also learns online more efficiently.
+Stitching novel trajectories from in-context subsequences. A desirable property of some offline
+RL algorithms is the ability to stitch suboptimal subsequences from the offline dataset into new
+trajectories with higher return. To test whether DPT exhibits stitching, we design the Dark Room
+(Three Tasks) environment in which there are three possible tasks. The pretraining data consists only
+of expert demonstrations of two of them. At test-time DPT is evaluated on third unseen task, but its
+offline dataset is only expert demonstrations of the original two. Despite this, it leverages the data to
+infer a path solving the third task (see Fig. 5a).
+5.3
+Learning from Algorithm-Generated Policies and Rollouts
+So far, we have only considered action labels provided by an optimal policy. However, in some tasks,
+an optimal policy is not readily available even in pretraining. In this experiment, we use actions
+labeled by a policy learned via PPO and in-context datasets sampled from PPO replay buffers. We
+train PPO agents in each of the 80 train tasks for 1K episodes to generate 80K total rollouts, from
+which we sample the in-context datasets. This variant, DPT (PPO, PPO), performs on par with DPT
+and still better than AD, as shown in Figures 5b and 5c. DPT (PPO, PPO) can be viewed as a direct
+comparison between our pretraining objective and that of AD, given the same pretraining data but
+8
+
+just used differently. We also evaluated a variant, DPT (Rand, PPO), which pretrains on random
+in-context datasets (like DPT), but still using PPO action labels. The performance is worse than
+the other DPT variants in some settings, but only marginally so. In Appendix B, we analyze the
+sensitivity of DPT to other hyperparameters, such as the context size and amount of pretraining data.
+6
+Theory
+We now shed light on the observations of the previous empirical results through a theoretical analysis.
+Our main result shows that DPT (under a slight modification to pretraining) essentially performs
+in-context posterior sampling (PS). PS is a generalization of Thompson Sampling for RL in MDPs. It
+maintains and samples from a posterior over tasks τ given historical data D and executes optimal
+policies π⋆
+τ (see Appendix C for a formal outline). It is provably sample-efficient with online Bayesian
+regret guarantees [12], but maintaining posteriors is generally computationally intractable. The ability
+for DPT to perform PS in-context suggests a path towards computation- and provably sample-efficient
+RL with priors learned from the data.
+6.1
+History-Dependent Pretraining and Assumptions
+We start with a modification to the pretraining of DPT. Rather than conditioning only on squery and
+D to predict a⋆∼π⋆
+τ(·|squery), we propose also conditioning on a sequence ξh = (s1:h, a⋆
+1:h) where
+s1:h ∼Sh ∈∆(Sh) is a distribution over sets of states, independent of τ, and a⋆
+h′ ∼π⋆
+τ(·|sh′)
+for h′ ∈[h]. Thus, we use π⋆
+τ to label both the query state (which is the prediction label) and the
+sequence of states sampled from Sh. Note that this does not require any environment interactions
+and hence no sampling from either Tτ or Rτ. At test-time at step h, this will allow us to condition on
+the history ξh−1 of states that Mθ visits and the actions that it takes in those states. Formally, the
+learned Mθ is deployed as follows, given D. (1) At h = 0, initialize ξ0 = () to be empty. (2) At
+step h, visit sh and find ah by sampling from Mθ(·|squery, D, ξh−1). (3) Append (sh, ah) to ξh−1 to
+get ξh. Note for bandits and contextual bandits (H = 1), there is no difference between this and the
+original pretraining procedure of prior sections because ξ0 is empty. For MDPs, the original DPT can
+be viewed as a convenient approximation.
+We now make several assumptions to simplify the analysis. First, assume Dquery, Dpre, and S have
+sufficient support such that all conditional probabilities of Ppre are well defined. Similar to other
+studies of in-context learning [64], we assume Mθ fits the pretraining distribution exactly with enough
+coverage and data, so that the focus of the analysis is just the in-context learning abilities.
+Assumption 1. (Learned model is consistent). Let Mθ denote the pretrained model. For all
+(squery, D, ξh), we have Ppre(a|squery, D, ξh) = Mθ(a|squery, D, ξh) for all a ∈A.
+To provide some cursory justification,
+if Mθ
+is the global minimizer of (2),
+then
+EPpre∥Ppre(·|squery, D, ξh) −Mθ(·|squery, D, ξh)∥2
+1 →0 as the number of pretraining samples
+N →∞with high probability for transformer model classes of bounded complexity (see Proposi-
+tion C.1). Approximate versions of the above assumptions are easily possible but obfuscate the key
+elements of the analysis. We also assume that the in-context dataset D ∼Dpre is compliant [59],
+meaning that the actions from D can depend only on the observed history and not additional con-
+founders. Note that this still allows Dpre to be very general — it could be generated randomly or from
+adaptive algorithms like PPO or TS.
+Definition 6.1 (Compliance). The in-context dataset distribution Dpre(·; τ) is compliant if, for all
+i ∈[n], the ith action of the dataset, ai, is conditionally independent of τ given the ith state si and
+partial dataset, Di−1, so far. In other words, the distribution Dpre(ai|si, Di−1; τ) is invariant to τ.
+Generally, Dpre can influence Mθ. In Proposition 6.4, we show that all compliant Dpre form a sort of
+equivalence class that generate the same Mθ. For the remainder, we assume all Dpre are compliant.
+6.2
+Main Results
+Equivalence of DPT and PS.
+We now state our main result which shows that the trajectories
+generated by a pretrained Mθ will follow the same distribution as those from a well-specified PS
+algorithm. In particular, let PS use the well-specified prior Tpre. Let τc be an arbitrary task. Let
+9
+
+Pps(· | D, τc) and PMθ(· | D, τc) denote the distributions over trajectories ξH ∈(S ×A)H generated
+from running PS and Mθ(·|·, D, ·), respectively, in task τc given historical data D.
+Theorem 1 (DPT
+⇐⇒
+PS). Let the above assumptions hold.
+Then, Pps(ξH | D, τc) =
+PMθ(ξH | D, τc) for all trajectories ξH.
+Regret implications.
+To see this result in action, let us specialize to the finite MDP setting [12].
+Suppose we pretrain Mθ on a distribution Tpre over MDPs with S := |S| and A := |A|. Let Dpre be
+constructed by uniform sampling (si, ai) and observing (ri, s′
+i) for i ∈[KH]. Let E [rh|sh, ah] ∈
+[0, 1]. And let Dquery and Sh be uniform over S and Sh (for all h) respectively. Finally, let Ttest
+be the distribution over test tasks with the same cardinalities. For a task τ, define the online
+cumulative regret of DPT over K episodes as Regτ(Mθ) := P
+k∈[K] Vτ(π⋆
+τ) −Vτ(ˆπk) where
+ˆπk(·|sh) = Mθ(·|sh, D(k−1), ξh−1) and D(k) contains the first k episodes collected from ˆπ1:k.
+Corollary 6.2 (Finite MDPs). Suppose that supτ Ttest(τ)/Tpre(τ) ≤C for some C > 0. For the
+above MDP setting, the pretrained model Mθ satisfies ETtest [Regτ(Mθ)] ≤e
+O(CH3/2S
+√
+AK).
+A similar analysis due to [65] allows us to prove why pretraining on (latently) linear bandits can
+lead to substantial empirical gains, even when the in-context datasets are generated by algorithms
+unaware of this structure. We observed this empirically in Section 4. Consider a similar setup as there
+where S is a singleton, A is finite but large, θτ ∈Rd is sampled as θτ ∼N(0, I/d), ϕ : A →Rd
+is a fixed feature map with supa∈A ∥ϕ(a)∥2 ≤1, and the reward of a ∈A in task τ is distributed
+as N(⟨θτ, ϕ(a)⟩, 1). This time, we let Dpre(·; τ) be given by running Thompson Sampling with
+Gaussian priors and likelihood functions on τ.
+Corollary 6.3 (Latent representation learning in linear bandits). For Ttest = Tpre in the above linear
+bandit setting, Mθ satisfies ETtest [Regτ(Mθ)] ≤e
+O(d
+√
+K).
+This significantly improves over the e
+O(
+p
+|A|K) upper regret bound for TS that does not leverage the
+linear structure. This highlights how DPT can have provably tighter upper bounds on future bandit
+problems than the algorithms used to generate its (pretraining) data. Note that if there is additional
+structure in the tasks which yields a tighter regret bound (for example if there are only a small finite
+number of known MDPs in the possible distribution), that may further improve performance, such as
+by removing the dependence on the problem finite state, action or full d-dimensional representation.
+Invariance of Mθ to compliant Dpre.
+Our final result sheds light on how Dpre impacts the final
+DPT behavior Mθ. Combined with Assumption 1, Mθ is invariant to Dpre satisfying Definition 6.1.
+Proposition 6.4. Let P 1
+pre and P 2
+pre be pretraining distributions that differ only by their in-context
+dataset distributions, denoted by D1
+pre and D2
+pre. If D1
+pre and D2
+pre are compliant with the same support,
+then P 1
+pre(a⋆|squery, D, ξh) = P 2
+pre(a⋆|squery, D, ξh) for all a⋆, squery, D, ξh.
+That is, if we generate in-context datasets D by running various algorithms that depend only on the
+observed data in the current task, we will end up with the same Mθ. For example, TS could be used
+for D1
+pre and PPO for D2
+pre. Expert-biased datasets discussed in Section 4 violate Definition 6.1, since
+privileged knowledge of τ is being used. This helps explain our empirical results that pretraining on
+expert-biased datasets leads to a qualitatively different learned model at test-time.
+7
+Discussion
+In this paper, we studied the problem of in-context decision-making. We introduced a new pretraining
+method and transformer model, DPT, which is trained via supervised learning to predict optimal
+actions given an in-context dataset of interactions. Through in-depth evaluations in classic decision
+problems in bandits and MDPs, we showed that this simple objective naturally gives rise to an
+in-context RL algorithm that is capable of online exploration and offline decision-making, unlike
+other algorithms that are explicitly trained or designed to do these. Our empirical and theoretical
+results provide first steps towards understanding these capabilities that arise from DPT and what
+factors are important for it to succeed. The inherent strength of pretraining lies in its simplicity–we
+can sidestep the complexities of hand-designing exploration or conservatism in RL algorithms and
+while simultaneously allowing the transformer to derive novel strategies that best leverage problem
+10
+
+structure. These findings underscore the potential of supervised pretraining in equipping transformer
+models with in-context decision-making abilities.
+Limitations and future work.
+One limitation of DPT is the requirement of optimal actions at
+pretraining. Empirically, we find that this requirement can be relaxed by using actions generated
+by another RL-trained agent during pretraining, which only leads to a slight loss in performance.
+However, fully understanding this problem and how best to leverage multi-task decision-making
+datasets remains a key open problem. We also discussed that the practical implementation for MDPs
+differs from true posterior sampling. It would be interesting to further understand and bridge this
+empirical-theoretical gap in the future. We also remark that our preliminary analysis shows promise
+for DPT to generalize to new tasks beyond its pretraining distribution. This suggests that diversifying
+the task distributions during pretraining could significantly enhance the model’s ability to generalize
+to new tasks. This possibility holds an exciting avenue for future work. Finally, further investigation
+is required to understand the implications of these findings for existing foundation models, such as
+instruction-finetuned models, that are increasingly being deployed in decision-making settings [66].
+Acknowledgments and Disclosure of Funding
+We thank Evan Liu, Sherry Yang, and Lucy Shi for helpful discussions and feedback. This work was
+supported in part by NSF grant 2112926 and ONR grant N00014-21-1-2685. JNL acknowledges
+support from the NSF GRFP.
+References
+[1] Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, et al. Language models are
+few-shot learners. Advances in neural information processing systems, 33:1877–1901, 2020.
+[2] Sewon Min, Xinxi Lyu, Ari Holtzman, Mikel Artetxe, Mike Lewis, Hannaneh Hajishirzi, and
+Luke Zettlemoyer. Rethinking the role of demonstrations: What makes in-context learning
+work? arXiv preprint arXiv:2202.12837, 2022.
+[3] Stephanie Chan, Adam Santoro, Andrew Lampinen, Jane Wang, Aaditya Singh, Pierre
+Richemond, James McClelland, and Felix Hill. Data distributional properties drive emer-
+gent in-context learning in transformers. Advances in Neural Information Processing Systems,
+35:18878–18891, 2022.
+[4] Shivam Garg, Dimitris Tsipras, Percy S Liang, and Gregory Valiant. What can transformers
+learn in-context? a case study of simple function classes. Advances in Neural Information
+Processing Systems, 35:30583–30598, 2022.
+[5] Yasaman Razeghi, Robert L Logan IV, Matt Gardner, and Sameer Singh. Impact of pretraining
+term frequencies on few-shot reasoning. arXiv preprint arXiv:2202.07206, 2022.
+[6] Ekin Akyürek, Dale Schuurmans, Jacob Andreas, Tengyu Ma, and Denny Zhou.
+What
+learning algorithm is in-context learning? investigations with linear models. arXiv preprint
+arXiv:2211.15661, 2022.
+[7] Michael Laskin, Luyu Wang, Junhyuk Oh, Emilio Parisotto, Stephen Spencer, Richie Steiger-
+wald, DJ Strouse, Steven Hansen, Angelos Filos, Ethan Brooks, et al. In-context reinforcement
+learning with algorithm distillation. arXiv preprint arXiv:2210.14215, 2022.
+[8] Mengdi Xu, Yikang Shen, Shun Zhang, Yuchen Lu, Ding Zhao, Joshua Tenenbaum, and Chuang
+Gan. Prompting decision transformer for few-shot policy generalization. In International
+Conference on Machine Learning, pages 24631–24645. PMLR, 2022.
+[9] Mengdi Xu, Yuchen Lu, Yikang Shen, Shun Zhang, Ding Zhao, and Chuang Gan. Hyper-
+decision transformer for efficient online policy adaptation. arXiv preprint arXiv:2304.08487,
+2023.
+[10] Richard S Sutton and Andrew G Barto. Reinforcement learning: An introduction. MIT press,
+2018.
+11
+
+[11] Sergey Levine, Aviral Kumar, George Tucker, and Justin Fu. Offline reinforcement learning:
+Tutorial, review, and perspectives on open problems. arXiv preprint arXiv:2005.01643, 2020.
+[12] Ian Osband, Daniel Russo, and Benjamin Van Roy. (more) efficient reinforcement learning via
+posterior sampling. Advances in Neural Information Processing Systems, 26, 2013.
+[13] Tom Schaul and Jürgen Schmidhuber. Metalearning. Scholarpedia, 5(6):4650, 2010.
+[14] Yoshua Bengio, Samy Bengio, and Jocelyn Cloutier. Learning a synaptic learning rule. Citeseer,
+1990.
+[15] Justin Fu, Sergey Levine, and Pieter Abbeel. One-shot learning of manipulation skills with online
+dynamics adaptation and neural network priors. In 2016 IEEE/RSJ International Conference on
+Intelligent Robots and Systems (IROS), pages 4019–4026. IEEE, 2016.
+[16] Anusha Nagabandi, Ignasi Clavera, Simin Liu, Ronald S Fearing, Pieter Abbeel, Sergey Levine,
+and Chelsea Finn. Learning to adapt in dynamic, real-world environments through meta-
+reinforcement learning. arXiv preprint arXiv:1803.11347, 2018.
+[17] Nicholas C Landolfi, Garrett Thomas, and Tengyu Ma. A model-based approach for sample-
+efficient multi-task reinforcement learning. arXiv preprint arXiv:1907.04964, 2019.
+[18] Kate Rakelly, Aurick Zhou, Chelsea Finn, Sergey Levine, and Deirdre Quillen. Efficient
+off-policy meta-reinforcement learning via probabilistic context variables. In International
+conference on machine learning, pages 5331–5340. PMLR, 2019.
+[19] Jan Humplik, Alexandre Galashov, Leonard Hasenclever, Pedro A Ortega, Yee Whye Teh, and
+Nicolas Heess. Meta reinforcement learning as task inference. arXiv preprint arXiv:1905.06424,
+2019.
+[20] Luisa Zintgraf, Kyriacos Shiarlis, Maximilian Igl, Sebastian Schulze, Yarin Gal, Katja Hofmann,
+and Shimon Whiteson. Varibad: A very good method for bayes-adaptive deep rl via meta-
+learning. arXiv preprint arXiv:1910.08348, 2019.
+[21] Evan Z Liu, Aditi Raghunathan, Percy Liang, and Chelsea Finn. Decoupling exploration and
+exploitation for meta-reinforcement learning without sacrifices. In International conference on
+machine learning, pages 6925–6935. PMLR, 2021.
+[22] Theodore J Perkins, Doina Precup, et al. Using options for knowledge transfer in reinforcement
+learning. Technical report, Citeseer, 1999.
+[23] Abhishek Gupta, Russell Mendonca, YuXuan Liu, Pieter Abbeel, and Sergey Levine. Meta-
+reinforcement learning of structured exploration strategies. Advances in neural information
+processing systems, 31, 2018.
+[24] Yiding Jiang, Evan Liu, Benjamin Eysenbach, J Zico Kolter, and Chelsea Finn. Learning options
+via compression. Advances in Neural Information Processing Systems, 35:21184–21199, 2022.
+[25] Chelsea Finn, Pieter Abbeel, and Sergey Levine. Model-agnostic meta-learning for fast adap-
+tation of deep networks. In International conference on machine learning, pages 1126–1135.
+PMLR, 2017.
+[26] Jonas Rothfuss, Dennis Lee, Ignasi Clavera, Tamim Asfour, and Pieter Abbeel. Promp: Proximal
+meta-policy search. arXiv preprint arXiv:1810.06784, 2018.
+[27] Yan Duan, John Schulman, Xi Chen, Peter L Bartlett, Ilya Sutskever, and Pieter Abbeel. Rl2:
+Fast reinforcement learning via slow reinforcement learning. arXiv preprint arXiv:1611.02779,
+2016.
+[28] Jane X Wang, Zeb Kurth-Nelson, Dhruva Tirumala, Hubert Soyer, Joel Z Leibo, Remi Munos,
+Charles Blundell, Dharshan Kumaran, and Matt Botvinick. Learning to reinforcement learn.
+arXiv preprint arXiv:1611.05763, 2016.
+[29] Nikhil Mishra, Mostafa Rohaninejad, Xi Chen, and Pieter Abbeel. A simple neural attentive
+meta-learner. arXiv preprint arXiv:1707.03141, 2017.
+12
+
+[30] Chris Lu, Yannick Schroecker, Albert Gu, Emilio Parisotto, Jakob Foerster, Satinder Singh, and
+Feryal Behbahani. Structured state space models for in-context reinforcement learning. arXiv
+preprint arXiv:2303.03982, 2023.
+[31] Sherry Yang, Ofir Nachum, Yilun Du, Jason Wei, Pieter Abbeel, and Dale Schuurmans. Foun-
+dation models for decision making: Problems, methods, and opportunities. arXiv preprint
+arXiv:2303.04129, 2023.
+[32] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Łukasz Kaiser, and Illia Polosukhin. Attention is all you need. Advances in neural information
+processing systems, 30, 2017.
+[33] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena,
+Yanqi Zhou, Wei Li, and Peter J Liu. Exploring the limits of transfer learning with a unified
+text-to-text transformer. The Journal of Machine Learning Research, 21(1):5485–5551, 2020.
+[34] Lili Chen, Kevin Lu, Aravind Rajeswaran, Kimin Lee, Aditya Grover, Misha Laskin, Pieter
+Abbeel, Aravind Srinivas, and Igor Mordatch. Decision transformer: Reinforcement learning
+via sequence modeling. Advances in neural information processing systems, 34:15084–15097,
+2021.
+[35] Michael Janner, Qiyang Li, and Sergey Levine. Offline reinforcement learning as one big
+sequence modeling problem. Advances in neural information processing systems, 34:1273–
+1286, 2021.
+[36] Kuang-Huei Lee, Ofir Nachum, Mengjiao Sherry Yang, Lisa Lee, Daniel Freeman, Sergio
+Guadarrama, Ian Fischer, Winnie Xu, Eric Jang, Henryk Michalewski, et al. Multi-game
+decision transformers. Advances in Neural Information Processing Systems, 35:27921–27936,
+2022.
+[37] Scott Reed, Konrad Zolna, Emilio Parisotto, Sergio Gomez Colmenarejo, Alexander Novikov,
+Gabriel Barth-Maron, Mai Gimenez, Yury Sulsky, Jackie Kay, Jost Tobias Springenberg, et al.
+A generalist agent. arXiv preprint arXiv:2205.06175, 2022.
+[38] Anthony Brohan, Noah Brown, Justice Carbajal, Yevgen Chebotar, Joseph Dabis, Chelsea Finn,
+Keerthana Gopalakrishnan, Karol Hausman, Alex Herzog, Jasmine Hsu, et al. Rt-1: Robotics
+transformer for real-world control at scale. arXiv preprint arXiv:2212.06817, 2022.
+[39] Nur Muhammad Shafiullah, Zichen Cui, Ariuntuya Arty Altanzaya, and Lerrel Pinto. Behavior
+transformers: Cloning k modes with one stone. Advances in neural information processing
+systems, 35:22955–22968, 2022.
+[40] David Brandfonbrener, Alberto Bietti, Jacob Buckman, Romain Laroche, and Joan Bruna.
+When does return-conditioned supervised learning work for offline reinforcement learning?
+arXiv preprint arXiv:2206.01079, 2022.
+[41] Mengjiao Yang, Dale Schuurmans, Pieter Abbeel, and Ofir Nachum. Dichotomy of control:
+Separating what you can control from what you cannot. arXiv preprint arXiv:2210.13435, 2022.
+[42] Aviral Kumar, Aurick Zhou, George Tucker, and Sergey Levine. Conservative q-learning for
+offline reinforcement learning. Advances in Neural Information Processing Systems, 33:1179–
+1191, 2020.
+[43] Tianhe Yu, Aviral Kumar, Rafael Rafailov, Aravind Rajeswaran, Sergey Levine, and Chelsea
+Finn. Combo: Conservative offline model-based policy optimization. Advances in neural
+information processing systems, 34:28954–28967, 2021.
+[44] Yao Liu, Adith Swaminathan, Alekh Agarwal, and Emma Brunskill. Provably good batch
+off-policy reinforcement learning without great exploration. Advances in neural information
+processing systems, 33:1264–1274, 2020.
+[45] Kamyar Ghasemipour, Shixiang Shane Gu, and Ofir Nachum. Why so pessimistic? estimating
+uncertainties for offline rl through ensembles, and why their independence matters. Advances in
+Neural Information Processing Systems, 35:18267–18281, 2022.
+13
+
+[46] Scott Fujimoto, David Meger, and Doina Precup. Off-policy deep reinforcement learning
+without exploration. In International conference on machine learning, pages 2052–2062.
+PMLR, 2019.
+[47] Aviral Kumar, Justin Fu, Matthew Soh, George Tucker, and Sergey Levine. Stabilizing off-
+policy q-learning via bootstrapping error reduction. Advances in Neural Information Processing
+Systems, 32, 2019.
+[48] Yifan Wu, George Tucker, and Ofir Nachum. Behavior regularized offline reinforcement
+learning. arXiv preprint arXiv:1911.11361, 2019.
+[49] Noah Y Siegel, Jost Tobias Springenberg, Felix Berkenkamp, Abbas Abdolmaleki, Michael
+Neunert, Thomas Lampe, Roland Hafner, Nicolas Heess, and Martin Riedmiller. Keep doing
+what worked: Behavioral modelling priors for offline reinforcement learning. arXiv preprint
+arXiv:2002.08396, 2020.
+[50] Yao Liu, Adith Swaminathan, Alekh Agarwal, and Emma Brunskill. Off-policy policy gradient
+with state distribution correction. UAI, 2019.
+[51] Lanqing Li, Rui Yang, and Dijun Luo. Focal: Efficient fully-offline meta-reinforcement learning
+via distance metric learning and behavior regularization. arXiv preprint arXiv:2010.01112,
+2020.
+[52] Eric Mitchell, Rafael Rafailov, Xue Bin Peng, Sergey Levine, and Chelsea Finn. Offline meta-
+reinforcement learning with advantage weighting. In International Conference on Machine
+Learning, pages 7780–7791. PMLR, 2021.
+[53] Ron Dorfman, Idan Shenfeld, and Aviv Tamar.
+Offline meta reinforcement learning–
+identifiability challenges and effective data collection strategies. Advances in Neural Information
+Processing Systems, 34:4607–4618, 2021.
+[54] Vitchyr H Pong, Ashvin V Nair, Laura M Smith, Catherine Huang, and Sergey Levine. Offline
+meta-reinforcement learning with online self-supervision. In International Conference on
+Machine Learning, pages 17811–17829. PMLR, 2022.
+[55] Daniel J Russo, Benjamin Van Roy, Abbas Kazerouni, Ian Osband, Zheng Wen, et al. A tutorial
+on thompson sampling. Foundations and Trends® in Machine Learning, 11(1):1–96, 2018.
+[56] William R Thompson. On the likelihood that one unknown probability exceeds another in view
+of the evidence of two samples. Biometrika, 25(3-4):285–294, 1933.
+[57] Peter Auer, Nicolo Cesa-Bianchi, and Paul Fischer. Finite-time analysis of the multiarmed
+bandit problem. Machine learning, 47:235–256, 2002.
+[58] Chenjun Xiao, Yifan Wu, Jincheng Mei, Bo Dai, Tor Lattimore, Lihong Li, Csaba Szepes-
+vari, and Dale Schuurmans. On the optimality of batch policy optimization algorithms. In
+International Conference on Machine Learning, pages 11362–11371. PMLR, 2021.
+[59] Ying Jin, Zhuoran Yang, and Zhaoran Wang. Is pessimism provably efficient for offline rl? In
+International Conference on Machine Learning, pages 5084–5096. PMLR, 2021.
+[60] Yasin Abbasi-Yadkori, Dávid Pál, and Csaba Szepesvári. Improved algorithms for linear
+stochastic bandits. In Advances in Neural Information Processing Systems, pages 2312–2320,
+2011.
+[61] Paria Rashidinejad, Banghua Zhu, Cong Ma, Jiantao Jiao, and Stuart Russell. Bridging offline
+reinforcement learning and imitation learning: A tale of pessimism. Advances in Neural
+Information Processing Systems, 34:11702–11716, 2021.
+[62] Maxime Chevalier-Boisvert. Miniworld: Minimalistic 3d environment for rl and robotics
+research, 2018.
+[63] John Schulman, Filip Wolski, Prafulla Dhariwal, Alec Radford, and Oleg Klimov. Proximal
+policy optimization algorithms. arXiv preprint arXiv:1707.06347, 2017.
+14
+
+[64] Sang Michael Xie, Aditi Raghunathan, Percy Liang, and Tengyu Ma. An explanation of
+in-context learning as implicit bayesian inference. arXiv preprint arXiv:2111.02080, 2021.
+[65] Daniel Russo and Benjamin Van Roy. Learning to optimize via posterior sampling. Mathematics
+of Operations Research, 39(4):1221–1243, 2014.
+[66] Guanzhi Wang, Yuqi Xie, Yunfan Jiang, Ajay Mandlekar, Chaowei Xiao, Yuke Zhu, Linxi Fan,
+and Anima Anandkumar. Voyager: An open-ended embodied agent with large language models.
+arXiv preprint arXiv:2305.16291, 2023.
+[67] Johannes von Oswald, Eyvind Niklasson, Ettore Randazzo, João Sacramento, Alexander Mord-
+vintsev, Andrey Zhmoginov, and Max Vladymyrov. Transformers learn in-context by gradient
+descent. arXiv preprint arXiv:2212.07677, 2022.
+[68] Catherine Olsson, Nelson Elhage, Neel Nanda, Nicholas Joseph, Nova DasSarma, Tom
+Henighan, Ben Mann, Amanda Askell, Yuntao Bai, Anna Chen, et al. In-context learning
+and induction heads. arXiv preprint arXiv:2209.11895, 2022.
+[69] Louis Kirsch, James Harrison, Jascha Sohl-Dickstein, and Luke Metz. General-purpose in-
+context learning by meta-learning transformers. arXiv preprint arXiv:2212.04458, 2022.
+[70] Seongjin Shin, Sang-Woo Lee, Hwijeen Ahn, Sungdong Kim, HyoungSeok Kim, Boseop
+Kim, Kyunghyun Cho, Gichang Lee, Woomyoung Park, Jung-Woo Ha, et al. On the effect
+of pretraining corpora on in-context learning by a large-scale language model. arXiv preprint
+arXiv:2204.13509, 2022.
+[71] Yingcong Li, M Emrullah Ildiz, Dimitris Papailiopoulos, and Samet Oymak. Transformers as
+algorithms: Generalization and implicit model selection in in-context learning. arXiv preprint
+arXiv:2301.07067, 2023.
+[72] Noam Wies, Yoav Levine, and Amnon Shashua. The learnability of in-context learning. arXiv
+preprint arXiv:2303.07895, 2023.
+[73] Jacob Abernethy, Alekh Agarwal, Teodor V Marinov, and Manfred K Warmuth. A mech-
+anism for sample-efficient in-context learning for sparse retrieval tasks.
+arXiv preprint
+arXiv:2305.17040, 2023.
+[74] Shipra Agrawal and Navin Goyal. Near-optimal regret bounds for thompson sampling. Journal
+of the ACM (JACM), 64(5):1–24, 2017.
+[75] Malcolm Strens. A bayesian framework for reinforcement learning. In ICML, volume 2000,
+pages 943–950, 2000.
+[76] Shipra Agrawal and Randy Jia. Optimistic posterior sampling for reinforcement learning:
+worst-case regret bounds. Advances in Neural Information Processing Systems, 30, 2017.
+[77] Xiuyuan Lu and Benjamin Van Roy. Ensemble sampling. Advances in neural information
+processing systems, 30, 2017.
+[78] Ian Osband, Charles Blundell, Alexander Pritzel, and Benjamin Van Roy. Deep exploration via
+bootstrapped dqn. Advances in neural information processing systems, 29, 2016.
+[79] Ian Osband, John Aslanides, and Albin Cassirer. Randomized prior functions for deep rein-
+forcement learning. Advances in Neural Information Processing Systems, 31, 2018.
+[80] Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan,
+Trevor Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative
+style, high-performance deep learning library. Advances in neural information processing
+systems, 32, 2019.
+[81] Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al.
+Language models are unsupervised multitask learners. OpenAI blog, 1(8):9, 2019.
+15
+
+[82] Antonin Raffin, Ashley Hill, Adam Gleave, Anssi Kanervisto, Maximilian Ernestus, and Noah
+Dormann. Stable-baselines3: Reliable reinforcement learning implementations. The Journal of
+Machine Learning Research, 22(1):12348–12355, 2021.
+[83] Luisa Zintgraf, Kyriacos Shiarlis, Maximilian Igl, Sebastian Schulze, Yarin Gal, Katja Hofmann,
+and Shimon Whiteson. Varibad: A very good method for bayes-adaptive deep rl via meta-
+learning. In International Conference on Learning Representation (ICLR), 2020.
+[84] Alekh Agarwal, Sham Kakade, Akshay Krishnamurthy, and Wen Sun. Flambe: Structural
+complexity and representation learning of low rank mdps. Advances in neural information
+processing systems, 33:20095–20107, 2020.
+16
+
+Additional Related Work
+In-context learning. Beyond decision-making and reinforcement learning, our approach takes
+inspiration from general in-context learning, a phenomenon observed most prominently in large
+language models in which large-scale autoregressive modelling can surprisingly lead to a model that
+exhibits meta-learning capabilities [1]. Recently, there has been great interest in understanding the
+capabilities and properties of in-context learning [4, 67, 5, 68, 69, 70, 71, 72, 6, 73]. While a common
+hypothesis suggests that this phenomenon is due to properties of the data used to train large language
+models [3], our work suggests that this phenomenon can also be encouraged in general settings via
+adjustments to the pre-training objective. In fact, DPT could be interpreted as explicitly encouraging
+the ability to perform Bayesian inference, which is a popular explanation for the mechanism behind
+in-context learning for large language models [64].
+Posterior Sampling. Posterior sampling originates from the seminal work of [56], and has been
+popularized and thoroughly investigated in recent years by a number of authors [55, 74, 75, 12, 76, 65].
+For bandits, it is often referred to as Thompson Sampling, but the framework is easily generalizable
+to RL. The principle is as follows: begin with a prior over possible models (i.e. reward and transition
+functions), and maintain a posterior distribution over models by updating as new interactions are
+made. At decision-time, sample a model from the posterior and execute its optimal policy. The
+aforementioned prior works have developed strong theoretical guarantees on Bayesian and frequentist
+regret for posterior sampling. Despite its desirable theoretical characteristics, a major limitation is
+that computing the posterior is often computationally intractable, leading practitioners to rely on
+approximation-based solutions [77, 78, 79]. In Section 6, we show that a version of the DPT model
+learned from pretraining can be viewed as implementing posterior sampling as it should be without
+resorting to approximations or deriving complicated posterior updates. Instead, the posterior update
+is implicitly learned through pretraining to predict the optimal action. This suggests that in-context
+learning (or meta-learning more generally) could be a key in unlocking practically applicable posterior
+sampling for RL.
+A
+Implementation and Experiment Details
+Algorithm 2 Decision-Pretrained Transformer (detailed)
+1: // Collecting pretraining dataset
+2: Initialize empty dataset B
+3: for i in [N] do
+4:
+Sample task τ ∼Tpre
+5:
+Sample interaction dataset D ∼Dpre(·; τ) of length n
+6:
+Sample squery ∼Dquery and a⋆∼π⋆
+τ(·|squery)
+7:
+Add (squery, D, a⋆) to B
+8: end for
+9: // Training model on dataset
+10: Initialize model Mθ with parameters θ
+11: while not converged do
+12:
+Sample (squery, D, a⋆) from B
+13:
+Predict ˆpj(·) = Mθ(·|squery, Dj) for all j ∈[n].
+14:
+Compute loss in (5) with respect to a⋆and backpropagate to update θ.
+15: end while
+A.1
+DPT Architecture: Formal Description
+In this section, we provide a detailed description of the architecture alluded to in Section 3 and Figure 1.
+See hyperparameter details for models in their respective sections. The model is implemented in
+Python with PyTorch [80]. The backbone of the transformer architecture we use is an autoregressive
+GPT-2 model from the HuggingFace transformers library.
+For the sake of exposition, we suppose that S and A are subsets of RdS and RdA respectively. We
+handle discrete state and action spaces with one-hot encoding. Consider a single training datapoint
+derived from an (potentially unknown) task τ: we have a dataset D of interactions within τ, a query
+17
+
+Algorithm 3 Offline test-time deployment (detailed)
+1: // Task and offline dataset are generated without learner’s control
+2: Sample unknown task τ ∼Ttest
+3: Sample dataset D ∼Dtest(·; τ)
+4: // Deploying offline policy Mθ(·|·, D)
+5: s1 = reset(τ)
+6: for h in [H] do
+7:
+ah = argmaxa∈A Mθ(·|sh, D) // Most likely action
+8:
+sh+1, rh = step(τ, ah)
+9: end for
+Algorithm 4 Online test-time deployment (detailed)
+1: // Online, dataset is empty as learning is from scratch
+2: Initialize D = {}
+3: Sample unknown task τ ∼Ttest
+4: for ep in max_eps do
+5:
+s1 = reset(τ)
+6:
+for h in [H] do
+7:
+ah ∼Mθ(·|sh, D) // Sample action from predicted distribution
+8:
+sh+1, rh = step(τ, ah)
+9:
+end for
+10:
+// Experience from previous episode added to dataset
+11:
+Add (s1, a1, r1, . . .) to D
+12: end for
+state squery, and its corresponding optimal action a⋆= π⋆
+τ(squery). We construct the embeddings to be
+passed to the GPT-2 backbone in the following way. From the dataset D = {(sj, aj, s′
+j, rj)}j∈[n], we
+construct vectors ξj = (sj, aj, s′
+j, rj) by stacking the elements of the transition tuple into dimension
+dξ := 2dS + dA + 1 for each j in the sequence. This sequence of n elements is concatenated with
+another vector v := (squery, 0) where the 0 vector is a vector of zeros of sufficient length to make the
+entire element dimension dξ. The (n + 1)-length sequence is given by X = (v, ξ1, . . . , ξn). As order
+does not often matter for the dataset D6, we do not use positional encoding in order to take advantage
+of this invariance. We first apply a linear layer Linear(X) and pass the result to the transformer,
+which outputs the sequence Y = (ˆy0, ˆy1, . . . , ˆyn). In the continuous action case, these can be used
+as is for predictions of a⋆. For the discrete action case, we use them as logits to be converted to
+either a distribution over actions in A or one-hot vector predictions of a⋆. Here, we compute action
+probabilities
+ˆpj = softmax(ˆyj) ∈∆(A)
+(3)
+Because of the GPT-2 causal architecture (we defer details to the original papers [81, 1]), we note
+that ˆpj depends only on squery and the partial dataset Dj = {(sk, ak, s′
+k, rk)}k∈[j], which is why we
+write the model notation,
+Mθ(·|squery, Dj) = ˆpj(·),
+(4)
+to denote that the predicted probabilities of the jth element only depend on Dj and not the entire
+D for the model M with parameters θ ∈Θ. For example, with j = 0, the prediction of a⋆is made
+without any contextual information about the task τ except for squery, which can be interpreted as the
+prior over a⋆. We measure loss of this training example via the cross entropy for each j ∈[n]:
+−
+X
+j∈[n]
+log ˆpj(a⋆)
+(5)
+Intuition.
+Elements of the inputs sequence X represent transitions in the environment. When
+passed through the GPT-2 transformer, the model learns to associate elements of the sequence via the
+standard query-key-value mechanism of the attention model. The query state squery is demarcated
+6This is not always true such as when data comes from an algorithm such as PPO or Thompson Sampling.
+18
+
+by its zeros vector (which also acts as padding). Unlike other examples of transformers used for
+decision-making such as the Decision Transformer [34] and Algorithm Distillation [7], DPT does
+not separate the individual (s, a, s′, r) into their own embeddings to be made into one long sequence.
+This is because we view the transition tuples in the dataset as their own singletons, to be related with
+other singletons in the dataset through the attention mechanism. We note that there are various other
+implementation variations one could take, but we found success and robustness with this one.
+A.2
+Implementation Details
+A.2.1
+Bandit algorithms
+First, we describe the comparisons from the bandit experiments with hyperparameters.
+Empirical Mean (Emp).
+Emp has no hyperparameters, but we give it some mechanism to avoid
+degenerate scenarios. In the offline setting, Emp will only choose from actions that have at least one
+example in the dataset. This gives Emp and LCB-style effect when actions are missing. Similarly,
+online, Emp will sample each action at least once before defaulting to its real strategy. These changes
+only improve Emp.
+Upper Confidence Bound (UCB).
+According to the Hoeffding bound, we choose actions as
+ˆa ∈argmaxa∈A
+n
+ˆµa +
+p
+1/na
+o
+where ˆµa is the empirical mean so far for action a and na is the
+number of times a has been chosen so far. To arrive at this constant for the bonus, we coarsely tried a
+set of plausible values given the noise and found this to perform the best.
+Lower Confidence Bound (LCB).
+We choose actions as ˆa ∈argmaxa∈A
+n
+ˆµa −
+p
+1/na
+o
+where
+ˆµa is the empirical mean so far for action a and na is the number of times a has been chosen so far.
+Thompson Sampling (TS).
+Since the means are sampled uniformly from [0, 1], Gaussian TS is
+partially misspecified; however, we set prior mean and variance to 1
+2 and
+1
+12 to match the true ones.
+The noise model was well-specified with the correct variance. In the linear experiments of Figure 3a
+and Figure 3b, we set the prior mean and variance to 0 and 1 to fit the true ones better.
+LinUCB.
+We choose ˆat ∈argmaxa∈A⟨ˆθt, ϕ(a)⟩+ β∥ϕ(a)∥ˆΣ−1
+t
+where β = 1 and ˆΣt = I +
+P
+s∈[t−1] ϕ(as)ϕ(as)⊤and ˆθt = ˆΣ−1
+t
+P
+s∈[t−1] rsϕ(as). Here, rs and as are the reward and action
+observed at time s.
+LinReg.
+LinReg (offline) is the same as LinUCB except we set β = 0 to greedily choose actions.
+DPT.
+The transformer for DPT has an embedding size of 32, context length of 500 for basic bandits
+and 200 for linear bandits, 4 hidden layers, and 4 attention heads per attention layer for all bandits.
+We use the AdamW optimizer with weight decay 1e-4, learning rate 1e-4, and batch-size 64. For
+all experiments, we shuffle the in-context dataset D since order does not matter except in the linear
+bandit.
+A.2.2
+RL Algorithms
+Below, we describe the comparisons from the MDP experiments and their hyperparameters.
+Proximal Policy Optimization (PPO).
+The reported results for PPO use the Stable Baselines3
+implementation [82] with the default hyperparameters, which successfully learns each task given
+100K environment steps in Dark Room and 125K environment steps in Miniworld. In Dark Room,
+the policy is implemented as a multi-layer perceptron with two hidden layers of 64 units each. In
+Miniworld, the policy is a convolutional neural network with two convolutional layers with 16 3 × 3
+kernels each, followed by a linear layer with output dimension of 8.
+19
+
+Algorithm Distillation (AD).
+We first collect learning histories with PPO for each of the training
+tasks. Then, given a cross-episodic context of length H, where H is the task horizon, the model
+is trained to predict the actions taken K episodes later (given the states visited in that episode).
+This was shown to lead to faster algorithms in [7]. We evaluated AD across different values of K.
+Between K = 10, 50, 100, we found K = 100 to be most performant in the Dark Room environment.
+In Miniworld, we also subsampled with K = 100. In Dark Room, the transformer has similar
+hyperparameters as DPT: an embedding size of 32, context length of 100 steps, 4 hidden layers, and
+4 attention heads per attention layer. In Miniworld, as with DPT, we first encode the image with a
+convolutional network with two convolutional layers with 16 3 × 3 kernels each, followed by a linear
+layer with output dimension of 8.
+RL2.
+The reported results for RL2 use an open-sourced implementation from [83]. The implemen-
+tation uses PPO as the RL algorithm and defines a single trial as four consecutive episodes. The
+policy is implemented with one hidden layer of 32 units in Dark Room. In Miniworld, the policy
+is parameterized with a convolutional neural network with two convolutional layers with 16 3 × 3
+kernels each, followed by a linear layer with output dimension of 8.
+DPT.
+The transformer for DPT has an embedding size of 32, context length of 100 steps, 4 hidden
+layers, and 4 attention heads per attention layer in Dark Room. In Miniworld, the image is first
+passed through a convolutional network with two convolutional layers 16 3×3 kernels each, followed
+by a linear layer with output dimension of 8. The transformer model that processes these image
+embeddings otherwise has the same hyperparameters as in Dark Room. We use the AdamW optimizer
+with weight decay 1e-4, learning rate 1e-3, and batch-size 128.
+A.3
+Bandit Pretraining and Testing
+Basic Bandit.
+Offline, to generate the in-context datasets for pretraining, we used a Dirichlet
+distribution to sample action frequencies in order to generate datasets with diverse compositions
+(i.e. some more uniform, some that only choose a few actions, etc.): p1 ∼Dir(1) where p1 ∈∆(A)
+and 1 ∈R|A|. We also mixed this with a distribution that has all mass on one action: ˆa ∼Unif(A)
+and p2(ˆa) = 1 and p2(a) = 0 for all a ̸= ˆa. The final action distribution is p = (1 −ω)p1 + ωp2
+where ω ∼Unif(0.1[10]). We train on 100,000 pretraining samples for 300 epochs with an 80/20
+train/validation split. In Figure 2a, Dtest is generated in the same way.
+Expert-Biased Bandit.
+To generate expert-biased datasets for pretraining, we compute the action
+frequencies to bias the dataset towards the optimal action. Let a⋆be the optimal one. As before,
+we take p1 ∼Dir(1). Then, p2(a⋆) = 1 and p2(a) = 0 for all a ̸= a⋆. For of bias of ω, we take
+p = (1 −ω)p1 + ωp2 with ω ∼Unif(0.1[10]). We use the same pretraining sample size and epochs
+as before. For testing, Dtest is generated the same way except we fix a particular ω ∈{0, 0.5, 1} to
+test on.
+Linear Bandit.
+We consider the case where |A| = 10 and d = 2. To generate environments from
+Tpre, we first sampled a fixed set of actions from N(0, Id/d) in Rd to represent the features. Then,
+for each τ, we sampled θτ ∼N(0, Id/d) to produce the means µa = ⟨θτ, ϕ(a)⟩for a ∈A. To
+generate the in-context dataset, we ran Gaussian TS (which does not leverage ϕ) over n = 200
+steps (see hyperparameters in previous section). Because order matters, we did not shuffle and used
+1, 000, 000 pretraining samples over 200 epochs with an 80/20 train/validation split. At test time, we
+set Ttest = Tpre and Dtest = Dpre. Note that ϕ is fixed over all τ, as is standard for a linear bandit.
+A.4
+MDP Environment Details
+Dark Room.
+The agent must navigate a 10 × 10 grid to find the goal within H = 100 steps. The
+agent’s observation is its xy-position, the allowed actions are left, right, up, down, and stay, and the
+reward is only r = 1 when the agent is at the goal, and r = 0 otherwise. At test time, the agent
+begins at the (0, 0) position. We randomly designate 80 of the 100 grid squares to be goals for the
+training tasks, and hold out the remaining 20 for evaluation.
+20
+
+0.0
+0.3
+0.5
+Noise standard deviation
+0.00
+0.01
+0.02
+0.03
+0.04
+0.05
+0.06
+0.07
+0.08
+Final Suboptimality
+Offline Robustness to Reward Shift
+Emp
+LCB
+TS
+DPT (ours)
+(a)
+0
+100
+200
+300
+400
+500
+Data
+0.1
+0.3
+0.02
+Suboptimality
+Offline Bandit (Bernoulli)
+Emp
+LCB
+TS
+DPT (ours)
+(b)
+0
+100
+200
+300
+400
+500
+Data
+0
+5
+10
+15
+20
+25
+Cumulative Regret
+Online Bandit (Bernoulli)
+Emp
+UCB
+TS
+DPT (ours)
+(c)
+Figure 6: (a) Final (after 500 steps) offline suboptimality on out-of-distribution bandits with different Gaussian
+noise standard deviations. (b) Offline performance on out-of-distribution Bernoulli bandits, given random in-
+context datasets. (c) Online cumulative regret on Bernoulli bandits. The mean and standard error are computed
+over 200 test tasks.
+Miniworld.
+The agent must navigate to the correct box, which is initially unknown, from 25 × 25
+RGB image observations. The agent is additionally conditioned on its own direction vector. In each
+episode, the environment is initialized with four boxes of different colors, one in each corner of the
+square room. The agent can turn left, turn right, or move forward. The reward is only r = 1 when the
+agent is near the correct box and r = 0 otherwise, and each episode is 50 time-steps long. At test
+time, the agent begins in the middle of the room.
+A.5
+MDP Pretraining Datasets
+Dark Room.
+In Dark Room, we collect 100K in-context datasets, each of length H = 100 steps,
+with a uniform-random policy. The 100K datasets are evenly collected across the 100 goals. The
+query states are uniformly sampled from the state space, and the optimal actions are computed as
+follows: move up/down until the agent is on the same y-position as the goal, then move left/right
+until the agent is on the x-position as the goal. Of the 100K collections of datasets, query states,
+and optimal actions, we use the first 80K (corresponding to the first 80 goals) for training and the
+remaining 20K for validation.
+Miniworld.
+While this task is solved from image-based observations, we also note that there are
+only four distinct tasks (one for each colored box), and the agent does not need to handle new tasks at
+test time. Hence, the number of in-context datasets required in pretraining is fewer – we use 40K
+datasets each of length H = 50 steps. So as to reduce computation, the in-context datasets only have
+only (s, a, r) tuples. The query states, which consist of image and direction are sampled uniformly
+from the entire state space, i.e., the agent is place uniformly at random in the environment, pointing
+in a random direction. The optimal actions are computed as follows: turn towards the correct box if
+the agent is not yet facing it (within ±15 degrees), otherwise move forward. Of the 40K collections
+of datasets, query states, and optimal actions, we use 32K for training and the remaining 8K for
+validation.
+B
+Additional Experimental Results
+B.1
+Bandits
+This section reports additional experimental results in bandit environments.
+Out-of-distribution reward variances.
+In Figures 2c and 6a, we demonstrate the robustness of
+the basic pretrained model under shifts in the reward distribution at test time by varying the amount
+of noise observed in the rewards. DPT maintains robustness to these shifts similar to TS.
+Bernoulli rewards.
+We test the out-of-distribution ability of DPT further by completely changing
+the reward distribution from Gaussian to Bernoulli bandits. Despite being trained only on Gaussian
+tasks during pretraining, DPT maintains strong performance both offline and online in Figures 6b
+and 6c.
+21
+
+Random
+Expert
+Dataset Composition
+0
+20
+40
+60
+80
+Return
+Offline Dark Room (Train Tasks)
+Dataset
+AD
+DPT (ours)
+(a)
+Random
+Expert
+Dataset Composition
+0
+20
+40
+60
+80
+Return
+Offline Dark Room (Test Tasks)
+Dataset
+AD
+DPT (ours)
+(b)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+20
+40
+60
+80
+Return
+Online Dark Room (Train Tasks)
+DPT (ours)
+AD
+PPO
+RL2
+(c)
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+20
+40
+60
+80
+Return
+Online Dark Room (Test Tasks)
+DPT (ours)
+AD
+PPO
+RL2
+(d)
+Figure 8: All comparisons in Dark Room evaluated on the tasks that were seen during pretraining, displayed
+next to their evaluations on test task counterparts from the main text.
+2 layers
+4 layers
+6 layers
+8 layers
+Layers
+0
+10
+20
+30
+40
+50
+60
+Return
+Layers (Offline)
+(a)
+1 heads
+2 heads
+4 heads
+8 heads
+Heads
+0
+10
+20
+30
+40
+50
+60
+Return
+Attention Heads (Offline)
+(b)
+16 dim
+32 dim
+64 dim
+128 dim
+Dimensions
+0
+10
+20
+30
+40
+50
+60
+Return
+Embedding Dimension (Offline)
+(c)
+10k
+50k
+100k
+200k
+Samples
+0
+10
+20
+30
+40
+50
+60
+Return
+Pretraining Samples (Offline)
+(d)
+Figure 9: Sensitivity analysis of the offline Dark Rook task over the GPT-2 transformer’s hyperparameters: (a)
+layers (b) attention heads (c) embedding dimensions (d) pretraining samples.
+B.2
+Markov Decision Processes
+0
+5
+10
+15
+20
+25
+30
+35
+40
+Episodes
+0
+10
+20
+30
+40
+50
+60
+70
+80
+Return
+Online Dark Room Permuted
+Figure 7: Online evalua-
+tion of DPT on Dark Room
+when tested on novel ac-
+tions set permutations.
+This section reports additional experimental results in the Dark Room and
+Miniworld environments.
+Performance on training tasks.
+In Fig. 8, we show the performance of
+each method on the training tasks in Dark Room. Offline, DPT and AD
+demonstrate comparable performance as on the training tasks, indicating a
+minimal generalization gap to new goals. Online, DPT, AD, and RL2 also
+achieve performance on the training tasks similar to that on the test tasks.
+Generalization to new dynamics.
+In this experiment, we study general-
+ization to variations in a different aspect of the MDP, namely the dynamics.
+We design Dark Room (Permuted), a variant of Dark Room in which the
+goal is fixed to a corner but the action space is randomly permuted. Hence,
+the agent must leverage its historical context to infer the effect of each action. On a held-out set of
+20 permutations, DPT infers the optimal policy correctly every time offline, given only 100 offline
+samples, matching the optimal policy at 83 return. Similarly, the online performance immediately
+snaps to a near optimal policy in one episode once it identifies the novel permutation in Figure 7.
+B.3
+Sensitivity Analysis
+We next seek to understand the sensitivity of DPT to different hyperparameters, including the
+model size and size of the pretraining dataset. These experiments are performed in the Dark Room
+environment. As shown in Fig. 9, the performance of DPT is robust to the model size; it is the same
+across different embedding sizes, number of layers, and number of attention heads. Notably, the
+performance is slightly worse with 8 attention heads, which may be attributed to slight overfitting.
+We do see that when the pretraining dataset is reduced to 10% of its original size (10000 samples)
+the performance degrades, but otherwise has similar performance with larger pretraining datasets.
+C
+Additional Theory and Omitted Proofs
+We start with a well-known concentration inequality for the maximum-likelihood estimate (MLE) to
+provide some more justification for the approximation made in Assumption 1. We state a version
+22
+
+from [84]. Let F be a finite function class used to model a conditional distribution pY |X(y|x)
+for x ∈X and y ∈Y. Assume there is f ⋆∈F such that p(y|x) = f ⋆(y|x) (realizable), and
+f(·|x) ∈∆(Y) for all x ∈X and f ∈F (proper). Let D = {xi, yi}i∈[N] denote a dataset of i.i.d
+samples where xi ∼pX and yi ∼pY |X(·|xi). Let
+ˆf = argmax
+f∈F
+X
+i∈[N]
+log f(yi|xi)
+(6)
+Proposition C.1 (Theorem 21 of [84]). Let D and ˆf be given as above under the aforementioned
+conditions. Then, with probability at least 1 −δ,
+Ex∼pX∥ˆf(·|x) −pY |X(·|x)∥2
+1 ≤8 log (|F|/δ)
+N
+(7)
+The finiteness of F is done for simplicity, but we can see that this yields dependence on the
+log-cardinality, a common measure of complexity. Extensions to infinite F of bounded statis-
+tical complexity can be readily made to replace this. For our setting, the bound suggests that
+EPpre∥Ppre(·|squery, D, ξh) −Mθ(·|squery, D, ξh)∥2
+1 →0 as N →∞with high probability, provided
+the function class of Mθ has bounded statistical complexity.
+C.1
+Posterior Sampling
+Posterior sampling is most generally described with the following procedure [12]. Initialize a prior
+distribution T1 = Tpre and dataset D = {}. For k ∈[K]
+1. Sample τk ∼Tk and compute ˆπτk
+2. Execute π⋆
+τk and add interactions to D
+3. Update posterior distribution Tk+1(τ) = P(τ|D).
+The prior and posteriors are typically over models such as reward functions in bandits or transition
+dynamics in MDPs.
+C.2
+Proof of Theorem 1
+Theorem 1 (DPT
+⇐⇒
+PS). Let the above assumptions hold.
+Then, Pps(ξH | D, τc) =
+PMθ(ξH | D, τc) for all trajectories ξH.
+Proof. Without loss of generality, for a task τ, we take π⋆
+τ(·|s) to be deterministic and denote the
+optimal action in state s as π⋆
+τ(s). Recall that we consider a fixed current task τc and a fixed in-context
+dataset D. Define ξh = (s1, a1, . . . , sh, ah).
+We now formally state the variant of the full joint distribution from which we sample during pretrain-
+ing. Let τ and D′ be an arbitrary task and dataset and let a⋆∈A, squery ∈S, ξH−1 ∈(S × A)H−1,
+and h ∈[0, H −1] be arbitrary.
+Ppre(τ, a⋆, squery, D′, ξH−1, h) = Tpre(τ)Dpre(D′; τ)Dquery(squery)SH(s1:H)π⋆
+τ(a⋆|squery)
+(8)
+× Unif[0, H −1]
+Y
+i∈[H]
+π⋆
+τ(ai|si)
+(9)
+The Unif[0, H −1] is due to the fact that we sample h ∼Unif[0, H −1] and then truncate ξh
+from ξH−1 (or, equivalently, sample ξh ∼Sh directly), marginalizing out the other variables. For
+h′ ≤h −1, recall that we also use the notation Sh′(s1:h′) to denote the marginalization of the full
+joint SH. We will eventually work with the posterior of this distribution given the data D and history
+ξh:
+Ppre(τ|D, ξh) ∝Tpre(τ)Dpre(D; τ)
+Y
+i∈[h]
+π⋆
+τ(ai|si)
+(10)
+∝Ppre(τ|D)
+Y
+i∈[h]
+π⋆
+τ(ai|si)
+(11)
+23
+
+We define the following random sequences and subsequences:
+Ξps(h; D) = (Sps
+1 , Aps
+1 , . . . , Sps
+h , Aps
+h )
+(12)
+where the variables are generated according to the following conditional process: τps ∼P(·|D),
+Sps
+1
+∼ρτc, Aps
+h ∼π⋆
+τps(·|Sps
+h ), and Sps
+h+1 ∼Tτc(·|Sps
+h , Aps
+h ). We also define Ξps(h′ : h; D) to be
+the last h −h′ elements of Ξps(h; D). Analogously, we define
+Ξpre(h; D) = (Spre
+1
+, Apre
+1
+, . . . , Spre
+h
+, Apre
+h )
+(13)
+where the variables are from the process: Spre
+1
+∼ρτc, Apre
+h
+∼Ppre(·|Spre
+h
+, D, Ξpre(h −1; D)), and
+Spre
+h+1 ∼Tτc(·|Spre
+h
+, Apre
+h ). Note that Apre
+h
+is sampled conditioned on the sequence Ξpre(h; D) so
+far.
+We will show that Ξps(h; D) and Ξpre(h; D) follow the same distribution for all h ∈[H]. For
+convenience, we will drop notational dependence on D, except where it resolves ambiguity. Also,
+because of Assumption 1, we have that Ppre(·|Spre
+h
+, D, Ξpre(h−1)) = Mθ(·|Spre
+h
+, D, Ξpre(h−1)),
+so we will just work with Ppre for the remainder of the proof. We will also make use of the following
+lemma.
+Lemma C.2. If Dpre is complaint, then Ppre(τ|D) = P(τps = τ|D).
+Proof. From the definition of posterior sampling (using the same prior, Tpre), we have that
+P(τps = τ|D) ∝P(D|τ)Tpre(τ)
+(14)
+∝Tpre(τ)
+Y
+j∈[n]
+Tτ(s′
+j|sj, aj)Rτ(rj|sj, aj)
+(15)
+∝Tpre(τ)
+Y
+j∈[n]
+Tτ(s′
+j|sj, aj)Rτ(rj|sj, aj)Dpre(aj|sj, Dj−1)
+(16)
+= Tpre(τ)Dpre(D; τ)
+(17)
+= Ppre(τ|D)
+(18)
+where the second line crucially uses the fact that posterior sampling chooses actions based only on
+the prior and history so far. Similarly, the third line uses the fact that Dpre is compliant. Since the two
+sides are proportional in τ, they are equivalent.
+We will prove Theorem 1 via induction for each h ∈[H]. First, consider the base case for a sequence
+of length h = 1. Recall that ρτc denotes the initial state distribution of τc. We have that the densities
+can be written as
+P(Ξps(1) = ξ1) = P(Sps
+1 = s1, Aps
+1 = a1)
+(19)
+= ρτc(s1)P(Aps
+1 = a1|Sps
+1 = s1)
+(20)
+= ρτc(s1)
+Z
+τ
+P(Aps
+1 = a1, τps = τ|Sps
+1 = s1)dτ
+(21)
+= ρτc(s1)
+Z
+τ
+π⋆
+τ(a1|s1)Pps(τps = τ|D, Sps
+1 = s1)dτ
+(22)
+= ρτc(s1)
+Z
+τ
+π⋆
+τ(a1|s1)Pps(τps = τ|D)dτ
+(23)
+= ρτc(s1)Ppre(Apre
+1
+= a1|s1, D)
+(24)
+= P(Ξpre(1) = ξ1)
+(25)
+where the second line uses the sampling process of Spre
+1
+; the third marginalizes over τps, which is
+the task that posterior sampling samples to find the optimal policy; the fourth decomposes this into
+the optimal policy and the posterior over τps given D and Sps
+1 . Since Sps
+1 is independent of sampling
+of τps this dependence goes away in the next line. The sixth line applies Lemma C.2 and then, for
+h = 1, there is no history to condition on.
+24
+
+Now, we leverage the inductive hypothesis to prove the full statement. Suppose that the hypothesis
+holds for h −1. Then,
+P(Ξps(h) = ξh) = P(Ξps(h −1) = ξh−1)P(Sps
+h = sh, Aps
+h = ah|Ξps(h −1) = ξh−1)
+(26)
+(27)
+By the hypothesis, we have that P(Ξps(h −1) = ξh−1) = P(Ξpre(h −1) = ξh−1). For the second
+factor,
+P(Sps
+h = sh, Aps
+h = ah|Ξps(h −1) = ξh−1)
+(28)
+= Tτc(sh|sh−1, ah−1) · P(Aps
+h = ah|Sps
+h = sh, Ξps(h −1) = ξh−1)
+(29)
+= Tτc(sh|sh−1, ah−1) ·
+Z
+τ
+P(Aps
+h = ah, τps = τ|Sps
+h = sh, Ξps(h −1) = ξh−1)dτ
+(30)
+As before, we can further rewrite the last factor as
+P(Aps
+h = ah, τps = τ|Sps
+h = sh, Ξps(h −1) = ξh−1)
+(31)
+= π⋆
+τ(ah|sh) · P(τps = τ|Sps
+h = sh, Ξps(h −1) = ξh−1)
+(32)
+where
+P(τps = τ|Sps
+h = sh, Ξps(h −1) = ξh−1) = P(Sps
+h = sh, Ξps(h −1) = ξh−1|τps = τ)P(τps = τ|D)
+P(Sps
+h = sh, Ξps(h −1) = ξh−1)
+(33)
+∝Ppre(τ|D)
+Y
+i∈[h−1]
+Tτc(si+1|si, ai)π⋆
+τ(ai|si)
+(34)
+∝Ppre(τ|D)
+Y
+i∈[h−1]
+π⋆
+τ(ai|si)
+(35)
+∝Ppre(τ|D)Dquery(sh)Sh−1(s1:h−1)
+Y
+i∈[h−1]
+π⋆
+τ(ai|si)
+(36)
+∝Ppre(τ|sh, D, ξh−1)
+(37)
+(38)
+where ∝denotes that the two sides are equal up to multiplicative factors independent of τ. In the first
+line, we used Bayes rule. In the second line, given that τps = τ (i.e. posterior sampling selected τ to
+deploy), we decompose the probability of observing that sequence of states of actions. We also used
+Lemma C.2. The denominator does not depend on τ. Similarly, for the third and fourth lines, Tτc and
+S do not depend on τ. The final line follows from the definition of the joint pretraining distribution
+in this regime.
+Therefore, we conclude that the posterior over the value of τps is the same as the posterior over the
+task in the pretraining distribution, given sh, D, ξh−1. Substituting back through all the previous
+equations, we have
+P(Ξps(h) = ξh)
+(39)
+= P(Ξpre(h −1) = ξh−1) · Tτc(sh|sh−1, ah−1)
+Z
+τ
+π⋆
+τ(ah|sh)Ppre(τ|sh, D, ξh−1)dτ
+(40)
+= P(Ξpre(h −1) = ξh−1) · Tτc(sh|sh−1, ah−1)Ppre(ah|sh, D, ξh−1)
+(41)
+= P(Ξpre(h) = ξh)
+(42)
+This concludes the proof.
+C.3
+Proof of Corollary 6.2
+Corollary C.3 (Finite MDPs). Suppose that supτ Ttest(τ)/Tpre(τ) ≤C for some C > 0. For the
+above MDP setting, the pretrained model Mθ satisfies ETtest [Regτ(Mθ)] ≤e
+O(CH3/2S
+√
+AK).
+25
+
+Proof. Note that Dpre is clearly compliant since it is generated by random sampling. We use the
+equivalence between Mθ and posterior sampling established in Theorem 1. The proof then follows
+immediately from Theorem 1 of [12] to guarantee that
+ETpre [Regτ(Mθ)] ≤e
+O
+
+H3/2S
+√
+AK
+
+(43)
+where the notation e
+O omits polylogarithmic dependence. The bound on the test task distribution
+follows from the assumed bound on the likelihood ratio under the priors:
+Z
+Ttest(τ)Regτ(Mθ)dτ ≤C
+Z
+Tpre(τ)Regτ(Mθ)dτ.
+(44)
+C.4
+Proof of Corollary 6.3
+Corollary C.4 (Latent representation learning in linear bandits). For Ttest = Tpre in the above linear
+bandit setting, Mθ satisfies ETtest [Regτ(Mθ)] ≤e
+O(d
+√
+K).
+Proof. The distribution Dpre satisfies compliance by definition because it is generated by an adaptive
+algorithm TS. The proof once again follows by immediately deferring to the established result of [65]
+(Proposition 3) for linear bandits by the posterior sampling equivalence of Theorem 1. This ensures
+that posterior sampling achieves regret e
+O(d
+√
+K). It remains, however, to justify that Ppre(·|Dk) will
+be covered by Gaussian Thompson Sampling for all Dk with k ∈[K]. This is verified by noting that
+Pps(a|Dk) > 0 for non-degenerate Gaussian Thompson Sampling (positive variances of the prior
+and likelihood functions) and finite K. This guarantees that any Dk will have support.
+C.5
+Proof of Proposition 6.4
+Proposition C.5. Let P 1
+pre and P 2
+pre be pretraining distributions that differ only by their in-context
+dataset distributions, denoted by D1
+pre and D2
+pre. If D1
+pre and D2
+pre are compliant with the same support,
+then P 1
+pre(a⋆|squery, D, ξh) = P 2
+pre(a⋆|squery, D, ξh) for all a⋆, squery, D, ξh.
+Proof. The proof follows by direct inspection of the pretraining distributions. For P 1
+pre, we have
+P 1
+pre(a⋆|squery, D, ξ) =
+Z
+τ
+π⋆
+τ(a⋆|squery)P 1
+pre(τ|squery, D, ξ)dτ
+(45)
+The posterior distribution over tasks is simply
+P 1
+pre(τ|squery, D, ξ) = P 1
+pre(τ, squery, D, ξ)
+P 1pre(squery, D, ξ)
+(46)
+∝P 1
+pre(τ)P 1
+pre(ξ|τ)Dquery(squery)D1
+pre(D; τ)
+(47)
+= P 2
+pre(τ)P 2
+pre(ξ|τ)Dquery(squery)D1
+pre(D; τ)
+(48)
+Then, the distribution over the in-context dataset can be decomposed as
+D1
+pre(D; τ) =
+Y
+i∈[n]
+Rτ(ri|si, ai)Tτ(s′
+i|si, ai)D1
+pre(ai|si, Di−1; τ)
+(49)
+=
+Y
+i∈[n]
+Rτ(ri|si, ai)Tτ(s′
+i|si, ai)D1
+pre(ai|si, Di−1)
+(50)
+∝
+Y
+i∈[n]
+Rτ(ri|si, ai)Tτ(s′
+i|si, ai)D2
+pre(ai|si, Di−1)
+(51)
+= D2
+pre(D; τ),
+(52)
+where the second equality holds because D1
+pre(aj|sj, Dj; τ) is assumed to be invariant to τ by
+compliance, and the fifth equality holds because D2
+pre(aj|sj, Dj; τ) is assumed to be invariant to τ.
+26
+
+Therefore, we conclude that, for any s, D, ξ,
+P 1
+pre(τ|s, D, ξ) ∝P 2
+pre(τ)P 2
+pre(ξ|τ)Dquery(s)D2
+pre(D; τ)
+(53)
+∝P 2
+pre(τ|s, D, ξ).
+(54)
+Since also
+R
+τ P 1
+pre(τ|s, D, ξ) = 1 =
+R
+τ P 2
+pre(τ|s, D, ξ), then
+P 1
+pre(τ|s, D, ξ) = P 2
+pre(τ|s, D, ξ).
+(55)
+Substituting this back into Equation45 yields P 1
+pre(a⋆|s, D, ξ) = P 1
+pre(a⋆|s, D, ξ).
+27
+

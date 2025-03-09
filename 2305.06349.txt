@@ -1,0 +1,1591 @@
+RECKONING: Reasoning through Dynamic
+Knowledge Encoding
+Zeming Chen1
+Gail Weiss1
+Eric Mitchell2
+Asli Celikyilmaz3
+Antoine Bosselut1
+Natural Language Processing Lab, EPFL1
+Stanford University2
+Meta AI Research3
+{zeming.chen, gail.weiss, antoine.bosselut}@epfl.ch
+eric.mitchell@cs.stanford.edu
+aslic@meta.com
+Abstract
+Recent studies on transformer-based language models show that they can answer
+questions by reasoning over knowledge provided as part of the context (i.e., in-
+context reasoning). However, since the available knowledge is often not ﬁltered
+for a particular question, in-context reasoning can be sensitive to distractor facts,
+additional content that is irrelevant to a question but that may be relevant for a
+different question (i.e., not necessarily random noise). In these situations, the model
+fails to distinguish the knowledge that is necessary to answer the question, leading
+to spurious reasoning and degraded performance. This reasoning failure contrasts
+with the model’s apparent ability to distinguish its contextual knowledge from all
+the knowledge it has memorized during pre-training. Following this observation,
+we propose teaching the model to reason more robustly by folding the provided
+contextual knowledge into the model’s parameters before presenting it with a
+question. Our method, RECKONING, is a bi-level learning algorithm that teaches
+language models to reason by updating their parametric knowledge through back-
+propagation, allowing them to then answer questions using the updated parameters.
+During training, the inner loop rapidly adapts a copy of the model weights to encode
+contextual knowledge into its parameters. In the outer loop, the model learns to
+uses the updated weights to reproduce and answer reasoning questions about the
+memorized knowledge. Our experiments on two multi-hop reasoning datasets show
+that RECKONING’s performance improves over the in-context reasoning baseline
+(by up to 4.5%). We also ﬁnd that compared to in-context reasoning, RECKONING
+generalizes better to longer reasoning chains unseen during training, is more robust
+to distractors in the context, and is more computationally efﬁcient when multiple
+questions are asked about the same knowledge.
+1
+Introduction
+Consider the sentence: “John is David’s dad, and Tom is John’s dad”. Concluding that Tom is
+David’s grandfather involves reasoning about the information in the sentence. Speciﬁcally, it requires
+understanding the direct information, or contextual knowledge, given in the sentence: the stated
+relationships between John, David, and Tom; and combining it with our existing, commonsense
+knowledge of the world: someone’s dad’s dad is their grandfather. Achieving such logical reasoning
+automatically has long been a goal of AI [51, 16, 71, 79].
+The example above demonstrates two necessary abilities required for successful reasoning: ﬁrst,
+holding large amounts of commonsense or general knowledge about the world, and second, processing
+and combining new information with existing knowledge. Transformer-based large language models
+Preprint. Under review.
+arXiv:2305.06349v1  [cs.CL]  10 May 2023
+
+θ
+Knowledge Encoding
+ℒinner
+∇inner
+θ
+Grandson
+Who is Peter to Griffin?
+ 
+̂θ𝒦
+N
+Relevant Facts 
+
+Peter is a son to Kyle. 
+Kyle is Julia’s son.
+Amy is a daughter to Griffin.
+Amy is Kyle’s sister.
+𝒦
+Knowledge Encoding for Reasoning — Inference
+Figure 1: Our algorithm, RECKONING, solves reasoning problems by encoding external contextual
+knowledge into a model’s parameters through gradient updates. At inference time, RECKONING
+performs a few parameter updates using the gradients of a language modeling loss to encode the
+relevant facts. Then, the updated model answers the question using only its implicit knowledge.
+have shown a remarkable capacity for the ﬁrst of these abilities, repeatedly being demonstrated to
+memorize large amounts of data, or parametric knowledge, in their weights [61, 7, 10, 48].
+For the second, recent work showed that transformers ﬁne-tuned to predict answers over a concate-
+nated context (“The cow is big; If something is big then it chases the dog; If the cow chases the dog
+then the cow sees the rabbit”) and question (“Did the cow see the rabbit?”) achieve high performance
+on reasoning tasks where all necessary knowledge is provided in the context [16]. We refer to this
+setting as in-context reasoning, with further disambiguation according to the amount and type of
+information provided [30].
+In real-world question-answering settings [38, 21, 40, 15], though, large amounts of contextual
+knowledge may be provided at once, and the information may not be perfectly ﬁltered for a speciﬁc
+question. Unfortunately, in-context reasoning is highly sensitive to distractors [67]: additional facts
+that are not relevant to a question (e.g., “Mary is Tom’s sister” in the opening example would be
+irrelevant). Indeed, we ﬁnd that ﬁne-tuning and evaluating GPT-2 [57] for in-context reasoning drops
+performance from 99.4% to only 70.9% accuracy for the same questions when adding distractors
+to the context (§4.2). This sensitivity to distractors in contextual knowledge contrasts with the
+transformer’s apparent robustness to distractors in parametric knowledge. At any point in time,
+most of the training data seen by a model, which forms the parameters of the model, is likely to be
+completely irrelevant to the example being processed. As such, presenting contextual knowledge in
+the same way as memorized knowledge—by encoding it into the model parameters—may improve
+the reasoning abilities of transformer-based language models.
+In this work, we propose a novel bi-level optimization algorithm, RECKONING, that learns to
+memorize (and reason) over facts (i.e., knowledge) by performing inference-time parameter updates
+using gradients computed from a language modeling loss on those facts. Then, when presented
+with questions about those facts after the parameter updates, the model can answer them correctly.
+During training, our framework involves two nested loops: the inner loop performs fast adaptations
+on initial weights to memorize a set of external knowledge through a few gradient updates; the
+outer loop optimizes the updated model to solve reasoning problems associated with the memorized
+knowledge. The outer loop learns optimal meta-parameters (i.e., the initialization of the inner loop)
+that can rapidly memorize and successfully reason over contextual knowledge, allowing knowledge
+memorization to be optimized directly for downstream reasoning. At inference time, instead of
+including external knowledge in the input sequence as the preﬁx to a question prompt, the model
+can encode it in its parameters through gradient updates and then reason over its updated parametric
+knowledge to reach a conclusion.
+We evaluate RECKONING on two synthetic multi-hop reasoning datasets: ProofWriter [71] and
+CLUTRR-Systematic-Generalization (CLUTRR-SG) [27], comparing against a ﬁne-tuned in-context
+reasoning baseline that uses the same underlying model. Our results show that RECKONING con-
+sistently outperforms the in-context reasoning baseline on each benchmark, demonstrating that
+RECKONING learns to answer multi-hop reasoning questions by encoding contextual knowledge into
+the model’s parameters and accessing this information when the question presented after the model’s
+parameters have been updated. In particular, we ﬁnd through robustness tests that RECKONING
+2
+
+Knowledge Encoding for Reasoning — Bi-level Optimization Training
+θ
+Outer-loop Learning
+For each (𝒦, x, y)
+Inner-loop Learning
+Relevant 
+facts 𝒦
+ℒinner
+∇inner
+θ
+∑ℒouter
+Reasoning Problems
+Question (x, y)
+ 
+̂θ𝒦
+N
+x: Who is Peter to Griffin?
+y: Grandson 
+Relevant Facts 
+
+Peter is a son to Kyle. 
+Kyle is Julia’s son.
+Amy is a daughter to Griffin.
+Amy is Kyle’s sister.
+𝒦
+______________________
+…
+______________________
+∇outer
+θ
+Figure 2: The two-stage training process of RECKONING with an inner and outer loop.
+more successfully generalizes to adversarial settings, such as the presence of distractor facts and the
+introduction of longer reasoning chains at inference time. Finally, while RECKONING requires more
+time to encode knowledge than a typical forward pass due to its inference-time gradient updates, our
+run-time analysis shows that RECKONING is more efﬁcient when solving multiple problems that use
+a common set of knowledge, as RECKONING only needs to encode the knowledge once to answer
+multiple questions using the updated parameters. Overall, we demonstrate that RECKONING is an
+effective algorithm for reasoning through dynamic and controllable knowledge encoding, overcoming
+an observed weakness in the common reasoning setting and providing multiple additional beneﬁts.
+2
+Background
+Language Modeling and Memorization
+In the causal language modeling training objective, a
+language model f with parameters θ is trained to estimate the conditional probabilities of tokens in a
+sequence given the preceding ones: p(xt|x<t). Speciﬁcally, we train fθ, the function computed by f
+with parameters θ, to approximate p using the causal language modeling (CLM) loss:
+LCLM(fθ, x) = −
+T
+X
+t=1
+log fθ(xt|x1, ..., xt−1).
+(1)
+This training objective allows language models to memorize individual training examples [10, 9], and
+we will exploit this ability in order to memorize and draw on contextual knowledge in our work.
+Reasoning, and Transformers as Soft Reasoners
+In natural language reasoning tasks, we are
+given (in natural language) a set of context knowledge K, a question x about the information in K,
+and a set of possible answers Y for x, from which we must choose the correct answer. In in-context
+reasoning, language models fθ trained with a next-token objective are applied to this task by selecting
+as the correct response the answer y ∈Y with a maximum probability according to the model’s next-
+token prediction after the concatenated context and question: y = arg maxy′ fθ(y′|[K; x]). Previous
+works have shown that, after relevant supervised ﬁne-tuning, transformer language models can
+achieve high performance in this setting [16, 71, 27], though this performance degrades signiﬁcantly
+in the presence of irrelevant facts (distractors) [67].
+3
+Method
+Addressing these challenges, we propose RECKONING (REasoning through dynamiC KnOwledge
+eNcodING), which solves reasoning problems by memorizing the provided contextual knowledge,
+and then using this encoded knowledge when prompted with downstream questions. Speciﬁcally,
+RECKONING uses bi-level optimization to learn a set of meta-parameters primed to encode relevant
+knowledge in a limited number of gradient steps. The model can then use its updated weights to
+solve reasoning problems over this knowledge, without further presentation of the knowledge itself.
+Notation
+We consider only decoder-based transformer language models, and reserve f : X × θ →
+Y to refer to such models, where X is the set possible inputs and θ are their possible weights
+3
+
+(parameters). We use fθ : x 7→f(x, θ) to easily refer to any f with a given set of parameters θ.
+We describe reasoning problems with triples (K, x, y) such that y ∈Y is the correct answer for the
+question x given facts K, and use D to refer to sets of such problems.
+Overview: Inference
+Given a reasoning problem (K, x, Y), we initialize our model with weights
+copied from a set of meta-parameters θ and perform a constant number N of gradient descent steps
+on these with the goal of minimizing the causal language modeling objective on the knowledge set
+K. This allows the model to memorize K in its updated parameters, which we refer to as ˆθK
+N. Next,
+we pass the question x to the model, using f ˆθK
+N to obtain a distribution over Y, and taking as output
+the answer y ∈Y with the highest probability. For this method to consistently output the ground
+truth y∗, we seek a set of optimal meta-parameters θ∗that can quickly memorize (i.e., learn) the
+given knowledge in a way that then allows accurate reasoning when queried about the knowledge
+downstream.
+Training RECKONING
+Given a distribution p(D) of reasoning problems, our proposed bi-level
+optimization framework RECKONING (seen in Figure 2) optimizes the following objective:
+θ∗∈arg min
+θ
+E
+(K,x,y)∼p(D)[LCE(f ˆθK
+N (x), y)]
+(2)
+where for all K, n ∈N, and θ: ˆθK
+0 = θ, and
+ˆθK
+n+1 = ˆθK
+n −α∇LCLM(f ˆθK
+n , K).
+(3)
+Here, LCE(f(x), y) denotes the cross-entropy (CE) loss, which we apply with the relevant parameters
+for each reasoning question in D, LCLM(f, K) =
+1
+|K|
+P
+k∈K LCLM(f, k) denotes the causal language
+modeling loss, and N and α are pre-deﬁned hyperparameters of the ﬁne-tuning. We seek our actual
+meta-parameters θ through gradient descent. In particular, denoting by θ0 our initial meta-parameters,
+and ˆθK
+N,i the parameters ˆθK
+N obtained when initializing ˆθK
+0 with θi, we iteratively compute
+θi+1 = θi −η∇1
+|Di|
+X
+(K,x,y)∈Di
+LTotal(f ˆθK
+N,i, K, x, y),
+(4)
+Algorithm 1 RECKONING
+Require: An example distribution p(D), a transformer lan-
+guage model f, initial meta-parameters θ, outer step
+size η, inner step size α, inner loop length N.
+1: while not converged do
+▷outer loop
+2:
+Sample D′ ∼p(D)
+3:
+LD′ ←0
+4:
+for each (K, x, y) ∈D′ do
+5:
+Initialize ˆθK
+0 = θ
+6:
+for n := 0 to N −1 do
+▷inner loop
+7:
+ˆθK
+n+1 ←ˆθK
+n −α∇LCLM(f ˆθK
+n , K)
+8:
+end for
+9:
+LD′ ←LD′ + LTotal(f ˆθK
+N , K, x, y)
+10:
+end for
+11:
+θ ←θ −η∇
+1
+|D′|LD′
+12: end while
+where LTotal(f, K, x, y) = LCE(f(x), y)
+and for each i, Di is a random batch sampled
+from p(D). We continue this progression un-
+til LTotal converges.
+The training can be seen as two nested loops:
+at each iteration, the outer loop (Equa-
+tion (4)) samples a random batch Di ⊆D of
+reasoning problems for evaluating (in order
+to update) the current meta-parameters θi,
+after the inner loop (Equation (3)) adapts
+them to encode the associated knowledge
+through N steps of gradient updates.
+Multi-Task Objective
+During our exper-
+iments, we ﬁnd that adding a knowledge-
+recovery objective to the outer loop—such
+that it must not only answer the question but also state the relevant contextual knowledge when
+prompted with the question—improves the reasoning performance of the model. We evaluate the
+knowledge recovery with a causal language modeling loss and model the two losses by simple linear
+combination, following prior works [23, 75, 74]. The entire change is achieved by redeﬁning the total
+loss in our outer loop (Equation (4)) as:
+LTotal(f, K, x, y) = LCE(f(x), y) + LCLM(f, x, K)
+(5)
+where LCLM(f, x, K) is the language modeling loss on K, as in Equation (3), but this time conditioned
+on the question x. The overall process for training RECKONING is depicted in Algorithm 1 and
+Figure 2. Additionally, we dynamically learn a per-step-per-layer learning rate to replace the shared
+constant learning rate in the inner loop. We give more details in Appendix D.
+4
+
+4
+Experiments
+Setup
+We conduct our experiments on two datasets focusing on multi-hop logical reasoning over
+natural language knowledge: ProofWriter [71], which measures the model’s ability to emulate
+reasoning over facts and rules expressed in natural language, and CLUTRR-SG [27], which is
+generated from the CLUTRR [69] benchmark, a logical reasoning task that involves reasoning over
+family relationships between entities grounded in ﬁrst-order logical proofs. For these datasets, each
+problem requires multiple reasoning hops to reach an answer.1 The more reasoning hops a problem
+requires, the more complex that problem is.
+We compare our method against the following baselines: (1) a ﬁne-tuned model that performs a
+forward pass on only the question without access to the knowledge (No-Facts), (2) a model trained
+using RECKONING with random knowledge that is not relevant to the questions (Random-Facts),
+and (3) an in-context reasoning baseline that concatenates the knowledge K with the question x in
+a single context and is trained using supervised learning to predict the answer (FT-ICR). Our ﬁrst
+two baselines sanity-check whether any surface-level patterns in the question or the knowledge set
+can be exploited to make an accurate prediction. The last baseline compares RECKONING to the
+conventional way of prompting models for reasoning abilities. In all experiments, we use the base
+GPT-2 [57] model (∼124M parameters) as our initialization. For each reported score, we compute the
+average across three different runs. Unless stated otherwise, we refer by RECKONING to our method
+trained with the multi-task objective. For more details on the implementation, dataset statistics, and
+examples, see Appendix A.
+4.1
+Multi-hop Reasoning Performance
+ProofWriter
+CLUTRR-SG
+Method
+2-h
+3-h
+5-h
+2-h
+4-h
+6-h
+No-Facts
+64.1
+63.0
+64.2
+0.0
+8.8
+8.9
+Random-Facts
+64.1
+63.0
+64.2
+0.0
+1.3
+2.5
+FT-ICRST
+98.4
+98.8
+97.8
+97.4
+91.3
+89.1
+FT-ICRMT
+99.4
+99.2
+99.6
+98.1
+96.9
+90.3
+RECKONINGST
+98.3
+98.3
+99.1
+96.0
+90.2
+91.2
+RECKONINGMT
+99.5
+99.7
+99.8
+98.3
+97.6
+94.8
+Table 1: Label accuracy of RECKONING on ProofWriter
+and CLUTRR-SG. We compare RECKONING to ﬁne-tuned
+in-context reasoning (ICR) baselines where the supporting
+facts are given as part of the input. Models with MT are
+trained with the multi-task objective in the outer loop that
+co-optimizes multi-hop question answering and knowledge
+memorization.
+Main Results
+We ﬁrst evaluate
+whether RECKONING learns to per-
+form reasoning by updating model pa-
+rameters with relevant facts through
+back-propagation. As input, a model
+is given a set of supporting facts (with-
+out the presence of distractors) and
+a question (or hypothesis). First, the
+model performs a few inner loop learn-
+ing steps of causal language modeling
+on the facts. Then, the updated model
+receives only the question and gener-
+ates an answer. To answer the ques-
+tion correctly, the model must reason
+over the encoded facts and the ques-
+tion, meaning it must encode the facts
+during the inner loop such that com-
+plex multi-hop questions can be an-
+swered by the updated model.
+We train our models and the ﬁne-tuned in-context reasoning (FT-ICR) baselines with both the single-
+task (LCE) and multi-task (LCE+LCLM) objectives. For multi-task training, the model learns to answer
+the question and generate its relevant knowledge in the outer loop. Table 1 shows the evaluation
+results on questions answering (or hypothesis classiﬁcation). For all hop numbers in ProofWriter and
+in CLUTRR-SG, multi-task RECKONING outperforms the best result of all baselines (consistently
+obtained by multi-task FT-ICR) by an average of 1%. We conclude that RECKONING can effectively
+solve reasoning problems by using parametric knowledge updated with relevant knowledge through
+gradient updates and do so better than existing baselines. The multi-task objective is crucial for this
+success: not only is RECKONING’s performance consistently higher (by an average of 2.8% over
+the two datasets and their hop counts) when using the multi-task rather than single-task objective,
+it also underperforms both FT-ICR baselines when trained with only the single-task objective. The
+multi-task objective also improves FT-ICR consistently (average 1.8%), though it is not enough
+1In ProofWriter, the number of reasoning hops is called the proof depth. To unify the presentation of the
+results, we use the term “hop” to describe the number of reasoning steps for both datasets.
+5
+
+0
+20
+40
+60
+80
+100
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Label Accuracy (%)
+Number of Test Hops
+Training on 2-hop Questions
+ICR
+RECKONING
+0
+20
+40
+60
+80
+100
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Number of Test Hops
+Training on 6-hop Questions
+ICR
+RECKONING
+0
+20
+40
+60
+80
+100
+2
+3
+4
+5
+6
+7
+8
+9
+10
+Number of Test Hops
+Training on 4-hop Questions
+ICR
+RECKONING
+Figure 3: System generalization evaluation on CLUTRR-SG. From left to right, the models are
+trained on 2-hop, 4-hop, and 6-hop CLUTRR-SG data portions. We evaluate the model on 2-10 hop
+test sets. The higher the hops, the more facts a question has, and the more difﬁcult that question is.
+to beat RECKONING with the multi-task objective. In all further experiments, we consider only
+RECKONING and in-context reasoning (ICR) with a multi-task objective.
+Generalizing to Longer Reasoning Chains
+Our ﬁrst experiments assume an alignment between
+the number of reasoning hops in the questions in the training and test set. However, we may not be
+able to train on all n-hop reasoning questions we encounter in the wild, and we rarely know the number
+of reasoning hops in a question a priori. Consequently, we also measure the generalization capacity
+of our model to questions with hop numbers unseen during training. We compile interpolation
+(fewer hops than the train set) and extrapolation (more hops than the train set) test sets from the
+CLUTRR-SG dataset. Again, we train models individually on 2-hop, 4-hop, and 6-hop examples
+and evaluate these three sets of models on the test sets, which contain 2-10-hop reasoning questions.
+Results in Figure 3 show that both RECKONING models and ICR baselines retain high performance
+on the interpolation test sets but exhibit decreasing performance as the number of hops increases.
+Importantly, though, RECKONING outperforms ﬁne-tuned baselines on all the test sets regardless
+of the number of training hops, with the highest performance gains of RECKONING being more
+than 10% in every training setting (15%, 30%, 10%, respectively). These performance gains happen
+when testing on extrapolation data, suggesting that training with RECKONING better generalizes to
+examples with high OOD hop counts compared to in-context reasoning.
+93.7
+56.7
+60.2
+95.3
+82.7
+77
+99
+96
+84.7
+99.6
+99
+94.9
+40
+60
+80
+100
+2-hop
+4-hop
+6-hop
+Label Accuracy (%)
+1-step
+2-step
+4-step
+6-step
+Figure 4: Impact of the number of inner loop steps
+on multi-hop reasoning performance. Each group
+of plots involves training and testing on a subset of
+questions in CLUTRR-SG with a different number
+of hops. Each colored bar refers to a different
+number of gradient steps in the inner loop.
+Does RECKONING’s performance depend on
+the number of inner loop gradient steps?
+In
+RECKONING, the model performs multi-hop rea-
+soning over facts by encoding facts using mul-
+tiple gradient steps in the inner loop optimiza-
+tion (§3). Naturally, this process prompts the
+question of whether there is a correlation be-
+tween the number of reasoning hops and the
+number of gradient steps needed to reliably en-
+code the knowledge (i.e., problems with more
+reasoning hops require more gradient steps in
+the inner loop to encode the facts). In Figure 4,
+we show for CLUTRR-SG that as the number of
+inner loop steps increases, the label accuracy of
+the outer-loop task also increases. Furthermore,
+when considering the performance gains for rea-
+soning with 6 inner loop steps (i.e., knowledge encoding) steps as opposed to one, we observe that
+this gap is much more pronounced for 4-hop (42.3%) and 6-hop (34.7%) reasoning than it is for
+2-hop reasoning (5.9%). These results show that problems requiring more hops of reasoning also
+greatly beneﬁt from more steps of inner loop knowledge encoding.
+4.2
+Reasoning with Distractors
+In cases where multiple questions must be answered about the same knowledge set, some knowledge
+that is relevant to one question will likely be irrelevant to another question. For example, in Table 5,
+6
+
+99.5
+94.1
+89.8
+89.5
+79.8
+99.4
+88.9
+80.6
+78.9
+62.7
+40
+60
+80
+100
+0
+2
+4
+6
+all
+Label Accuracy (%)
+Number of Distractors
+Training on 2-hop Questions
+RECKONING
+ICR
+99.7
+94.7
+91.8
+87.2
+83.7
+99.2
+92.9
+82.7
+78.6
+72.7
+40
+60
+80
+100
+0
+2
+4
+6
+all
+Number of Distractors
+Training on 3-hop Questions
+RECKONING
+ICR
+99.8
+96.0
+93.9
+91.5
+84.0
+99.6
+94.1
+88.9
+81.5
+77.2
+40
+60
+80
+100
+0
+2
+4
+6
+all
+Number of Distractors
+Training on 5-hop Questions
+RECKONING
+ICR
+Figure 5: Robustness under distractors for ProofWriter. Each of the three plots corresponds to training
+and testing on a subset of questions in ProofWriter with a different number of hops (2,3,5-hops).
+Each bar corresponds to the number of distractors in the knowledge sets for those questions.
+the fact “Charlie is White.” is not needed to answer the question “Harry is red?”. Thus, it is important
+to evaluate the robustness of RECKONING when there exists irrelevant information (i.e., distractors)
+in the knowledge set. In this experiment, we analyze RECKONING’s ability to focus on the correct
+knowledge and ignore distractors when answering questions. We use ProofWriter as the evaluation
+dataset since it already has a setting with distractors included in the knowledge. For systematic
+analysis, we gradually add distractors to the context (starting from 2 and ﬁnishing at all possible
+distractors, of which there are an average of 7 per question). We train RECKONING and the baseline
+using the multi-task objective, where the model must (1) recall all of the facts and rules relevant to
+the question and (2) predict the conclusion based on the correct knowledge. In this case, we adapt
+training such that for each question x, the outer-loop (Equation (5)) CLM loss is only computed
+with respect to the relevant facts from K, thereby learning to recall relevant facts during training. In
+Figure 5, we see that RECKONING’s performance is consistently more robust under distractors than
+the in-context reasoning baseline. When we include all of the distractors in the context, RECKONING
+achieves a signiﬁcantly higher average label accuracy (82.5%) across hops than the baseline (70.9%),
+as computed by average of the 3 considered hop depths. Additionally, compared to performance with
+no distractors, RECKONING’s performance only drops 17.1% while the baseline performance drops
+28.6%, thereby exhibiting a better ability to disentangle the correct knowledge from the distractors.
+4.3
+Run-time Analysis
+Model
+Wall-clock
+Time (s)
+Single question
+FT-IRC
+0.1887
+RECKONING1step
+0.2532
+RECKONING4step
+0.9664
+Multiple questions (18)
+FT-IRC
+2.0436
+RECKONING1step
+0.6228
+RECKONING4step
+1.4839
+Table 2: Run-time analysis of the ﬁne-tuned
+in-context reasoning baseline and RECKON-
+ING. We measure the wall-clock time with
+seconds as the unit.
+One of the advantages of RECKONING is the ability
+to memorize a large set of knowledge and answer
+multiple related questions about that knowledge at
+little extra cost per question. Speciﬁcally, in con-
+trast to in-context reasoning, RECKONING can en-
+code knowledge once and answer multiple questions
+without needing to reprocess the knowledge for each
+question asked. To test whether RECKONING could
+be a more efﬁcient method for inference when mul-
+tiple questions are asked about the same knowledge,
+we measure the wall-clock time (in seconds) of the
+complete inference pipeline of RECKONING vs. ICR.
+For this experiment, we use a synthetic reasoning
+dataset with examples where the model is given a
+sequence of random letters as contextual knowledge,
+and the question asks for the most frequent letter in
+the context. The total number of tokens in each ex-
+ample is 1024: 7 for the question, 1 for the answer, and the remaining 1016 as random letters in the
+context, presented as 8 “facts”. The ﬁne-tuned in-context reasoning baseline receives a sequence
+including all 8 facts and the question. In contrast, RECKONING receives the 8 facts as a batch of eight
+segments of 127 tokens and encodes them in parallel in the inner loop. In the outer loop, the model
+only receives the question or a batch of questions. We focus on two settings: (1) inference time for a
+single question and (2) inference time when answering multiple questions. In the multiple-question
+setting, we set the number of questions to 18 (the same as in ProofWriter). For RECKONING, the
+inference process includes the inner-loop knowledge encoding through gradient updates and the ﬁnal
+7
+
+forward pass to encode the question. We set the number of inner loop gradient steps to 1 and 4. In
+Table 2, we see that when answering a single question, RECKONING does not perform inference
+faster compared to in-context reasoning. However, RECKONING shows signiﬁcant advantages under a
+multi-question setting. Both the 1-step inner loop and the 4-step inner loop are faster than the baseline.
+Since RECKONING encodes the knowledge in model parameters, it does not need to reprocess the
+knowledge for a related question and is more efﬁcient. We run this experiment on 1 RTX 3090 GPU.2
+4.4
+Memorizing Knowledge
+Method
+LCLM
+∆LCLM
+RECKONINGST
+10.74
+9.55
+RECKONINGMT
+0.167
+12.61
+Table 3: Average validation loss after the
+inner loop (LCLM) and change in inner
+loop loss (∆LCLM) between single-task
+and multi-task outer-loop loss. ∆LCLM
+measures how much the loss decreases
+after the gradient steps.
+In Table 1, we saw that training RECKONING with a multi-
+task outer loop objective improved over training with the
+single-task objective, potentially because the multi-task
+objective improves the model’s ability to memorize the
+knowledge in the inner loop. To validate our hypothesis,
+we evaluate and analyze RECKONING’s performance in
+reproducing memorized knowledge. We ﬁrst show in Ta-
+ble 3 the average inner loop loss (LCLM) and inner loop
+loss difference (∆LCLM) from the ﬁrst inner loop evalu-
+ation to the last on validation examples from the 5-hop
+ProofWriter data. We can see that the average inner loop
+loss for RECKONINGST is much higher than RECKONINGMT, and indeed starts out much higher as
+well. This observation shows that the single-task outer loop objective, which optimizes the model
+only for multi-hop question answering, does not learn to encode the knowledge in the inner loop by
+memorizing it, despite learning how to reason over it to answer questions. In contrast, the multi-task
+objective forces the model to learn to memorize the knowledge in the inner loop too: we observe that
+RECKONINGMT minimizes the inner loop loss as it reads the knowledge. This pattern is also shown
+in the average inner-loss difference (∆LCLM). The inner loop loss decreases more after the gradient
+updates when trained with the multi-task objective.
+ProofWriter
+CLUTRR-SG
+Method
+2-h
+3-h
+5-h
+2-h
+4-h
+6-h
+FT-ICRMT
+99.8
+99.0
+98.7
+100.0
+100.0
+99.9
+RECKONINGMT
+98.9
+98.6
+98.2
+100.0
+99.9
+99.9
+Table 4: Exact match score for reproducing memorized
+knowledge. In contrast to in-context reasoning, RECKON-
+ING does not have direct access to the knowledge.
+Next, we report the evaluation results
+on the model’s ability to reproduce the
+memorized facts correctly under a multi-
+task setting in Table 4. For the metric,
+we calculate the exact match score be-
+tween the reproduced facts and the gold
+facts.3 We compare the results to the
+ﬁne-tuned baseline with in-context rea-
+soning (FT-ICR).
+63.5
+63.2
+66.1
+79.8
+83.7
+84.0
+40
+60
+80
+100
+2-hop
+3-hop
+5-hop
+Label Accuracy (%)
+single-task
+multi-task
+Figure 6: Performance comparison be-
+tween models trained with a single-task
+and a multi-task objective under distrac-
+tors. With the multi-task objective, the
+model learns to memorize the relevant
+facts and perform reasoning over these
+facts memorized in the parameters.
+The results show that RECKONINGMT can correctly re-
+cover the relevant facts from its model parameters with an
+average exact match score of 99.3, which is comparable
+to the FT-ICR baseline. Note that this task is easier for
+the full-context baseline since it can directly attend to and
+copy the facts from the input, while RECKONINGMT does
+not have direct access to the facts when recalling them (as
+they have instead been encoded in the model parameters).
+This result shows that the supporting facts are successfully
+encoded into the model parameters such that the model
+can reproduce them without losing much information.
+Finally, we show that RECKONING with a multi-task ob-
+jective is also more robust to distractors as it trains the
+model to only reproduce the facts that would be relevant to
+a particular question we ask in the outer loop. As in Sec-
+2We perform this experiment in a limited setting and do not handle the case where hidden states could be
+cached for the forward pass of in-context reasoning, likely speeding up multi-question inference [11].
+3This is done by prompting the model with the question and comparing its output (after its answer to the
+question) to the concatenation of all of the facts. The model is able to produce these facts in the expected order
+due to an implementation detail: they are numbered and labeled when given to the inner loop.
+8
+
+tion 4.2, we use the ProofWriter dataset and, for each question, add all the distractors to the context.
+We train the model using the multi-task objective, and we report the label accuracy. While in Table 1,
+we originally saw a ∼1% improvement from training with a multi-task objective on ProofWriter
+with no distractors, we see a much more signiﬁcant performance gap in Figure 6 (∼18.2%) when
+distractors are available. We also note that the performance of the single-task model is essentially
+random (see the Random-Facts baseline from Table 1). By learning how to memorize knowledge
+in the inner loop so that it can recall relevant facts in the outer loop, the model also learns how to
+encode facts more robustly over them.
+5
+Related Work
+Logical Reasoning Datasets and Benchmarks
+As a central building block of human cognition
+and intelligence [26], logical reasoning has been a long-pursued topic in the ﬁeld of AI [53, 46, 8,
+2, 16, 12, 70, 44]. Logical reasoning, in general, can be categorized in a trichotomy of deductive,
+inductive, and abductive reasoning [24]. Multiple datasets have been published that evaluate neural
+models’ ability on these three types of logical reasoning [16, 5, 69]. Initially, logical reasoning tasks
+focused on hypothesis classiﬁcation, where, given a theory consisting of multiple facts and rules, a
+model would determine whether the hypothesis was correct. Recently, transformer-based language
+models have been directly used to solve this task in synthetic [16, 63], real-world [28], and adversarial
+[59, 25, 65] settings. However, simply predicting whether the hypothesis is valid does not elucidate
+whether the model correctly reasons over the provided knowledge. To better analyze and interpret the
+reasoning process of language models, new tasks focus on generating the valid proof that explains
+the model’s decision [71, 19]. Our proposed method, RECKONING, is optimized for the hypothesis
+classiﬁcation reasoning task and evaluates on many of these datasets [71, 27].
+Logical Reasoning over Natural Language
+Historically, automatic logical reasoners used sym-
+bolic systems and formal languages as a knowledge representation [41, 53, 50, 1, 47, 78]. However,
+these systems were hard to scale up due to the knowledge-acquisition bottleneck and the brittleness
+of formal representation [33, 81]. With recent advances in transformer-based language modeling
+[73] and self-supervised pre-training [20, 57, 58], a novel paradigm for logical reasoning emerged,
+where pre-trained language models (PLMs) could be used as soft reasoners over knowledge expressed
+in natural language. Natural language as a knowledge representation allowed PLMs to handle raw
+input with diverse formats [31, 14], resulting in PLMs being applied to various types of deductive
+[16], abductive [5], and inductive [27] reasoning tasks. However, language models as soft reasoners
+also showed structural weaknesses, as their performance dropped on complex logical operations
+[77, 12], and their reasoning process was not interpretable [62, 43]. Consequently, a new line of work
+uses neuro-symbolic methods to combine the best of both language models and symbolic reasoning
+[34, 42, 13, 6, 39]. Speciﬁcally, the interpretability gap motivated modular and step-wise reasoning
+systems that use PLMs as intermediate modules [64, 72, 32, 66, 56, 80] to generate reasoning steps
+(e.g., proofs). In contrast to these works, our method RECKONING dynamically encodes natural
+language knowledge into the model parameters through gradient updates, thereby reasoning by
+mixing contextual knowledge with pre-encoded parametric knowledge and allowing the model to
+determine a conclusion based on its updated parametric knowledge.
+Model Editing
+While our motivations are grounded in research on machine reasoning, our methods
+are more often used in the area of model editing. Model editing is a method to edit a model’s
+parameters to correct its errors or update the model. Several works propose hypernetwork-based
+methods to edit knowledge in a model by predicting updates conditioned on new factual statements
+[29] or transforming the gradients from new provided facts [52] to make local edits to a model. Other
+approaches focus on more direct edits of model behavior, such as directly modifying neuron outputs
+[18, 82], localizing distinct feed-forward layers that are responsible for factual recall, and modifying
+these weights [48], and performing weight updates across multiple layers to perform simultaneous
+edits [49]. Similarly, our method also rapidly edits the model parameters to add knowledge. However,
+our bi-level framework optimizes model edits for the reasoning task in the outer loop, allowing the
+model to learn to do fast memorization of knowledge that can support the model’s reasoning ability.
+Language Models as Knowledge Bases
+Our work learns to reason by dynamically encoding
+contextual knowledge in the parameters of language models before answering questions about
+them. Previous studies have found that LLMs can store real-world facts learned during pre-training
+[61, 10, 48, 9]. Learning these facts during pre-training allows language models to be prompted
+[55, 37, 68, 83] or adapted [7, 60, 35, 36] to produce these facts on-demand. However, LLM
+9
+
+knowledge is latent and hard to identify or control. The model generation is sensitive to speciﬁc
+words or phrases. LLMs emit knowledge encoded in the parameters only when prompted appropriately
+[54, 22, 17, 9]. It is also difﬁcult to inject or update knowledge for LLMs [48], and the memorization
+of knowledge in LLMs is not optimized toward their reasoning ability. In our work, we seek to
+ﬁnd a way to add knowledge to LLMs in a controllable and adaptive way that can be beneﬁcial to
+downstream reasoning applications.
+6
+Conclusion
+We present RECKONING, a bi-level learning framework for multi-hop reasoning that encodes knowl-
+edge verbalized using natural language into a model’s parameters through gradient updates. During
+training, the inner loop encodes the contextual knowledge into the model parameters by backpropa-
+gating a language modeling loss. In the outer loop, the model solves reasoning problems using the
+memorized knowledge given only the question as input. Through bi-level optimization, RECKONING
+ﬁnds a set of meta-parameters that allows it to perform quick knowledge-based updates for reasoning.
+Our experiments show that RECKONING learns to reason only by relying on its parametric knowledge
+after external knowledge has been encoded through gradient updates. Using a multi-task objective
+that co-optimizes reasoning and knowledge memorization in the outer loop, RECKONING outperforms
+in-context reasoning baselines that are trained to encode external knowledge as part of the context.
+Through our analysis, we show that RECKONING is more generalizable to problems with longer
+reasoning chains, less susceptible to irrelevant distractor knowledge, and that RECKONING is more
+efﬁcient than the baseline when answering multiple questions that require common knowledge.
+Acknowledgements
+We thank Shikhar Murty and Christopher Manning for helpful discussions in crafting ideas for this
+project. We also gratefully acknowledge the support of Innosuisse under PFFS-21-29, the EPFL
+Science Seed Fund, the EPFL Center for Imaging, Sony Group Corporation, and the Allen Institute
+for AI.
+References
+[1] Lasha Abzianidze. A tableau prover for natural logic and language. In Proceedings of the 2015
+Conference on Empirical Methods in Natural Language Processing, pages 2492–2502, Lisbon,
+Portugal, September 2015. Association for Computational Linguistics.
+[2] Lasha Abzianidze. LangPro: Natural language theorem prover. In Proceedings of the 2017
+Conference on Empirical Methods in Natural Language Processing: System Demonstrations,
+pages 115–120, Copenhagen, Denmark, September 2017. Association for Computational
+Linguistics.
+[3] Antreas Antoniou, Harrison Edwards, and Amos Storkey. How to train your MAML. In
+International Conference on Learning Representations, 2019.
+[4] Sungyong Baik, Myungsub Choi, Janghoon Choi, Heewon Kim, and Kyoung Mu Lee. Meta-
+learning with adaptive hyperparameters. ArXiv, abs/2011.00209, 2020.
+[5] Chandra Bhagavatula, Ronan Le Bras, Chaitanya Malaviya, Keisuke Sakaguchi, Ari Holtzman,
+Hannah Rashkin, Doug Downey, Scott Wen tau Yih, and Yejin Choi. Abductive commonsense
+reasoning, 2020.
+[6] Antoine Bosselut, Ronan Le Bras, , and Yejin Choi. Dynamic neuro-symbolic knowledge graph
+construction for zero-shot commonsense question answering. In Proceedings of the 35th AAAI
+Conference on Artiﬁcial Intelligence (AAAI), 2021.
+[7] Antoine Bosselut, Hannah Rashkin, Maarten Sap, Chaitanya Malaviya, Asli Celikyilmaz, and
+Yejin Choi. Comet: Commonsense transformers for automatic knowledge graph construction.
+In Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics,
+pages 4762–4779, 2019.
+10
+
+[8] Samuel R. Bowman, Christopher Potts, and Christopher D. Manning. Recursive neural networks
+can learn logical semantics. In Proceedings of the 3rd Workshop on Continuous Vector Space
+Models and their Compositionality, pages 12–21, Beijing, China, July 2015. Association for
+Computational Linguistics.
+[9] Nicholas Carlini, Daphne Ippolito, Matthew Jagielski, Katherine Lee, Florian Tramer, and
+Chiyuan Zhang. Quantifying memorization across neural language models. In The Eleventh
+International Conference on Learning Representations, 2023.
+[10] Nicholas Carlini, Florian Tramer, Eric Wallace, Matthew Jagielski, Ariel Herbert-Voss, Kather-
+ine Lee, Adam Roberts, Tom Brown, Dawn Song, Ulfar Erlingsson, Alina Oprea, and Colin
+Raffel. Extracting training data from large language models, 2021.
+[11] Carol Chen. Transformer inference arithmetic. https://kipp.ly/blog/transformer-inference-
+arithmetic/, 2022.
+[12] Zeming Chen and Qiyue Gao. Curriculum: A broad-coverage benchmark for linguistic phe-
+nomena in natural language understanding. In Proceedings of the 2022 Conference of the North
+American Chapter of the Association for Computational Linguistics: Human Language Tech-
+nologies, pages 3204–3219, Seattle, United States, July 2022. Association for Computational
+Linguistics.
+[13] Zeming Chen, Qiyue Gao, and Lawrence S. Moss. NeuralLog: Natural language inference with
+joint neural and logical reasoning. In Proceedings of *SEM 2021: The Tenth Joint Conference
+on Lexical and Computational Semantics, pages 78–88, Online, August 2021. Association for
+Computational Linguistics.
+[14] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, Parker
+Schuh, Kensen Shi, Sasha Tsvyashchenko, Joshua Maynez, Abhishek Rao, Parker Barnes,
+Yi Tay, Noam Shazeer, Vinodkumar Prabhakaran, Emily Reif, Nan Du, Ben Hutchinson,
+Reiner Pope, James Bradbury, Jacob Austin, Michael Isard, Guy Gur-Ari, Pengcheng Yin,
+Toju Duke, Anselm Levskaya, Sanjay Ghemawat, Sunipa Dev, Henryk Michalewski, Xavier
+Garcia, Vedant Misra, Kevin Robinson, Liam Fedus, Denny Zhou, Daphne Ippolito, David
+Luan, Hyeontaek Lim, Barret Zoph, Alexander Spiridonov, Ryan Sepassi, David Dohan, Shivani
+Agrawal, Mark Omernick, Andrew M. Dai, Thanumalayan Sankaranarayana Pillai, Marie Pellat,
+Aitor Lewkowycz, Erica Moreira, Rewon Child, Oleksandr Polozov, Katherine Lee, Zongwei
+Zhou, Xuezhi Wang, Brennan Saeta, Mark Diaz, Orhan Firat, Michele Catasta, Jason Wei,
+Kathy Meier-Hellstern, Douglas Eck, Jeff Dean, Slav Petrov, and Noah Fiedel. Palm: Scaling
+language modeling with pathways, 2022.
+[15] Manuel Ciosici, Joe Cecil, Dong-Ho Lee, Alex Hedges, Marjorie Freedman, and Ralph
+Weischedel. Perhaps PTLMs should go to school – a task to assess open book and closed
+book QA. In Proceedings of the 2021 Conference on Empirical Methods in Natural Language
+Processing, pages 6104–6111, Online and Punta Cana, Dominican Republic, November 2021.
+Association for Computational Linguistics.
+[16] Peter Clark, Oyvind Tafjord, and Kyle Richardson. Transformers as soft reasoners over language.
+In Christian Bessiere, editor, Proceedings of the Twenty-Ninth International Joint Conference on
+Artiﬁcial Intelligence, IJCAI-20, pages 3882–3890. International Joint Conferences on Artiﬁcial
+Intelligence Organization, 7 2020. Main track.
+[17] Jeff Da, Ronan Le Bras, Ximing Lu, Yejin Choi, and Antoine Bosselut. Analyzing commonsense
+emergence in few-shot knowledge models. In Proceedings of the Conference on Automated
+Knowledge Base Construction (AKBC), 2021.
+[18] Damai Dai, Li Dong, Yaru Hao, Zhifang Sui, Baobao Chang, and Furu Wei. Knowledge neurons
+in pretrained transformers. In Proceedings of the 60th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pages 8493–8502, Dublin, Ireland, May
+2022. Association for Computational Linguistics.
+[19] Bhavana Dalvi, Peter Jansen, Oyvind Tafjord, Zhengnan Xie, Hannah Smith, Leighanna Pi-
+patanangkura, and Peter Clark. Explaining answers with entailment trees. In Proceedings of the
+2021 Conference on Empirical Methods in Natural Language Processing, pages 7358–7370,
+Online and Punta Cana, Dominican Republic, November 2021. Association for Computational
+Linguistics.
+11
+
+[20] Jacob Devlin, Ming-Wei Chang, Kenton Lee, and Kristina Toutanova. BERT: Pre-training of
+deep bidirectional transformers for language understanding. In Proceedings of the 2019 Confer-
+ence of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies, Volume 1 (Long and Short Papers), pages 4171–4186, Minneapolis,
+Minnesota, June 2019. Association for Computational Linguistics.
+[21] Matthew Dunn, Levent Sagun, Mike Higgins, V. Ugur Guney, Volkan Cirik, and Kyunghyun
+Cho. Searchqa: A new q&a dataset augmented with context from a search engine, 2017.
+[22] Yanai Elazar, Nora Kassner, Shauli Ravfogel, Abhilasha Ravichander, Eduard Hovy, Hinrich
+Schütze, and Yoav Goldberg. Measuring and improving consistency in pretrained language
+models. Transactions of the Association for Computational Linguistics, 9:1012–1031, 2021.
+[23] Christopher Fifty, Ehsan Amid, Zhe Zhao, Tianhe Yu, Rohan Anil, and Chelsea Finn. Measuring
+and harnessing transference in multi-task learning, 2021.
+[24] Peter A. Flach and Antonis C. Kakas. Abductive and inductive reasoning: Background and
+issues. In Applied Logic Series, pages 1–27. Springer Netherlands, 2000.
+[25] Alexander Gaskell, Yishu Miao, Francesca Toni, and Lucia Specia. Logically consistent adver-
+sarial attacks for soft theorem provers. In Proceedings of the Thirty-First International Joint
+Conference on Artiﬁcial Intelligence. International Joint Conferences on Artiﬁcial Intelligence
+Organization, July 2022.
+[26] Vinod Goel, Gorka Navarrete, Ira A. Noveck, and Jérôme Prado. Editorial: The reasoning brain:
+The interplay between cognitive neuroscience and theories of reasoning. Frontiers in Human
+Neuroscience, 10, January 2017.
+[27] Nicolas Gontier, Koustuv Sinha, Siva Reddy, and Christopher Joseph Pal. Measuring systematic
+generalization in neural proof generation with transformers. ArXiv, abs/2009.14786, 2020.
+[28] Simeng Han, Hailey Schoelkopf, Yilun Zhao, Zhenting Qi, Martin Riddell, Luke Benson, Lucy
+Sun, Ekaterina Zubova, Yujie Qiao, Matthew Burtell, David Peng, Jonathan Fan, Yixin Liu,
+Brian Wong, Malcolm Sailor, Ansong Ni, Linyong Nan, Jungo Kasai, Tao Yu, Rui Zhang,
+Shaﬁq Joty, Alexander R. Fabbri, Wojciech Kryscinski, Xi Victoria Lin, Caiming Xiong, and
+Dragomir Radev. Folio: Natural language reasoning with ﬁrst-order logic, 2022.
+[29] Peter Hase, Mona Diab, Asli Celikyilmaz, Xian Li, Zornitsa Kozareva, Veselin Stoyanov, Mohit
+Bansal, and Srinivasan Iyer. Do language models have beliefs? methods for detecting, updating,
+and visualizing model beliefs, 2021.
+[30] Chadi Helwe, Chloé Clavel, and Fabian M. Suchanek. Reasoning with transformer-based mod-
+els: Deep learning, but shallow reasoning. In Danqi Chen, Jonathan Berant, Andrew McCallum,
+and Sameer Singh, editors, 3rd Conference on Automated Knowledge Base Construction, AKBC
+2021, Virtual, October 4-8, 2021, 2021.
+[31] Dan Hendrycks, Collin Burns, Steven Basart, Andy Zou, Mantas Mazeika, Dawn Song, and
+Jacob Steinhardt. Measuring massive multitask language understanding, 2021.
+[32] Ruixin Hong, Hongming Zhang, Xintong Yu, and Changshui Zhang. METGEN: A module-
+based entailment tree generation framework for answer explanation. In Findings of the Associ-
+ation for Computational Linguistics: NAACL 2022, pages 1887–1905, Seattle, United States,
+July 2022. Association for Computational Linguistics.
+[33] Hai Hu, Qi Chen, Kyle Richardson, Atreyee Mukherjee, Lawrence S. Moss, and Sandra Kuebler.
+MonaLog: a lightweight system for natural language inference based on monotonicity. In
+Proceedings of the Society for Computation in Linguistics 2020, pages 334–344, New York,
+New York, January 2020. Association for Computational Linguistics.
+[34] Zhiting Hu, Xuezhe Ma, Zhengzhong Liu, Eduard Hovy, and Eric Xing. Harnessing deep
+neural networks with logic rules. In Proceedings of the 54th Annual Meeting of the Association
+for Computational Linguistics (Volume 1: Long Papers), pages 2410–2420, Berlin, Germany,
+August 2016. Association for Computational Linguistics.
+[35] Jena D Hwang, Chandra Bhagavatula, Ronan Le Bras, Jeff Da, Keisuke Sakaguchi, Antoine
+Bosselut, and Yejin Choi. (comet-) atomic 2020: On symbolic and neural commonsense
+knowledge graphs. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, volume 35,
+pages 6384–6392, 2021.
+12
+
+[36] Liwei Jiang, Antoine Bosselut, Chandra Bhagavatula, and Yejin Choi. “I’m not mad”: Common-
+sense implications of negation and contradiction. In Proceedings of the 2021 Conference of the
+North American Chapter of the Association for Computational Linguistics: Human Language
+Technologies, pages 4380–4397, Online, June 2021. Association for Computational Linguistics.
+[37] Zhengbao Jiang, Frank F. Xu, Jun Araki, and Graham Neubig. How can we know what language
+models know? Transactions of the Association for Computational Linguistics, 8:423–438,
+2020.
+[38] Mandar Joshi, Eunsol Choi, Daniel Weld, and Luke Zettlemoyer. TriviaQA: A large scale
+distantly supervised challenge dataset for reading comprehension. In Proceedings of the 55th
+Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers),
+pages 1601–1611, Vancouver, Canada, July 2017. Association for Computational Linguistics.
+[39] Jaehun Jung, Lianhui Qin, Sean Welleck, Faeze Brahman, Chandra Bhagavatula, Ronan Le Bras,
+and Yejin Choi. Maieutic prompting: Logically consistent reasoning with recursive explana-
+tions. In Proceedings of the 2022 Conference on Empirical Methods in Natural Language
+Processing, pages 1266–1279, Abu Dhabi, United Arab Emirates, December 2022. Association
+for Computational Linguistics.
+[40] Tom Kwiatkowski, Jennimaria Palomaki, Olivia Redﬁeld, Michael Collins, Ankur Parikh, Chris
+Alberti, Danielle Epstein, Illia Polosukhin, Jacob Devlin, Kenton Lee, Kristina Toutanova, Llion
+Jones, Matthew Kelcey, Ming-Wei Chang, Andrew M. Dai, Jakob Uszkoreit, Quoc Le, and Slav
+Petrov. Natural questions: A benchmark for question answering research. Transactions of the
+Association for Computational Linguistics, 7:452–466, 2019.
+[41] Douglas B. Lenat, Mayank Prakash, and Mary Shepherd. Cyc: Using common sense knowledge
+to overcome brittleness and knowledge acquisition bottlenecks. AI Magazine, 6(4):65, Mar.
+1985.
+[42] Tao Li, Vivek Gupta, Maitrey Mehta, and Vivek Srikumar. A logic-driven framework for
+consistency of neural models. In Proceedings of the 2019 Conference on Empirical Methods
+in Natural Language Processing and the 9th International Joint Conference on Natural Lan-
+guage Processing (EMNLP-IJCNLP), pages 3924–3935, Hong Kong, China, November 2019.
+Association for Computational Linguistics.
+[43] Zhengzhong Liang, Steven Bethard, and Mihai Surdeanu. Explainable multi-hop verbal reason-
+ing through internal monologue. In Proceedings of the 2021 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language Technologies,
+pages 1225–1250, Online, June 2021. Association for Computational Linguistics.
+[44] Hanmeng Liu, Ruoxi Ning, Zhiyang Teng, Jian Liu, Qiji Zhou, and Yue Zhang. Evaluating the
+logical reasoning ability of chatgpt and gpt-4, 2023.
+[45] Ilya Loshchilov and Frank Hutter. Decoupled weight decay regularization. In International
+Conference on Learning Representations, 2017.
+[46] Bill MacCartney and Christopher D. Manning. Natural logic for textual inference. In Proceed-
+ings of the ACL-PASCAL Workshop on Textual Entailment and Paraphrasing, pages 193–200,
+Prague, June 2007. Association for Computational Linguistics.
+[47] Pascual Martínez-Gómez, Koji Mineshima, Yusuke Miyao, and Daisuke Bekki. On-demand
+injection of lexical knowledge for recognising textual entailment. In Proceedings of the 15th
+Conference of the European Chapter of the Association for Computational Linguistics: Volume
+1, Long Papers, pages 710–720, Valencia, Spain, April 2017. Association for Computational
+Linguistics.
+[48] Kevin Meng, David Bau, Alex J Andonian, and Yonatan Belinkov. Locating and editing factual
+associations in GPT. In Alice H. Oh, Alekh Agarwal, Danielle Belgrave, and Kyunghyun Cho,
+editors, Advances in Neural Information Processing Systems, 2022.
+[49] Kevin Meng, Arnab Sen Sharma, Alex J Andonian, Yonatan Belinkov, and David Bau. Mass-
+editing memory in a transformer. In The Eleventh International Conference on Learning
+Representations, 2023.
+[50] K. S. Metaxiotis, Dimitris Askounis, and John Psarras. Expert systems in production planning
+and scheduling: A state-of-the-art survey. Journal of Intelligent Manufacturing, 13(4):253–260,
+2002.
+13
+
+[51] Kostas S. Metaxiotis, Dimitris Askounis, and John E. Psarras. Expert systems in production
+planning and scheduling: A state-of-the-art survey. Journal of Intelligent Manufacturing,
+13:253–260, 2002.
+[52] Eric Mitchell, Charles Lin, Antoine Bosselut, Chelsea Finn, and Christopher D. Manning. Fast
+model editing at scale, 2021.
+[53] Stephen Muggleton and Luc de Raedt. Inductive logic programming: Theory and methods. The
+Journal of Logic Programming, 19-20:629–679, May 1994.
+[54] Fabio Petroni, Patrick Lewis, Aleksandra Piktus, Tim Rocktäschel, Yuxiang Wu, Alexander H.
+Miller, and Sebastian Riedel. How context affects language models’ factual predictions, 2020.
+[55] Fabio Petroni, Tim Rocktäschel, Sebastian Riedel, Patrick Lewis, Anton Bakhtin, Yuxiang Wu,
+and Alexander Miller. Language models as knowledge bases? In Proceedings of the 2019
+Conference on Empirical Methods in Natural Language Processing and the 9th International
+Joint Conference on Natural Language Processing (EMNLP-IJCNLP), pages 2463–2473, Hong
+Kong, China, November 2019. Association for Computational Linguistics.
+[56] Hanhao Qu, Yu Cao, Jun Gao, Liang Ding, and Ruifeng Xu. Interpretable proof generation via
+iterative backward reasoning. In Proceedings of the 2022 Conference of the North American
+Chapter of the Association for Computational Linguistics: Human Language Technologies,
+pages 2968–2981, Seattle, United States, July 2022. Association for Computational Linguistics.
+[57] Alec Radford, Jeff Wu, Rewon Child, David Luan, Dario Amodei, and Ilya Sutskever. Language
+models are unsupervised multitask learners. 2019.
+[58] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena,
+Yanqi Zhou, Wei Li, and Peter J. Liu. Exploring the limits of transfer learning with a uniﬁed
+text-to-text transformer, 2020.
+[59] Kyle Richardson and Ashish Sabharwal. Pushing the limits of rule reasoning in transformers
+through natural language satisﬁability. Proceedings of the AAAI Conference on Artiﬁcial
+Intelligence, 36(10):11209–11219, June 2022.
+[60] Adam Roberts, Colin Raffel, and Noam Shazeer. How much knowledge can you pack into
+the parameters of a language model? In Proceedings of the 2020 Conference on Empirical
+Methods in Natural Language Processing (EMNLP), pages 5418–5426, Online, November
+2020. Association for Computational Linguistics.
+[61] Anna Rogers, Olga Kovaleva, and Anna Rumshisky. A primer in BERTology: What we
+know about how BERT works. Transactions of the Association for Computational Linguistics,
+8:842–866, 2020.
+[62] Cynthia Rudin. Stop explaining black box machine learning models for high stakes decisions
+and use interpretable models instead. Nature Machine Intelligence, 1(5):206–215, May 2019.
+[63] Mohammed Saeed, Naser Ahmadi, Preslav Nakov, and Paolo Papotti. RuleBERT: Teaching
+soft rules to pre-trained language models. In Proceedings of the 2021 Conference on Empirical
+Methods in Natural Language Processing, pages 1460–1476, Online and Punta Cana, Dominican
+Republic, November 2021. Association for Computational Linguistics.
+[64] Swarnadeep Saha, Prateek Yadav, and Mohit Bansal. multiPRover: Generating multiple proofs
+for improved interpretability in rule reasoning. In Proceedings of the 2021 Conference of the
+North American Chapter of the Association for Computational Linguistics: Human Language
+Technologies, pages 3662–3677, Online, June 2021. Association for Computational Linguistics.
+[65] Soumya Sanyal, Zeyi Liao, and Xiang Ren. RobustLR: A diagnostic benchmark for evaluating
+logical robustness of deductive reasoners. In Proceedings of the 2022 Conference on Empirical
+Methods in Natural Language Processing, pages 9614–9631, Abu Dhabi, United Arab Emirates,
+December 2022. Association for Computational Linguistics.
+[66] Soumya Sanyal, Harman Singh, and Xiang Ren. FaiRR: Faithful and robust deductive reasoning
+over natural language. In Proceedings of the 60th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pages 1075–1093, Dublin, Ireland, May
+2022. Association for Computational Linguistics.
+[67] Freda Shi, Xinyun Chen, Kanishka Misra, Nathan Scales, David Dohan, Ed H. Chi, Nathanael
+Schärli, and Denny Zhou. Large language models can be easily distracted by irrelevant context.
+CoRR, abs/2302.00093, 2023.
+14
+
+[68] Taylor Shin, Yasaman Razeghi, Robert L. Logan IV, Eric Wallace, and Sameer Singh. Auto-
+Prompt: Eliciting Knowledge from Language Models with Automatically Generated Prompts.
+In Proceedings of the 2020 Conference on Empirical Methods in Natural Language Process-
+ing (EMNLP), pages 4222–4235, Online, November 2020. Association for Computational
+Linguistics.
+[69] Koustuv Sinha, Shagun Sodhani, Jin Dong, Joelle Pineau, and William L. Hamilton. CLUTRR:
+A diagnostic benchmark for inductive reasoning from text. In Proceedings of the 2019 Confer-
+ence on Empirical Methods in Natural Language Processing and the 9th International Joint
+Conference on Natural Language Processing (EMNLP-IJCNLP), pages 4506–4515, Hong Kong,
+China, November 2019. Association for Computational Linguistics.
+[70] Aarohi Srivastava, Abhinav Rastogi, Abhishek Rao, Abu Awal Md Shoeb, Abubakar Abid,
+Adam Fisch, Adam R. Brown, Adam Santoro, Aditya Gupta, Adrià Garriga-Alonso, Agnieszka
+Kluska, Aitor Lewkowycz, Akshat Agarwal, Alethea Power, Alex Ray, Alex Warstadt, Alexan-
+der W. Kocurek, Ali Safaya, Ali Tazarv, Alice Xiang, Alicia Parrish, Allen Nie, Aman Hussain,
+Amanda Askell, Amanda Dsouza, Ambrose Slone, Ameet Rahane, Anantharaman S. Iyer, An-
+ders Andreassen, Andrea Madotto, Andrea Santilli, Andreas Stuhlmüller, Andrew Dai, Andrew
+La, Andrew Lampinen, Andy Zou, Angela Jiang, Angelica Chen, Anh Vuong, Animesh Gupta,
+Anna Gottardi, Antonio Norelli, Anu Venkatesh, Arash Gholamidavoodi, Arfa Tabassum, Arul
+Menezes, Arun Kirubarajan, Asher Mullokandov, Ashish Sabharwal, Austin Herrick, Avia
+Efrat, Aykut Erdem, Ayla Karaka¸s, B. Ryan Roberts, Bao Sheng Loe, Barret Zoph, Bartłomiej
+Bojanowski, Batuhan Özyurt, Behnam Hedayatnia, Behnam Neyshabur, Benjamin Inden, Benno
+Stein, Berk Ekmekci, Bill Yuchen Lin, Blake Howald, Cameron Diao, Cameron Dour, Catherine
+Stinson, Cedrick Argueta, César Ferri Ramírez, Chandan Singh, Charles Rathkopf, Chenlin
+Meng, Chitta Baral, Chiyu Wu, Chris Callison-Burch, Chris Waites, Christian Voigt, Christo-
+pher D. Manning, Christopher Potts, Cindy Ramirez, Clara E. Rivera, Clemencia Siro, Colin
+Raffel, Courtney Ashcraft, Cristina Garbacea, Damien Sileo, Dan Garrette, Dan Hendrycks, Dan
+Kilman, Dan Roth, Daniel Freeman, Daniel Khashabi, Daniel Levy, Daniel Moseguí González,
+Danielle Perszyk, Danny Hernandez, Danqi Chen, Daphne Ippolito, Dar Gilboa, David Dohan,
+David Drakard, David Jurgens, Debajyoti Datta, Deep Ganguli, Denis Emelin, Denis Kleyko,
+Deniz Yuret, Derek Chen, Derek Tam, Dieuwke Hupkes, Diganta Misra, Dilyar Buzan, Dim-
+itri Coelho Mollo, Diyi Yang, Dong-Ho Lee, Ekaterina Shutova, Ekin Dogus Cubuk, Elad Segal,
+Eleanor Hagerman, Elizabeth Barnes, Elizabeth Donoway, Ellie Pavlick, Emanuele Rodola,
+Emma Lam, Eric Chu, Eric Tang, Erkut Erdem, Ernie Chang, Ethan A. Chi, Ethan Dyer, Ethan
+Jerzak, Ethan Kim, Eunice Engefu Manyasi, Evgenii Zheltonozhskii, Fanyue Xia, Fatemeh Siar,
+Fernando Martínez-Plumed, Francesca Happé, Francois Chollet, Frieda Rong, Gaurav Mishra,
+Genta Indra Winata, Gerard de Melo, Germán Kruszewski, Giambattista Parascandolo, Giorgio
+Mariani, Gloria Wang, Gonzalo Jaimovitch-López, Gregor Betz, Guy Gur-Ari, Hana Galijase-
+vic, Hannah Kim, Hannah Rashkin, Hannaneh Hajishirzi, Harsh Mehta, Hayden Bogar, Henry
+Shevlin, Hinrich Schütze, Hiromu Yakura, Hongming Zhang, Hugh Mee Wong, Ian Ng, Isaac
+Noble, Jaap Jumelet, Jack Geissinger, Jackson Kernion, Jacob Hilton, Jaehoon Lee, Jaime Fer-
+nández Fisac, James B. Simon, James Koppel, James Zheng, James Zou, Jan Koco´n, Jana
+Thompson, Jared Kaplan, Jarema Radom, Jascha Sohl-Dickstein, Jason Phang, Jason Wei, Jason
+Yosinski, Jekaterina Novikova, Jelle Bosscher, Jennifer Marsh, Jeremy Kim, Jeroen Taal, Jesse
+Engel, Jesujoba Alabi, Jiacheng Xu, Jiaming Song, Jillian Tang, Joan Waweru, John Burden,
+John Miller, John U. Balis, Jonathan Berant, Jörg Frohberg, Jos Rozen, Jose Hernandez-Orallo,
+Joseph Boudeman, Joseph Jones, Joshua B. Tenenbaum, Joshua S. Rule, Joyce Chua, Kamil
+Kanclerz, Karen Livescu, Karl Krauth, Karthik Gopalakrishnan, Katerina Ignatyeva, Katja
+Markert, Kaustubh D. Dhole, Kevin Gimpel, Kevin Omondi, Kory Mathewson, Kristen Chia-
+fullo, Ksenia Shkaruta, Kumar Shridhar, Kyle McDonell, Kyle Richardson, Laria Reynolds, Leo
+Gao, Li Zhang, Liam Dugan, Lianhui Qin, Lidia Contreras-Ochando, Louis-Philippe Morency,
+Luca Moschella, Lucas Lam, Lucy Noble, Ludwig Schmidt, Luheng He, Luis Oliveros Colón,
+Luke Metz, LütﬁKerem ¸Senel, Maarten Bosma, Maarten Sap, Maartje ter Hoeve, Maheen
+Farooqi, Manaal Faruqui, Mantas Mazeika, Marco Baturan, Marco Marelli, Marco Maru, Maria
+Jose Ramírez Quintana, Marie Tolkiehn, Mario Giulianelli, Martha Lewis, Martin Potthast,
+Matthew L. Leavitt, Matthias Hagen, Mátyás Schubert, Medina Orduna Baitemirova, Melody
+Arnaud, Melvin McElrath, Michael A. Yee, Michael Cohen, Michael Gu, Michael Ivanitskiy,
+Michael Starritt, Michael Strube, Michał Sw˛edrowski, Michele Bevilacqua, Michihiro Yasunaga,
+Mihir Kale, Mike Cain, Mimee Xu, Mirac Suzgun, Mo Tiwari, Mohit Bansal, Moin Aminnaseri,
+15
+
+Mor Geva, Mozhdeh Gheini, Mukund Varma T, Nanyun Peng, Nathan Chi, Nayeon Lee, Neta
+Gur-Ari Krakover, Nicholas Cameron, Nicholas Roberts, Nick Doiron, Nikita Nangia, Niklas
+Deckers, Niklas Muennighoff, Nitish Shirish Keskar, Niveditha S. Iyer, Noah Constant, Noah
+Fiedel, Nuan Wen, Oliver Zhang, Omar Agha, Omar Elbaghdadi, Omer Levy, Owain Evans,
+Pablo Antonio Moreno Casares, Parth Doshi, Pascale Fung, Paul Pu Liang, Paul Vicol, Pegah
+Alipoormolabashi, Peiyuan Liao, Percy Liang, Peter Chang, Peter Eckersley, Phu Mon Htut,
+Pinyu Hwang, Piotr Miłkowski, Piyush Patil, Pouya Pezeshkpour, Priti Oli, Qiaozhu Mei, Qing
+Lyu, Qinlang Chen, Rabin Banjade, Rachel Etta Rudolph, Raefer Gabriel, Rahel Habacker,
+Ramón Risco Delgado, Raphaël Millière, Rhythm Garg, Richard Barnes, Rif A. Saurous, Riku
+Arakawa, Robbe Raymaekers, Robert Frank, Rohan Sikand, Roman Novak, Roman Sitelew,
+Ronan LeBras, Rosanne Liu, Rowan Jacobs, Rui Zhang, Ruslan Salakhutdinov, Ryan Chi, Ryan
+Lee, Ryan Stovall, Ryan Teehan, Rylan Yang, Sahib Singh, Saif M. Mohammad, Sajant Anand,
+Sam Dillavou, Sam Shleifer, Sam Wiseman, Samuel Gruetter, Samuel R. Bowman, Samuel S.
+Schoenholz, Sanghyun Han, Sanjeev Kwatra, Sarah A. Rous, Sarik Ghazarian, Sayan Ghosh,
+Sean Casey, Sebastian Bischoff, Sebastian Gehrmann, Sebastian Schuster, Sepideh Sadeghi,
+Shadi Hamdan, Sharon Zhou, Shashank Srivastava, Sherry Shi, Shikhar Singh, Shima Asaadi,
+Shixiang Shane Gu, Shubh Pachchigar, Shubham Toshniwal, Shyam Upadhyay, Shyamolima,
+Debnath, Siamak Shakeri, Simon Thormeyer, Simone Melzi, Siva Reddy, Sneha Priscilla
+Makini, Soo-Hwan Lee, Spencer Torene, Sriharsha Hatwar, Stanislas Dehaene, Stefan Divic,
+Stefano Ermon, Stella Biderman, Stephanie Lin, Stephen Prasad, Steven T. Piantadosi, Stuart M.
+Shieber, Summer Misherghi, Svetlana Kiritchenko, Swaroop Mishra, Tal Linzen, Tal Schuster,
+Tao Li, Tao Yu, Tariq Ali, Tatsu Hashimoto, Te-Lin Wu, Théo Desbordes, Theodore Roth-
+schild, Thomas Phan, Tianle Wang, Tiberius Nkinyili, Timo Schick, Timofei Kornev, Timothy
+Telleen-Lawton, Titus Tunduny, Tobias Gerstenberg, Trenton Chang, Trishala Neeraj, Tushar
+Khot, Tyler Shultz, Uri Shaham, Vedant Misra, Vera Demberg, Victoria Nyamai, Vikas Raunak,
+Vinay Ramasesh, Vinay Uday Prabhu, Vishakh Padmakumar, Vivek Srikumar, William Fedus,
+William Saunders, William Zhang, Wout Vossen, Xiang Ren, Xiaoyu Tong, Xinran Zhao, Xinyi
+Wu, Xudong Shen, Yadollah Yaghoobzadeh, Yair Lakretz, Yangqiu Song, Yasaman Bahri, Yejin
+Choi, Yichi Yang, Yiding Hao, Yifu Chen, Yonatan Belinkov, Yu Hou, Yufang Hou, Yuntao Bai,
+Zachary Seid, Zhuoye Zhao, Zijian Wang, Zijie J. Wang, Zirui Wang, and Ziyi Wu. Beyond the
+imitation game: Quantifying and extrapolating the capabilities of language models, 2022.
+[71] Oyvind Tafjord, Bhavana Dalvi, and Peter Clark. ProofWriter: Generating implications, proofs,
+and abductive statements over natural language. In Findings of the Association for Computa-
+tional Linguistics: ACL-IJCNLP 2021, pages 3621–3634, Online, August 2021. Association for
+Computational Linguistics.
+[72] Oyvind Tafjord, Bhavana Dalvi Mishra, and Peter Clark. Entailer: Answering questions with
+faithful and truthful chains of reasoning. In Proceedings of the 2022 Conference on Empirical
+Methods in Natural Language Processing, pages 2078–2093, Abu Dhabi, United Arab Emirates,
+December 2022. Association for Computational Linguistics.
+[73] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez,
+Ł ukasz Kaiser, and Illia Polosukhin. Attention is all you need. In I. Guyon, U. Von Luxburg,
+S. Bengio, H. Wallach, R. Fergus, S. Vishwanathan, and R. Garnett, editors, Advances in Neural
+Information Processing Systems, volume 30. Curran Associates, Inc., 2017.
+[74] Xinyi Wang, Yulia Tsvetkov, and Graham Neubig. Balancing training for multilingual neural
+machine translation. In Proceedings of the 58th Annual Meeting of the Association for Com-
+putational Linguistics, pages 8526–8537, Online, July 2020. Association for Computational
+Linguistics.
+[75] Zirui Wang, Zachary C. Lipton, and Yulia Tsvetkov. On negative interference in multilingual
+models: Findings and a meta-learning treatment. In Proceedings of the 2020 Conference on
+Empirical Methods in Natural Language Processing (EMNLP), pages 4438–4450, Online,
+November 2020. Association for Computational Linguistics.
+[76] Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony
+Moi, Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, Joe Davison, Sam Shleifer,
+Patrick von Platen, Clara Ma, Yacine Jernite, Julien Plu, Canwen Xu, Teven Le Scao, Sylvain
+Gugger, Mariama Drame, Quentin Lhoest, and Alexander M. Rush. Huggingface’s transformers:
+State-of-the-art natural language processing, 2020.
+16
+
+[77] Hitomi Yanaka, Koji Mineshima, Daisuke Bekki, and Kentaro Inui. Do neural models learn
+systematicity of monotonicity inference in natural language? In Proceedings of the 58th Annual
+Meeting of the Association for Computational Linguistics, pages 6105–6117, Online, July 2020.
+Association for Computational Linguistics.
+[78] Hitomi Yanaka, Koji Mineshima, Pascual Martínez-Gómez, and Daisuke Bekki. Acquisition of
+phrase correspondences using natural deduction proofs. In Proceedings of the 2018 Conference
+of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies, Volume 1 (Long Papers), pages 756–766, New Orleans, Louisiana,
+June 2018. Association for Computational Linguistics.
+[79] Kaiyu Yang, Jia Deng, and Danqi Chen. Generating natural language proofs with veriﬁer-guided
+search. In Proceedings of the 2022 Conference on Empirical Methods in Natural Language
+Processing, pages 89–105, Abu Dhabi, United Arab Emirates, December 2022. Association for
+Computational Linguistics.
+[80] Kaiyu Yang, Jia Deng, and Danqi Chen. Generating natural language proofs with veriﬁer-guided
+search, 2022.
+[81] Zonglin Yang, Xinya Du, Rui Mao, Jinjie Ni, and Erik Cambria. Logical reasoning over natural
+language as knowledge representation: A survey, 2023.
+[82] Yunzhi Yao, Shaohan Huang, Li Dong, Furu Wei, Huajun Chen, and Ningyu Zhang. Kformer:
+Knowledge injection in transformer feed-forward layers, 2022.
+[83] Wenhao Yu, Dan Iter, Shuohang Wang, Yichong Xu, Mingxuan Ju, Soumya Sanyal, Chen-
+guang Zhu, Michael Zeng, and Meng Jiang. Generate rather than retrieve: Large language
+models are strong context generators. In The Eleventh International Conference on Learning
+Representations, 2023.
+17
+
+A
+Dataset
+ProofWriter
+The ProofWriter [71] dataset has 500k pairs of questions, answers, and proofs over
+natural-language rule bases. Each example in the dataset contains a set of facts, a set of rules, a
+hypothesis, and a label indicating whether the hypothesis is true, false, or unknown. The dataset
+comprise ﬁve datasets named D0, D1, D2, D3, D5, each with 100k examples. Each dataset’s questions
+require reasoning up to depths D (D = 0, 1, 2, 3, 5) to determine their answers. In our experiments,
+we only focus on the datasets that require more reasoning depths (D2, D3, D5). We show an example
+from the dataset in Table 5. In these datasets, a set of facts and rules are mapped to 18 questions,
+where the questions can be answered based on a subset of the facts and rules. Thus, some of the
+facts or rules can be irrelevant to some questions, and we call them distractors in Section 4.2. In the
+experiment for knowledge encoding with distractors, we encode all the facts in the model parameters
+and evaluate its ability to reproduce and reason over the correct facts. We show an example of
+distractor and relevant knowledge of a question in Table 7
+CLUTRR-SG
+The CLUTRR-SG [27] is an evaluation dataset for inductive reasoning on family
+relations adapted from the [69] dataset for measuring systematic generalization. Each example in
+the dataset contains (i) a set of facts representing a family graph G = (V, E) where nodes (V ) are
+entities and edges (E) are the relationships. (ii) a question asking the relationship between two
+entities (v1, vn ∈V ), and (iii) a target relationship e∗∈E as the answer for the question. The facts
+are expressed as a list of (vi, ej, vk) tuples. The two entities in the question are separated by more
+than one hop in the graph. There are 272 unique entities, 20 relationship types, and nearly 1.5M
+possible facts in the dataset. Following the authors, we deﬁne the difﬁculty of examples based on the
+number of family graph edges (i.e., the number of reasoning hops required to determine a relation),
+in which k edges (k-hop) correspond to k facts. We show an example from the dataset in Table 6.
+B
+In-context Reasoning with Distractors
+To motivate the advantage of RECKONING on mitigating interference from distractors, we analyze the
+performance change of ﬁne-tuned in-context reasoning with and without distractors present in the con-
+text of the questions. We deﬁne distractors as additional facts or rules present in a question’s context
+that is not directly relevant to the questions. A model should not be able to use only these distractors to
+answer a question correctly. For an example of distractors in a question’s context, please see Table 7.
+Identiﬁer
+Content
+fact 1
+Harry is nice.
+fact 2
+Fiona is quite Nice.
+fact 3
+Fiona is round.
+fact 4
+Fiona is white.
+fact 5
+Dave is furry.
+fact 6
+Charlie is white.
+rule 1
+Furry people are green.
+rule 2
+Round, green people are red.
+rule 3
+All red people are white.
+rule 4
+Nice, round people are furry.
+rule 5
+If someone is nice, then they are round.
+rule 6
+If Charlie is round and Charlie is nice, then Charlie is white.
+question-answer 1
+Harry is red? True
+question-answer 2
+Harry is not red? False
+question-answer 3
+Dave is not white? Unknown
+Table 5: An example from the dataset ProofWriter. There are 6 facts and 6 rules mapped to three
+question-answer pairs. Each question can be answered based on the given facts and rules.
+18
+
+Identiﬁer
+Content
+fact 1
+C is H’s father.
+fact 2
+Z is J’s aunt.
+fact 3
+J is S’s daughter.
+fact 4
+D is C’s father
+fact 5
+S is B’s father.
+fact 6
+H is Z’s son.
+question-answer 1
+How are D and B related to each other? Grandfather
+Table 6: An example of 6-hop reasoning from the CLUTRR-SG dataset.
+Identiﬁer
+Content
+fact 1
+Harry is nice.
+fact 2
+Fiona is quite Nice.
+fact 3
+Fiona is round.
+fact 4
+Fiona is white.
+fact 5
+Dave is furry.
+fact 6
+Charlie is white.
+rule 1
+Furry people are green.
+rule 2
+Round, green people are red.
+rule 3
+All red people are white.
+rule 4
+Nice, round people are furry.
+rule 5
+If someone is nice, then they are round.
+rule 6
+If Charlie is round and Charlie is nice, then Charlie is white.
+question-answer 1
+Harry is red? True
+Table 7: Example of distractors (black) and relevant knowledge (red) in the ProofWriter dataset.
+98.3
+99.4
+75.1
+70.8
+40
+60
+80
+100
+FT-ICR
+FT-ICR-MT
+Label Accuracy
+FT-ICR With vs. Without All Distractors
+Without
+With
+Figure 7: Label accuracy of ﬁne-tuned in-context
+reasoning on questions with and without distractors
+in the context. With the same questions, adding dis-
+tractors to contexts signiﬁcantly lower the perfor-
+mance of in-context reasoning, both in the single-
+task and multi-task setting.
+We evaluate the baseline on the ProofWriter
+dataset since it naturally contains contexts in-
+cluding distractors (Table 7). Recall that we
+have two training objectives. The single-task
+objective only trains the model to predict an an-
+swer for each question given their contexts. The
+multi-task objective (MT) trains the model to not
+only predict an answer but also reproduce the
+correct facts and rules (in contrast to distractors)
+based on the contexts. We evaluate the baseline
+on 2, 3, and 5-hop datasets with both training
+objectives, and we report the average label ac-
+curacy across hops in Figure 7. Compared to
+the baseline’s performance without distractors
+in the context, the performance with distractors
+decreases signiﬁcantly. For single-task, the per-
+formance drops 23.2% when adding distractors
+to the contexts, and the performance with the multi-task objective drops 28.6%. The results highlight
+in-context reasoning’s high sensitivity to the interference of irrelevant information in the contexts.
+C
+Implementation Details
+We select GPT-2-base [57] as the model for our method and all the baselines. We use the version
+implemented by the Huggingface Transformers library [76]. All the experiments for RECKONING
+19
+
+are conducted on a cluster with NVIDIA A100 (40GB) GPUs. All the baseline experiments are
+conducted on a local machine with NVIDIA RTX 3090 GPU (24GB).
+Fine-tuned In-context Reasoning
+We set the train batch size to 16 and train the model for 6
+epochs with early stopping based on the validation label accuracy. We set the learning rate to 3e-5
+and use the AdamW optimizer with ϵ set to 1e-8. We validate the model on the development set for
+every epoch and select the best checkpoint using the validation accuracy as the metric.
+RECKONING
+In the inner loop, we generally perform 4 gradient steps for lower-hop questions (2,
+3, 4-hop) and 5 gradient steps for higher-hop questions (5 and 6-hop). We select the AdamW [45] as
+the optimizer for the inner loop since the main task is language modeling. The inner-loop learning
+rate is set to 3e-5 before training and the algorithm dynamically learns a set of optimal learning rates
+when converged. In our experiments and analysis, we only report the results from RECKONING with
+a multi-task objective since its performance is better than the single-task objective. In the outer loop,
+we also use the AdamW with a learning rate of 3e-5. For both optimizers, we set ϵ to 1e-8. We set
+the train batch size to 2 due to memory limitations. We apply the technique of gradient accumulation
+and set the accumulation step to 2. We train the model for 6 epochs with early stopping. For each
+epoch, we validate the model twice: once in the middle and once at the end. We select the best model
+checkpoint based on the validation label accuracy.
+D
+Adaptive Learning Rate
+Prior works [3, 4] show that a ﬁxed learning rate shared across steps and across parameters does not
+beneﬁt the generalization performance of the system. Instead, [3] recommend learning a learning rate
+for each layer of the network and for each adaptation step in the inner loop. The layer parameters
+have the freedom to learn to adjust the learning rates at each step. To control the learning rate α in
+the inner loop adaptively, we deﬁne α as a set of adjustable variable: α = {α0, α1, ...αL}, where L
+is the number of layers and for every l = 0, ..., L, αl is a vector with N elements given a pre-deﬁned
+inner loop step number N. The inner loop update equation then becomes
+ˆθK
+n+1,l = ˆθK
+n,l −α(l)
+n ⊙∇LCLM(f ˆθK
+n , K)
+(6)
+where ⊙is an element-wise product and ˆθ(l)
+n is the parameters for layer l at the inner step n. We
+learn the set of optimal inner loop learning rates α∗by optimizing the parameters in the outer loop:
+α ←α −η∇1
+|Di|
+X
+(K,x,y)∈Di
+LTotal(f ˆθK
+[ θi]N(x), y),
+(7)
+where η is the outer loop learning rate and ˆθ is the updated parameters from inner loop. Below, we
+show the ﬁnal algorithm of RECKONING in Algorithm 2.
+Algorithm 2 Dynamic Knowledge Encoding for Reasoning
+Require: An example distribution p(D), a transformer language model f, initial meta-parameters θ, outer step
+size η, initial inner step size α, inner loop length N.
+1: while not converged do
+▷outer loop
+2:
+Sample D′ ∼p(D)
+3:
+LD′ ←0
+4:
+for each (K, x, y) ∈D′ do
+5:
+Initialize ˆθK
+0 = θ
+6:
+for n := 0 to N −1 do
+▷inner loop
+7:
+ˆθK
+n+1 ←ˆθK
+n −α ⊙∇LCLM(f ˆθK
+n , K)
+8:
+end for
+9:
+LD′ ←LD′ + LTotal(f ˆθK
+N , K, x, y)
+10:
+end for
+11:
+α ←α −η∇LD′
+▷Update inner step size
+12:
+θ ←θ −η∇LD′
+13: end while
+20
+
+81.5
+50.5
+45.2
+99
+96
+84.7
+40
+60
+80
+100
+2-hop
+4-hop
+6-hop
+Label Accuracy (%)
+Dynamic LR vs. Static LR
+LR-fix
+LR-dyna
+Figure 8: We study how much the dynamic
+learning rate in the inner loop contributes to
+the outer loop performance. We ﬁx all the hy-
+perparameters except the option of using the
+dynamic or ﬁxed learning rate. We conduct
+the analysis using the CLUTRR-SG dataset
+since it is more complex and difﬁcult (lower
+random performance).
+Are dynamic learning rates necessary for RECK-
+ONING’s performance?
+Following prior works on
+meta-learning [3, 4], we dynamically learn a set of
+per-step-per-layer learning rates for RECKONING.
+In this ablation study, we analyze whether dynamic
+learning rates for the inner loop are effective in im-
+proving the outer loop reasoning performance. Sim-
+ilarly, we ﬁx other experimental settings and set the
+number of inner loop steps to 4. As Figure 8 shows,
+when using a static learning rate (i.e., all layers and
+inner loop steps share a constant learning rate), the
+performance drops by a large margin (average drop
+of 34.2%). The performance drop becomes more sig-
+niﬁcant on questions requiring more reasoning hops
+(45.5% drop for 4-hop and 39.5% drop for 6-hop),
+demonstrating the importance of using a dynamic
+learning rate in the inner loop of our framework.
+21
+

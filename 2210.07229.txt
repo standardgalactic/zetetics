@@ -1,0 +1,1863 @@
+Published as a conference paper at ICLR 2023
+MASS-EDITING MEMORY IN A TRANSFORMER
+Kevin Meng1,2
+Arnab Sen Sharma2
+Alex Andonian1
+Yonatan Belinkov† 3
+David Bau2
+1MIT CSAIL
+2Northeastern University
+3Technion – IIT
+ABSTRACT
+Recent work has shown exciting promise in updating large language models with
+new memories, so as to replace obsolete information or add specialized knowledge.
+However, this line of work is predominantly limited to updating single associations.
+We develop MEMIT, a method for directly updating a language model with many
+memories, demonstrating experimentally that it can scale up to thousands of
+associations for GPT-J (6B) and GPT-NeoX (20B), exceeding prior work by orders
+of magnitude. Our code and data are at memit.baulab.info.
+1
+INTRODUCTION
+How many memories can we add to a deep network by directly editing its weights?
+Although large autoregressive language models (Radford et al., 2019; Brown et al., 2020; Wang &
+Komatsuzaki, 2021; Black et al., 2022) are capable of recalling an impressive array of common facts
+such as “Tim Cook is the CEO of Apple” or “Polaris is in the constellation Ursa Minor” (Petroni et al.,
+2020; Brown et al., 2020), even very large models are known to lack more specialized knowledge,
+and they may recall obsolete information if not updated periodically (Lazaridou et al., 2021; Agarwal
+& Nenkova, 2022; Liska et al., 2022). The ability to maintain fresh and customizable information is
+desirable in many application domains, such as question answering, knowledge search, and content
+generation. For example, we might want to keep search models updated with breaking news and
+recently-generated user feedback. In other situations, authors or companies may wish to customize
+models with specific knowledge about their creative work or products. Because re-training a large
+model can be prohibitive (Patterson et al., 2021) we seek methods that can update knowledge directly.
+To that end, several knowledge-editing methods have been proposed to insert new memories directly
+into specific model parameters. The approaches include constrained fine-tuning (Zhu et al., 2020),
+hypernetwork knowledge editing (De Cao et al., 2021; Hase et al., 2021; Mitchell et al., 2021; 2022),
+and rank-one model editing (Meng et al., 2022). However, this body of work is typically limited to
+updating at most a few dozen facts; a recent study evaluates on a maximum of 75 (Mitchell et al.,
+2022) whereas others primarily focus on single-edit cases. In practical settings, we may wish to
+MEMIT
+plays sport
+plays sport
+plays sport
+Tony
+Meola
+Olga
+Færseth
+Michael
+Jordan
+Baseball
+Soccer
+Basketball
+located in
+located in
+Eiffel
+Tower
+Space
+Needle
+Paris
+Seattle
+s
+o
+r
+(a) Unedited GPT
+plays sport
+Tony
+Meola
+Olga
+Færseth
+Michael
+Jordan
+Baseball
+Soccer
+Basketball
+located in
+Eiffel
+Tower
+Space
+Needle
+Paris
+Seattle
+s
+o
+r
+(b) Modified GPT
+(c) Scaling MEMIT to 10,000 Edits
+…
+…
+Figure 1: MEMIT is capable of updating thousands of memories at once. (a) Language models can
+be viewed as knowledge bases containing memorized tuples (s, r, o), each connecting some subject s to an
+object o via a relation r, e.g., (s = Michael Jordan, r = plays sport, o = basketball). (b) MEMIT modifies
+transformer weights to edit memories, e.g., “Michael Jordan now plays the sport baseball,” while (c) maintaining
+generalization, specificity, and fluency at scales beyond other methods. As Section 5.2.2 details, editing score is
+the harmonic mean of efficacy, generalization, and specificity metrics.
+†Supported by the Viterbi Fellowship in the Center for Computer Engineering at the Technion.
+Correspondence to mengk@mit.edu, davidbau@northeastern.edu.
+1
+arXiv:2210.07229v2  [cs.CL]  1 Aug 2023
+
+Published as a conference paper at ICLR 2023
+update a model with hundreds or thousands of facts simultaneously, but a naive sequential application
+of current state-of-the-art knowledge-editing methods fails to scale up (Section 5.2).
+We propose MEMIT, a scalable multi-layer update algorithm that uses explicitly calculated parameter
+updates to insert new memories. Inspired by the ROME direct editing method (Meng et al., 2022),
+MEMIT targets the weights of transformer modules that we determine to be causal mediators of
+factual knowledge recall. Experiments on GPT-J (6B parameters; Wang & Komatsuzaki 2021)
+and GPT-NeoX (20B; Black et al. 2022) demonstrate that MEMIT can scale and successfully
+store thousands of memories in bulk. We analyze model behavior when inserting true facts,
+counterfactuals, 27 specific relations, and different mixed sets of memories. In each setting, we
+measure robustness in terms of generalization, specificity, and fluency while comparing the scaling of
+MEMIT to rank-one, hypernetwork, and fine-tuning baselines.
+2
+RELATED WORK
+Scalable knowledge bases. The representation of world knowledge is a core problem in artificial
+intelligence (Richens, 1956; Minsky, 1974), classically tackled by constructing knowledge bases of
+real-world concepts. Pioneering hand-curated efforts (Lenat, 1995; Miller, 1995) have been followed
+by web-powered knowledge graphs (Auer et al., 2007; Bollacker et al., 2007; Suchanek et al., 2007;
+Havasi et al., 2007; Carlson et al., 2010; Dong et al., 2014; Vrandeˇci´c & Krötzsch, 2014; Bosselut
+et al., 2019) that extract knowledge from large-scale sources. Structured knowledge bases can be
+precisely queried, measured, and updated (Davis et al., 1993), but they are limited by sparse coverage
+of uncatalogued knowledge, such as commonsense facts (Weikum, 2021).
+Language models as knowledge bases. Since LLMs can answer natural-language queries about
+real-world facts, it has been proposed that they could be used directly as knowledge bases (Petroni
+et al., 2019; Roberts et al., 2020; Jiang et al., 2020; Shin et al., 2020). However, LLM knowledge
+is only implicit; responses are sensitive to specific phrasings of the prompt (Elazar et al., 2021;
+Petroni et al., 2020), and it remains difficult to catalog, add, or update knowledge (AlKhamissi et al.,
+2022). Nevertheless, LLMs are promising because they scale well and are unconstrained by a fixed
+schema (Safavi & Koutra, 2021). In this paper, we take on the update problem, asking how the
+implicit knowledge encoded within model parameters can be mass-edited.
+Hypernetwork knowledge editors. Several meta-learning methods have been proposed to edit
+knowledge in a model. Sinitsin et al. (2019) proposes a training objective to produce models amenable
+to editing by gradient descent. De Cao et al. (2021) proposes a Knowledge Editor (KE) hypernetwork
+that edits a standard model by predicting updates conditioned on new factual statements. In a study
+of KE, Hase et al. (2021) find that it fails to scale beyond a few edits, and they scale an improved
+objective to 10 beliefs. MEND (Mitchell et al., 2021) also adopts meta-learning, inferring weight
+updates from the gradient of the inserted fact. To scale their method, Mitchell et al. (2022) proposes
+SERAC, a system that routes rewritten facts through a different set of parameters while keeping the
+original weights unmodified; they demonstrate scaling up to 75 edits. Rather than meta-learning, our
+method employs direct parameter updates based on an explicitly computed mapping.
+Direct model editing. Our work most directly builds upon efforts to localize and understand the
+internal mechanisms within LLMs (Elhage et al., 2021; Dar et al., 2022). Based on observations from
+Geva et al. (2021; 2022) that transformer MLP layers serve as key–value memories, we narrow our
+focus to them. We then employ causal mediation analysis (Pearl, 2001; Vig et al., 2020; Meng et al.,
+2022), which implicates a specific range of layers in recalling factual knowledge. Previously, Dai
+et al. (2022) and Yao et al. (2022) have proposed editing methods that alter sparse sets of neurons, but
+we adopt the classical view of a linear layer as an associative memory (Anderson, 1972; Kohonen,
+1972). Our method is closely related to Meng et al. (2022), which also updates GPT as an explicit
+associative memory. Unlike the single-edit approach taken in that work, we modify a sequence of
+layers and develop a way for thousands of modifications to be performed simultaneously.
+3
+PRELIMINARIES: LANGUAGE MODELING AND MEMORY EDITING
+The goal of MEMIT is to modify factual associations stored in the parameters of an autoregressive
+LLM. Such models generate text by iteratively sampling from a conditional token distribution
+2
+
+Published as a conference paper at ICLR 2023
+P
+
+x[t] | x[1], . . . , x[E]
+
+parameterized by a D-layer transformer decoder, G (Vaswani et al., 2017):
+P
+
+x[t] | x[1], . . . , x[E]
+
+≜G([x[1], . . . , x[E]]) = softmax
+
+WyhD
+[E]
+
+,
+(1)
+where hD
+[E] is the transformer’s hidden state representation at the final layer D and ending token E.
+This state is computed using the following recursive relation:
+hl
+[t](x) = hl−1
+[t] (x) + al
+[t](x) + ml
+[t](x)
+(2)
+where al = attnl 
+hl−1
+[1] , hl−1
+[2] , . . . , hl−1
+[t]
+
+(3)
+ml
+[t] = W l
+out σ
+
+W l
+inγ
+
+hl−1
+[t]
+
+,
+(4)
+h0
+[t](x) is the embedding of token x[t], and γ is layernorm. Note that we have written attention and
+MLPs in parallel as done in Black et al. (2021) and Wang & Komatsuzaki (2021).
+Large language models have been observed to contain many memorized facts (Petroni et al., 2020;
+Brown et al., 2020; Jiang et al., 2020; Chowdhery et al., 2022). In this paper, we study facts of the
+form (subject s, relation r, object o), e.g., (s = Michael Jordan, r = plays sport, o = basketball). A
+generator G can recall a memory for (si, ri, ∗) if we form a natural language prompt pi = p(si, ri)
+such as “Michael Jordan plays the sport of” and predict the next token(s) representing oi. Our goal is
+to edit many memories at once. We formally define a list of edit requests as:
+E = {(si, ri, oi) | i} s.t. ∄i, j. (si = sj) ∧(ri = rj) ∧(oi ̸= oj).
+(5)
+The logical constraint ensures that there are no conflicting requests. For example, we can edit Michael
+Jordan to play oi = “baseball”, but then we exclude associating him with professional soccer.
+What does it mean to edit a memory well? At a superficial level, a memory can be considered edited
+after the model assigns a higher probability to the statement “Michael Jordan plays the sport of
+baseball” than to the original prediction (basketball); we say that such an update is effective. Yet it is
+important to also view the question in terms of generalization, specificity, and fluency:
+• To test for generalization, we can rephrase the question: “What is Michael Jordan’s sport? What
+sport does he play professionally?” If the modification of G is superficial and overfitted to the
+specific memorized prompt, such predictions will fail to recall the edited memory, “baseball.”
+• Conversely, to test for specificity, we can ask about similar subjects for which memories should
+not change: “What sport does Kobe Bryant play? What does Magic Johnson play?” These tests
+will fail if the updated G indiscriminately regurgitates “baseball” for subjects that were not edited.
+• When making changes to a model, we must also monitor fluency. If the updated model generates
+disfluent text such as “baseball baseball baseball baseball,” we should count that as a failure.
+Achieving these goals is challenging, even for a few edits (Hase et al., 2021; Mitchell et al., 2022;
+Meng et al., 2022). We investigate whether they can be attained at the scale of thousands of edits.
+4
+METHOD
+MEMIT inserts memories by updating transformer mechanisms that have recently been elucidated
+using causal mediation analysis (Meng et al., 2022). In GPT-2 XL, we found that there is a sequence
+of critical MLP layers R that mediate factual association recall at the last subject token S (Figure 2).
+MEMIT operates by (i) calculating the vector associations we want the critical layers to remember,
+then (ii) storing a portion of the desired memories in each layer l ∈R.
+Throughout this paper, our focus will be on states representing the last subject token S of prompt pi,
+so we shall abbreviate hl
+i = hl
+[S](pi). Similarly, ml
+i and al
+i denote ml
+[S](pi) and al
+[S](pi).
+4.1
+IDENTIFYING THE CRITICAL PATH OF MLP LAYERS
+Figure 3 shows the results of applying causal tracing to the larger GPT-J (6B) model; for implementa-
+tion details, see Appendix A. We measure the average indirect causal effect of each hl
+i on a sample
+of memory prompts pi, with either the Attention or MLP modules for token S disabled. The results
+3
+
+Published as a conference paper at ICLR 2023
+Michael
+Jordan
+now
+plays
+𝑘!
+"
+𝑊!"
+#
+𝑊$%&
+#
+attn!
+𝑊"#$
+!
+stores 𝑘%
+! →𝑚%
+! pairs minimizing:
+!
+!"#
+$
+𝑊%&'
+(
+𝑘!
+( −𝑚!
+(
+)
+key for subject
+memorized value
+attn module
+vector state
+direct path
+mlp module
+mlp critical path
+non-mediating components
+information moved by attention
+(a)
+(b)
+(c)
+𝑚!
+"
+𝑎!
+"
+ℎ!
+"
+(d)
+range of critical MLP layers ℛ
+last
+subject
+token 𝑆
+Figure 2: MEMIT modifies transformer parameters on the critical path of MLP-mediated factual recall.
+We edit stored associations based on observed patterns of causal mediation: (a) first, the early-layer attention
+modules gather subject names into vector representations at the last subject token S. (b) Then MLPs at layers
+l ∈R read these encodings and add memories to the residual stream. (c) Those hidden states are read by
+attention to produce the output. (d) MEMIT edits memories by storing vector associations in the critical MLPs.
+confirm that GPT-J has a concentration of mediating states hl
+i; moreover, they highlight a mediating
+causal role for a range of MLP modules, which can be seen as a large gap between the effect of single
+states (purple bars in Figure 3) and the effects with MLP severed (green bars); this gap diminishes
+after layer 8. Unlike Meng et al. (2022) who use this test to identify a single edit layer, we select the
+whole range of critical MLP layers l ∈R. For GPT-J, we have R = {3, 4, 5, 6, 7, 8}.
+0
+5
+10
+15
+20
+25
+Layer at which hidden state is restored
+0.0%
+5.0%
+10.0%
+Average Indirect Effect
+Causal effect of hidden states Attn or MLP modules severed
+Effect of single state
+Effect w/ Attn severed
+Effect w/ MLP severed
+Figure 3: A critical mediating role for mid-layer MLPs.
+Given that a range of MLPs play a joint
+mediating role in recalling facts, we ask:
+what is the role of one MLP in stor-
+ing a memory? Each token state in a
+transformer is part of the residual stream
+that all attention and MLP modules read
+from and write to (Elhage et al., 2021).
+Unrolling Eqn. 2 for hL
+i = hL
+[S](pi):
+hL
+i = h0
+i +
+L
+X
+l=1
+al
+i +
+L
+X
+l=1
+ml
+i.
+(6)
+Eqn. 6 highlights that each individual
+MLP contributes by adding to the memory at hL
+i (Figure 2b), which is later read by last-token
+attention modules (Figure 2c). Therefore, when writing new memories into G, we can spread the
+desired changes across all the critical layers ml
+i for l ∈R.
+4.2
+BATCH UPDATE FOR A SINGLE LINEAR ASSOCIATIVE MEMORY
+In each individual layer l, we wish to store a large batch of u ≫1 memories. This section derives an
+optimal single-layer update that minimizes the squared error of memorized associations, assuming
+that the layer contains previously-stored memories that should be preserved. We denote W0 ≜W l
+out
+(Eqn. 4, Figure 2) and analyze it as a linear associative memory (Kohonen, 1972; Anderson, 1972)
+that associates a set of input keys ki ≜kl
+i (encoding subjects) to corresponding memory values
+mi ≜ml
+i (encoding memorized properties) with minimal squared error:
+W0 ≜argmin
+ˆ
+W
+n
+X
+i=1
+ ˆWki −mi
+
+2
+.
+(7)
+If we stack keys and memories as matrices K0 = [k1 | k2 | · · · | kn] and M0 = [m1 | m2 | · · · | mn],
+then Eqn. 7 can be optimized by solving the normal equation (Strang, 1993, Chapter 4):
+W0K0KT
+0 = M0KT
+0 .
+(8)
+Suppose that pre-training sets a transformer MLP’s weights to the optimal solution W0 as defined in
+Eqn. 8. Our goal is to update W0 with some small change ∆that produces a new matrix W1 with
+4
+
+Published as a conference paper at ICLR 2023
+𝑧!
+ℎ!
+"
+𝑘!
+"#$
+𝑚!
+"#$
+𝑊!%
+"#$
+𝑊&'(
+"#$
+attn!"#
+ℎ!
+"#)
+𝑘!
+"#*
+𝑚!
+"#*
+𝑊!%
+"#*
+𝑊&'(
+"#*
+attn!"$
+ℎ!
+"#$
+𝑘!
+"
+𝑚!
+"
+𝑊!%
+"
+𝑊&'(
+"
+attn!
+ℎ!
+"#*
+(i) For each memory 𝑖, find 𝑧! by optimizing Eqn. 16
+(ii-a) Add ∆"#$ s.t. ∀𝑖: 𝑚!
+"#$ += +!# ,!
+"
+)
+Re-collect layer 𝐿−1 activations
+(ii-b) Add ∆"#* s.t. ∀𝑖: 𝑚!
+"#* += +!# ,!
+"
+$
+(ii-c) Add ∆" s.t. ∀𝑖: 𝑚!
+" += +!# ,!
+"
+*
+Re-collect layer 𝐿activations
+(ii) For each layer 𝑙, apply updates using
+Eqn. 14 to move all ℎ!
+" towards 𝑧!
+All states examined at 𝑆= Last subject token for 𝑝!
+Figure 4: The MEMIT update. We first (i) replace hl
+i with the vector zi and optimize Eqn. 16 so that it
+conveys the new memory. Then, after all zi are calculated we (ii) iteratively insert a fraction of the residuals
+for all zi over the range of critical MLP modules, executing each layer’s update by applying Eqn. 14. Because
+changing one layer will affect activations of downstream modules, we recollect activations after each iteration.
+a set of additional associations. Unlike Meng et al. (2022), we cannot solve our problem with a
+constraint that adds only a single new association, so we define an expanded objective:
+W1 ≜argmin
+ˆ
+W
+ n
+X
+i=1
+ ˆWki −mi
+
+2
++
+n+u
+X
+i=n+1
+ ˆWki −mi
+
+2
+!
+.
+(9)
+We can solve Eqn. 9 by again applying the normal equation, now written in block form:
+W1 [K0
+K1] [K0
+K1]T = [M0
+M1] [K0
+K1]T
+(10)
+which expands to:
+(W0 + ∆)(K0KT
+0 + K1KT
+1 ) = M0KT
+0 + M1KT
+1
+(11)
+W0K0KT
+0 + W0K1KT
+1 + ∆K0KT
+0 + ∆K1KT
+1 = M0KT
+0 + M1KT
+1
+(12)
+subtracting Eqn. 8 from Eqn. 12 :
+∆(K0KT
+0 + K1KT
+1 ) = M1KT
+1 −W0K1KT
+1 .
+(13)
+A succinct solution can be written by defining two additional quantities: C0 ≜K0KT
+0 , a constant
+proportional to the uncentered covariance of the pre-existing keys, and R ≜M1 −W0K1, the residual
+error of the new associations when evaluated on old weights W0. Then Eqn. 13 can be simplified as:
+∆= RKT
+1 (C0 + K1KT
+1 )−1.
+(14)
+Since pretraining is opaque, we do not have access to K0 or M0. Fortunately, computing Eqn. 14
+only requires an aggregate statistic C0 over the previously stored keys. We assume that the set of
+previously memorized keys can be modeled as a random sample of inputs, so that we can compute
+C0 = λ · Ek
+
+kkT 
+(15)
+by estimating Ek
+
+kkT 
+, an uncentered covariance statistic collected using an empirical sample of
+vector inputs to the layer. We must also select λ, a hyperparameter that balances the weighting of
+new v.s. old associations; a typical value is λ = 1.5 × 104.
+4.3
+UPDATING MULTIPLE LAYERS
+We now define the overall update algorithm (Figure 4). Inspired by the observation that robustness is
+improved when parameter change magnitudes are minimized (Zhu et al., 2020), we spread updates
+evenly over the range of mediating layers R. We define a target layer L ≜max(R) at the end of
+the mediating layers, at which the new memories should be fully represented. Then, for each edit
+(si, ri, oi) ∈E, we (i) compute a hidden vector zi to replace hL
+i such that adding δi ≜zi −hL
+i to the
+hidden state at layer L and token T will completely convey the new memory. Finally, one layer at a
+time, we (ii) modify the MLP at layer l, so that it contributes an approximately-equal portion of the
+change δi for each memory i.
+(i) Computing zi. For the ith memory, we first compute a vector zi that would encode the association
+(si, ri, oi) if it were to replace hL
+i at layer L at token S. We find zi = hL
+i + δi by optimizing the
+residual vector δi using gradient descent:
+zi = hL
+i + argmin
+δi
+1
+P
+P
+X
+j=1
+−log PG(hL
+i +=δi) [oi | xj ⊕p(si, ri)] .
+(16)
+5
+
+Published as a conference paper at ICLR 2023
+In words, we optimize δi to maximize the model’s prediction of the desired object oi, given a set of
+factual prompts {xj ⊕p(si, ri)} that concatenate random prefixes xj to a templated prompt to aid
+generalization across contexts. G(hL
+i += δi) indicates that we modify the transformer execution by
+substituting the modified hidden state zi for hL
+i ; this is called “hooking” in popular ML libraries.
+(ii) Spreading zi −hL
+i over layers. We seek delta matrices ∆l such that:
+setting ˆW l
+out := W l
+out + ∆l for all l ∈R optimizes min
+{∆l}
+X
+i
+zi −ˆhL
+i
+
+2
+,
+(17)
+where ˆhL
+i = h0
+i +
+L
+X
+l=1
+al
+i +
+L
+X
+l=1
+ˆW l
+out σ
+ W l
+inγ
+ hl−1
+t
+
+.
+(18)
+Because edits to any layer will influence all following layers’ activations, we calculate ∆l iteratively
+in ascending layer order (Figure 4ii-a,b,c). To compute each individual ∆l, we need the corresponding
+keys Kl = [kl
+1 | · · · | kl
+n] and memories M l = [ml
+1 | · · · | ml
+n] to insert using Eqn. 14. Each key kl
+i
+is computed as the input to W l
+out at each layer l (Figure 2d):
+kl
+i = 1
+P
+P
+X
+j=1
+k(xj + si), where k(x) = σ
+ W l
+in γ
+ hl−1
+i
+(x)
+
+.
+(19)
+ml
+i is then computed as the sum of its current value and a fraction of the remaining top-level residual:
+ml
+i = Woutkl
+i + rl
+i where rl
+i is the residual given by zi −hL
+i
+L −l + 1,
+(20)
+where the denominator of ri spreads the residual out evenly. Algorithm 1 summarizes MEMIT, and
+additional implementation details are offered in Appendix B.
+Algorithm 1: The MEMIT Algorithm
+Data: Requested edits E = {(si, ri, oi)}, generator G, layers to edit S, covariances Cl
+Result: Modified generator containing edits from E
+1 for si, ri, oi ∈E do
+// Compute target zi vectors for every memory i
+2
+optimize δi ←argminδi
+1
+P
+PP
+j=1 −log PG(hL
+i +=δi) [oi | xj ⊕p(si, ri)] (Eqn. 16)
+3
+zi ←hL
+i + δi
+4 end
+5 for l ∈R do
+// Perform update: spread changes over layers
+6
+hl
+i ←hl−1
+i
++ al
+i + ml
+i (Eqn. 2)
+// Run layer l with updated weights
+7
+for si, ri, oi ∈E do
+8
+kl
+i ←kl
+i = 1
+P
+PP
+j=1 k(xj + si) (Eqn. 19)
+9
+rl
+i ←zi−hL
+i
+L−l+1 (Eqn. 20)
+// Distribute residual over remaining layers
+10
+end
+11
+Kl ←[kl1
+i , ..., kL
+i ]
+12
+Rl ←[rl1
+i , ..., rL
+i ]
+13
+∆l ←RlKlT (Cl + KlKlT )−1 (Eqn. 14)
+14
+W l ←W l + ∆l
+// Update layer l MLP weights in model
+15 end
+5
+EXPERIMENTS
+5.1
+MODELS AND BASELINES
+We run experiments on two autoregressive LLMs: GPT-J (6B) and GPT-NeoX (20B). For baselines,
+we first compare with a naive fine-tuning approach that uses weight decay to prevent forgetfulness
+(FT-W). Next, we experiment with MEND, a hypernetwork-based model editing approach that edits
+multiple facts at the same time (Mitchell et al., 2021). Finally, we run a sequential version of ROME
+(Meng et al., 2022): a direct model editing method that iteratively updates one fact at a time. The
+recent SERAC model editor (Mitchell et al., 2022) does not yet have public code, so we cannot
+compare with it at this time. See Appendix B for implementation details.
+6
+
+Published as a conference paper at ICLR 2023
+5.2
+MEMIT SCALING
+5.2.1
+EDITING 10K MEMORIES IN ZSRE
+Table 1: 10,000 zsRE Edits on GPT-J (6B).
+Editor
+Score ↑
+Efficacy ↑
+Paraphrase ↑
+Specificity ↑
+GPT-J
+26.4
+26.4 (±0.6)
+25.8 (±0.5)
+27.0 (±0.5)
+FT-W
+42.1
+69.6 (±0.6)
+64.8 (±0.6)
+24.1 (±0.5)
+MEND
+20.0
+19.4 (±0.5)
+18.6 (±0.5)
+22.4 (±0.5)
+ROME
+2.6
+21.0 (±0.7)
+19.6 (±0.7)
+0.9 (±0.1)
+MEMIT
+50.7
+96.7 (±0.3)
+89.7 (±0.5)
+26.6 (±0.5)
+We first test MEMIT on zsRE (Levy
+et al., 2017), a question-answering
+task from which we extract 10,000
+real-world facts; zsRE tests MEMIT’s
+ability to add correct information. Be-
+cause zsRE does not contain gener-
+ation tasks, we evaluate solely on
+prediction-based metrics.
+Efficacy
+measures the proportion of cases where o is the argmax generation given p(s, r), Paraphrase
+is the same metric but applied on paraphrases, Specificity is the model’s argmax accuracy on a
+randomly-sampled unrelated fact that should not have changed, and Score is the harmonic mean of
+the three aforementioned scores; Appendix C contains formal definitions. As Table 1 shows, MEMIT
+performs best at 10,000 edits; most memories are recalled with generalization and minimal bleedover.
+Interestingly, simple fine-tuning FT-W performs better than the baseline knowledge editing methods
+MEND and ROME at this scale, likely because its objective is applied only once.
+5.2.2
+COUNTERFACT SCALING CURVES
+Next, we test MEMIT’s ability to add counterfactual information using COUNTERFACT, a col-
+lection of 21,919 factual statements (Meng et al. (2022), Appendix C). We first filter con-
+flicts by removing facts that violate the logical condition in Eqn. 5 (i.e., multiple edits modify
+the same (s, r) prefix to different objects). For each problem size n ∈{1, 2, 3, 6, 10, 18, 32,
+56, 100, 178, 316, 562, 1000, 1778, 3162, 5623, 10000}1, n counterfactuals are inserted.
+Following Meng et al. (2022), we report several metrics designed to test editing desiderata.
+Efficacy Success (ES) evaluates editing success and is the proportion of cases for which the
+new object oi’s probability is greater than the probability of the true real-world object oc
+i:2
+Ei [PG [oi | p(si, ri)] > PG [oc
+i | p(si, ri)]]. Paraphrase Success (PS) is a generalization measure
+defined similarly, except G is prompted with rephrasings of the original statement. For testing
+specificity, Neighborhood Success (NS) is defined similarly, but we check the probability G assigns
+to the correct answer oc
+i (instead of oi), given prompts about distinct but semantically-related subjects
+(instead of si). Editing Score (S) aggregates metrics by taking the harmonic mean of ES, PS, NS.
+We are also interested in measuring generation quality of the updated model. First, we check that G’s
+generations are semantically consistent with the new object using a Reference Score (RS), which is
+collected by generating text about s and checking its TF-IDF similarity with a reference Wikipedia
+text about o. To test for fluency degradation due to excessive repetition, we measure Generation
+Entropy (GE), computed as the weighted sum of the entropy of bi- and tri-gram n-gram distributions
+of the generated text. See Appendix C for further details on metrics.
+Figure 5 plots performance v.s. number of edits on log scale, up to 10,000 facts. ROME performs well
+up to n = 10 but degrades starting at n = 32. Similarly, MEND performs well at n = 1 but rapidly
+declines at n = 6, losing all efficacy before n = 1,000 and, curiously, having negligible effect on the
+model at n = 10,000 (the high specificity score is achieved by leaving the model nearly unchanged).
+MEMIT performs best at large n. At small n, ROME achieves better generalization at the cost of
+slightly lower specificity, which means that ROME’s edits are more robust under rephrasings, likely
+due to that method’s hard equality constraint for weight updates, compared to MEMIT’s soft error
+minimization. Table 2 provides a direct numerical comparison at 10,000 edits on both GPT-J and
+GPT-NeoX. FT-W3 does well on probability-based metrics but suffers from complete generation
+failure, indicating significant model damage.
+Appendix B provides a runtime analysis of all four methods on 10,000 edits. We find that MEND is
+fastest, taking 98 sec. FT is second at around 29 min, while MEMIT and ROME are the slowest at
+1These values come from a log-scale curve: ni = exp
+ ln(10,000) ∗
+i
+16
+
+, for non-negative integers i.
+2COUNTERFACT is derived from a set of true facts from WikiData, so oc
+i is always known.
+3We find that the weight decay hyperparameter is highly sensitive to the number of edits. Therefore, to evaluate
+scaling behavior cost-efficiently, we tune it only on n = 10,000. See Appendix B.1 for experimental details.
+7
+
+Published as a conference paper at ICLR 2023
+Figure 5: MEMIT scaling curves plot editing performance against problem size (log-scale). The dotted line
+indicates GPT-J’s pre-edit performance; specificity (NS) and fluency (GE) should stay close to the baseline. 95%
+confidence intervals are shown as areas.
+Table 2: Numerical results on COUNTERFACT for 10,000 edits.
+Editor
+Score
+Efficacy
+Generalization
+Specificity
+Fluency
+Consistency
+S ↑
+ES ↑
+PS ↑
+NS ↑
+GE ↑
+RS ↑
+GPT-J
+22.4
+15.2 (0.7)
+17.7 (0.6)
+83.5 (0.5)
+622.4 (0.3)
+29.4 (0.2)
+FT-W
+67.6
+99.4 (0.1)
+77.0 (0.7)
+46.9 (0.6)
+293.9 (2.4)
+15.9 (0.3)
+MEND
+23.1
+15.7 (0.7)
+18.5 (0.7)
+83.0 (0.5)
+618.4 (0.3)
+31.1 (0.2)
+ROME
+50.3
+50.2 (1.0)
+50.4 (0.8)
+50.2 (0.6)
+589.6 (0.5)
+3.3 (0.0)
+MEMIT
+85.8
+98.9 (0.2)
+88.6 (0.5)
+73.7 (0.5)
+619.9 (0.3)
+40.1 (0.2)
+GPT-NeoX
+23.7
+16.8 (1.9)
+18.3 (1.7)
+81.6 (1.3)
+620.4 (0.6)
+29.3 (0.5)
+MEMIT
+82.0
+97.2 (0.8)
+82.2 (1.6)
+70.8 (1.4)
+606.4 (1.0)
+36.9 (0.6)
+7.44 hr and 12.29 hr, respectively. While MEMIT’s execution time is high relative to MEND and FT,
+we note that its current implementation is naive and does not batch the independent zi optimizations,
+instead computing each one in series. These computations are actually “embarrassingly parallel” and
+thus could be batched.
+5.3
+EDITING DIFFERENT CATEGORIES OF FACTS
+For insight into MEMIT’s performance on different types of facts, we pick the 27 categories from
+COUNTERFACT that have at least 300 cases each, and assess each algorithm’s performance on those
+cases. Figure 6a shows that MEMIT achieves better overall scores compared to FT and MEND in
+all categories. It also reveals that some relations are harder to edit compared to others; for example,
+each of the editing algorithms faced difficulties in changing the sport an athlete plays. Even on harder
+cases, MEMIT outperforms other methods by a clear margin.
+Model editing methods are known to occasionally suffer from a trade-off between attaining high
+generalization and good specificity. This trade-off is clearly visible for MEND in Figure 6b. FT
+consistently fails to achieve good specificity. Overall, MEMIT achieves a higher score in both
+dimensions, although it also exhibits a trade-off in editing some relations such as P127 (“product
+owned by company”) and P641 (“athlete plays sport”).
+8
+
+Published as a conference paper at ICLR 2023
+Specificity Success (NS)
+citizen of country [P27]
+was born in [P19]
+works in location [P937]
+located in country [P17]
+language of a show [P364]
+official language [P37]
+plays position in sport [P413]
+produced by [P176]
+developed by [P178]
+specializes in field [P101]
+has the genre [P136]
+holds the position of [P39]
+located in continent [P30]
+plays sport of [P641]
+native language [P103]
+headquartered in [P159]
+language spoken by [P1412]
+died in location [P20]
+works as occupation [P106]
+show originally aired in [P449]
+country of origin [P495]
+works for [P108]
+was founded in [P740]
+follow religion [P140]
+plays instrument [P1303]
+owned by company [P127]
+has twin city [P190]
+(a)
+(b)
+20
+40
+60
+80
+100
+Scores (S)
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Generalization Success (PS)
+20
+30
+40
+50
+60
+70
+80
+90
+100
+Specificity Success (NS)
+P127
+P641
+P30
+P127
+P641
+P30
+P127
+P641
+P30
+MEMIT
+FT
+MEND
+Figure 6: (a) Category-wise rewrite scores achieved by different approaches in editing 300 similar facts. (b)
+Category-wise specificity vs generalization scores by different approaches on 300 edits.
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+75
+80
+85
+90
+95
+100
+Score (S)
+(a) Subject different, Object different
+P27
+P37
+P27, P37
+avg
+100
+200
+300
+400
+500
+600
+700
+75
+80
+85
+90
+95
+100
+(b) Subject similar, Object different
+P413
+P1412
+P413, P1412
+avg
+100
+200
+300
+400
+500
+600
+700
+75
+80
+85
+90
+95
+100
+(c) Subject different, Object similar
+P17
+P495
+P17, P495
+avg
+100
+200
+300
+400
+500
+600
+700
+75
+80
+85
+90
+95
+100
+(d) Subject similar, Object similar
+P27
+P937
+P27, P937
+avg
+Number of edits
+Number of edits
+Number of edits
+Figure 7: When comparing mixes of edits, MEMIT gives consistent near-linear (near-average) performance
+while scaling up to 700 facts.
+5.4
+EDITING DIFFERENT CATEGORIES OF FACTS TOGETHER
+To investigate whether the scaling of MEMIT is sensitive to differences in the diversity of the
+memories being edited together, we sample sets of cases Emix that mix two different relations from
+the COUNTERFACT dataset. We consider four scenarios depicted in Figure 7, where the relations
+have similar or different classes of subjects or objects. In all of the four cases, MEMIT’s performance
+on Emix is close to the average of the performance of each relation without mixing. This provides
+support to the hypothesis that the scaling of MEMIT is neither positively nor negatively affected by
+the diversity of the memories being edited. Appendix D contains implementation details.
+6
+DISCUSSION AND CONCLUSION
+We have developed MEMIT, a method for editing factual memories in large language models by
+directly manipulating specific layer parameters. Our method scales to much larger sets of edits (100x)
+than other approaches while maintaining excellent specificity, generalization, and fluency.
+Our investigation also reveals some challenges: certain relations are more difficult to edit with robust
+specificity, yet even on challenging cases we find that MEMIT outperforms other methods by a clear
+margin. The knowledge representation we study is also limited in scope to working with directional
+(s, r, o) relations: it does not cover spatial or temporal reasoning, mathematical knowledge, linguistic
+knowledge, procedural knowledge, or even symmetric relations. For example, the association that
+“Tim Cook is CEO of Apple” must be processed separately from the opposite association that “The
+CEO of Apple is Tim Cook.”
+Despite these limitations, it is noteworthy that large-scale model updates can be constructed using an
+explicit analysis of internal computations. Our results raise a question: might interpretability-based
+methods become a commonplace alternative to traditional opaque fine-tuning approaches? Our
+positive experience brings us optimism that further improvements to our understanding of network
+internals will lead to more transparent and practical ways to edit, control, and audit models.
+9
+
+Published as a conference paper at ICLR 2023
+7
+ETHICAL CONSIDERATIONS
+Although we test a language model’s ability to serve as a knowledge base, we do not find these
+models to be a reliable source of knowledge, and we caution readers that a LLM should not be used as
+an authoritative source of facts. Our memory-editing methods shed light on the internal mechanisms
+of models and potentially reduce the cost and energy needed to fix errors in a model, but the same
+methods might also enable a malicious actor to insert false or damaging information into a model
+that was not originally present in the training data.
+8
+ACKNOWLEDGEMENTS.
+Thanks to Jaden Fiotto-Kaufmann for building the demonstration at memit.baulab.us. This project
+was supported by an AI Alignment grant from Open Philanthropy. YB was also supported by
+the Israel Science Foundation (grant No. 448/20) and an Azrieli Foundation Early Career Faculty
+Fellowship.
+9
+REPRODUCIBILITY
+The code and data for our methods and experiments are available at memit.baulab.info.
+All experiments are run on workstations with NVIDIA A6000 GPUs. The language models are
+loaded using HuggingFace Transformers (Wolf et al., 2019), and PyTorch (Paszke et al., 2019) is
+used for executing the model editing algorithms on GPUs.
+GPT-J experiments fit into one 48GB A6000, but GPT-NeoX runs require at least two: one 48GB
+GPU for running the model in float16, and another slightly smaller GPU for executing the editing
+method. Due to the size of these language models, our experiments will not run on GPUs with less
+memory.
+REFERENCES
+Oshin Agarwal and Ani Nenkova. Temporal effects on pre-trained models for language processing
+tasks. Transactions of the Association for Computational Linguistics, 10:904–921, 2022.
+Badr AlKhamissi, Millicent Li, Asli Celikyilmaz, Mona Diab, and Marjan Ghazvininejad. A review
+on language models as knowledge bases. arXiv preprint arXiv:2204.06031, 2022.
+James A Anderson. A simple neural network generating an interactive memory. Mathematical
+biosciences, 14(3-4):197–220, 1972.
+Sören Auer, Christian Bizer, Georgi Kobilarov, Jens Lehmann, Richard Cyganiak, and Zachary Ives.
+Dbpedia: A nucleus for a web of open data. In The semantic web, pp. 722–735. Springer, 2007.
+Sid Black, Leo Gao, Phil Wang, Connor Leahy, and Stella Biderman. GPT-Neo: Large Scale
+Autoregressive Language Modeling with Mesh-Tensorflow, March 2021. URL https://doi.
+org/10.5281/zenodo.5297715.
+Sid Black, Stella Biderman, Eric Hallahan, Quentin Anthony, Leo Gao, Laurence Golding, Horace He,
+Connor Leahy, Kyle McDonell, Jason Phang, Michael Pieler, USVSN Sai Prashanth, Shivanshu
+Purohit, Laria Reynolds, Jonathan Tow, Ben Wang, and Samuel Weinbach. Gpt-neox-20b: An
+open-source autoregressive language model, 2022.
+Kurt Bollacker, Robert Cook, and Patrick Tufts. Freebase: A shared database of structured general
+human knowledge. In AAAI, volume 7, pp. 1962–1963, 2007.
+Antoine Bosselut, Hannah Rashkin, Maarten Sap, Chaitanya Malaviya, Asli Celikyilmaz, and Yejin
+Choi. Comet: Commonsense transformers for automatic knowledge graph construction. In
+Proceedings of the 57th Annual Meeting of the Association for Computational Linguistics, pp.
+4762–4779, 2019.
+10
+
+Published as a conference paper at ICLR 2023
+Tom Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal,
+Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel
+Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler,
+Jeffrey Wu, Clemens Winter, Chris Hesse, Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray,
+Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford, Ilya Sutskever,
+and Dario Amodei. Language models are few-shot learners. In H. Larochelle, M. Ranzato,
+R. Hadsell, M. F. Balcan, and H. Lin (eds.), Advances in Neural Information Processing Systems,
+volume 33, pp. 1877–1901, 2020.
+Andrew Carlson, Justin Betteridge, Bryan Kisiel, Burr Settles, Estevam R Hruschka, and Tom M
+Mitchell. Toward an architecture for never-ending language learning. In Twenty-Fourth AAAI
+conference on artificial intelligence, 2010.
+Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam
+Roberts, Paul Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm:
+Scaling language modeling with pathways. arXiv preprint arXiv:2204.02311, 2022.
+Damai Dai, Li Dong, Yaru Hao, Zhifang Sui, Baobao Chang, and Furu Wei. Knowledge neurons
+in pretrained transformers. In Proceedings of the 60th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pp. 8493–8502, 2022.
+Guy Dar, Mor Geva, Ankit Gupta, and Jonathan Berant. Analyzing transformers in embedding space.
+arXiv preprint arXiv:2209.02535, 2022.
+Randall Davis, Howard Shrobe, and Peter Szolovits. What is a knowledge representation?
+AI
+magazine, 14(1):17–17, 1993.
+Nicola De Cao, Wilker Aziz, and Ivan Titov. Editing factual knowledge in language models. In
+Proceedings of the 2021 Conference on Empirical Methods in Natural Language Processing,
+pp. 6491–6506, Online and Punta Cana, Dominican Republic, November 2021. Association for
+Computational Linguistics.
+Xin Dong, Evgeniy Gabrilovich, Geremy Heitz, Wilko Horn, Ni Lao, Kevin Murphy, Thomas
+Strohmann, Shaohua Sun, and Wei Zhang. Knowledge vault: A web-scale approach to proba-
+bilistic knowledge fusion. In Proceedings of the 20th ACM SIGKDD international conference on
+Knowledge discovery and data mining, pp. 601–610, 2014.
+Yanai Elazar, Nora Kassner, Shauli Ravfogel, Abhilasha Ravichander, Eduard Hovy, Hinrich Schütze,
+and Yoav Goldberg. Measuring and improving consistency in pretrained language models. Trans-
+actions of the Association for Computational Linguistics, 9:1012–1031, 2021.
+Nelson Elhage, Neel Nanda, Catherine Olsson, Tom Henighan, Nicholas Joseph, Ben Mann, Amanda
+Askell, Yuntao Bai, Anna Chen, Tom Conerly, Nova DasSarma, Dawn Drain, Deep Ganguli,
+Zac Hatfield-Dodds, Danny Hernandez, Andy Jones, Jackson Kernion, Liane Lovitt, Kamal
+Ndousse, Dario Amodei, Tom Brown, Jack Clark, Jared Kaplan, Sam McCandlish, and Chris
+Olah. A mathematical framework for transformer circuits. Transformer Circuits Thread, 2021.
+https://transformer-circuits.pub/2021/framework/index.html.
+Mor Geva, Roei Schuster, Jonathan Berant, and Omer Levy. Transformer feed-forward layers are
+key-value memories. In Proceedings of the 2021 Conference on Empirical Methods in Natural
+Language Processing, pp. 5484–5495, 2021.
+Mor Geva, Avi Caciularu, Kevin Ro Wang, and Yoav Goldberg. Transformer feed-forward layers
+build predictions by promoting concepts in the vocabulary space. arXiv preprint arXiv:2203.14680,
+2022.
+Peter Hase, Mona Diab, Asli Celikyilmaz, Xian Li, Zornitsa Kozareva, Veselin Stoyanov, Mohit
+Bansal, and Srinivasan Iyer. Do language models have beliefs? methods for detecting, updating,
+and visualizing model beliefs. arXiv preprint arXiv:2111.13654, 2021.
+Catherine Havasi, Robert Speer, and Jason Alonso. Conceptnet: A lexical resource for common sense
+knowledge. Recent advances in natural language processing V: selected papers from RANLP, 309:
+269, 2007.
+11
+
+Published as a conference paper at ICLR 2023
+Zhengbao Jiang, Frank F Xu, Jun Araki, and Graham Neubig. How can we know what language
+models know? Transactions of the Association for Computational Linguistics, 8:423–438, 2020.
+Teuvo Kohonen. Correlation matrix memories. IEEE transactions on computers, 100(4):353–359,
+1972.
+Angeliki Lazaridou, Adhi Kuncoro, Elena Gribovskaya, Devang Agrawal, Adam Liska, Tayfun Terzi,
+Mai Gimenez, Cyprien de Masson d’Autume, Tomas Kocisky, Sebastian Ruder, et al. Mind the gap:
+Assessing temporal generalization in neural language models. Advances in Neural Information
+Processing Systems, 34:29348–29363, 2021.
+Douglas B Lenat. Cyc: A large-scale investment in knowledge infrastructure. Communications of the
+ACM, 38(11):33–38, 1995.
+Omer Levy, Minjoon Seo, Eunsol Choi, and Luke Zettlemoyer.
+Zero-shot relation extraction
+via reading comprehension. In Proceedings of the 21st Conference on Computational Natural
+Language Learning (CoNLL 2017), pp. 333–342, 2017.
+Adam Liska, Tomas Kocisky, Elena Gribovskaya, Tayfun Terzi, Eren Sezener, Devang Agrawal,
+D’Autume Cyprien De Masson, Tim Scholtes, Manzil Zaheer, Susannah Young, et al. Stream-
+ingQA: A benchmark for adaptation to new knowledge over time in question answering models.
+In International Conference on Machine Learning, pp. 13604–13622. PMLR, 2022.
+Kevin Meng, David Bau, Alex Andonian, and Yonatan Belinkov. Locating and editing factual
+associations in GPT. Advances in Neural Information Processing Systems, 35, 2022.
+George A Miller. Wordnet: a lexical database for english. Communications of the ACM, 38(11):
+39–41, 1995.
+Marvin Minsky. A framework for representing knowledge, 1974.
+Eric Mitchell, Charles Lin, Antoine Bosselut, Chelsea Finn, and Christopher D. Manning. Fast model
+editing at scale, 2021.
+Eric Mitchell, Charles Lin, Antoine Bosselut, Chelsea Finn, and Christopher D. Manning. Memory-
+based model editing at scale. In International Conference on Machine Learning, 2022.
+Adam Paszke, Sam Gross, Francisco Massa, Adam Lerer, James Bradbury, Gregory Chanan, Trevor
+Killeen, Zeming Lin, Natalia Gimelshein, Luca Antiga, et al. Pytorch: An imperative style,
+high-performance deep learning library. Advances in neural information processing systems, 32,
+2019.
+David Patterson, Joseph Gonzalez, Quoc Le, Chen Liang, Lluis-Miquel Munguia, Daniel Rothchild,
+David So, Maud Texier, and Jeff Dean. Carbon emissions and large neural network training. arXiv
+preprint arXiv:2104.10350, 2021.
+Judea Pearl. Direct and indirect effects. In Proceedings of the Seventeenth conference on Uncertainty
+in artificial intelligence, pp. 411–420, 2001.
+Fabio Petroni, Tim Rocktäschel, Sebastian Riedel, Patrick Lewis, Anton Bakhtin, Yuxiang Wu, and
+Alexander Miller. Language models as knowledge bases? In Proceedings of the 2019 Conference
+on Empirical Methods in Natural Language Processing and the 9th International Joint Conference
+on Natural Language Processing (EMNLP-IJCNLP), pp. 2463–2473, 2019.
+Fabio Petroni, Patrick Lewis, Aleksandra Piktus, Tim Rocktäschel, Yuxiang Wu, Alexander H Miller,
+and Sebastian Riedel. How context affects language models’ factual predictions. In Automated
+Knowledge Base Construction, 2020.
+Alec Radford, Jeffrey Wu, Rewon Child, David Luan, Dario Amodei, Ilya Sutskever, et al. Language
+models are unsupervised multitask learners. OpenAI blog, pp. 9, 2019.
+Richard H Richens. Preprogramming for mechanical translation. Mechanical Translation, 3(1):
+20–25, 1956.
+12
+
+Published as a conference paper at ICLR 2023
+Adam Roberts, Colin Raffel, and Noam Shazeer. How much knowledge can you pack into the
+parameters of a language model? In Proceedings of the 2020 Conference on Empirical Methods in
+Natural Language Processing (EMNLP), pp. 5418–5426, 2020.
+Tara Safavi and Danai Koutra. Relational world knowledge representation in contextual language
+models: A review. In Proceedings of the 2021 Conference on Empirical Methods in Natural
+Language Processing, pp. 1053–1067, 2021.
+Taylor Shin, Yasaman Razeghi, Robert L Logan IV, Eric Wallace, and Sameer Singh. Autoprompt:
+Eliciting knowledge from language models with automatically generated prompts. In Proceedings
+of the 2020 Conference on Empirical Methods in Natural Language Processing (EMNLP), pp.
+4222–4235, 2020.
+Anton Sinitsin, Vsevolod Plokhotnyuk, Dmitry Pyrkin, Sergei Popov, and Artem Babenko. Editable
+neural networks. In International Conference on Learning Representations, 2019.
+Gilbert Strang. Introduction to linear algebra. Wellesley-Cambridge Press Wellesley, MA, 1993.
+Fabian M Suchanek, Gjergji Kasneci, and Gerhard Weikum. Yago: a core of semantic knowledge. In
+Proceedings of the 16th international conference on World Wide Web, pp. 697–706, 2007.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N Gomez, Łukasz
+Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in neural information
+processing systems, pp. 5998–6008, 2017.
+Jesse Vig, Sebastian Gehrmann, Yonatan Belinkov, Sharon Qian, Daniel Nevo, Yaron Singer, and
+Stuart M Shieber. Investigating gender bias in language models using causal mediation analysis.
+In NeurIPS, 2020.
+Denny Vrandeˇci´c and Markus Krötzsch. Wikidata: a free collaborative knowledgebase. Communica-
+tions of the ACM, 57(10):78–85, 2014.
+Ben Wang and Aran Komatsuzaki. GPT-J-6B: A 6 Billion Parameter Autoregressive Language Model.
+https://github.com/kingoflolz/mesh-transformer-jax, May 2021.
+Gerhard Weikum. Knowledge graphs 2021: a data odyssey. Proceedings of the VLDB Endowment,
+14(12):3233–3238, 2021.
+Thomas Wolf, Lysandre Debut, Victor Sanh, Julien Chaumond, Clement Delangue, Anthony Moi,
+Pierric Cistac, Tim Rault, Rémi Louf, Morgan Funtowicz, et al. Huggingface’s transformers:
+State-of-the-art natural language processing. arXiv preprint arXiv:1910.03771, 2019.
+Yunzhi Yao, Shaohan Huang, Li Dong, Furu Wei, Huajun Chen, and Ningyu Zhang. Kformer:
+Knowledge injection in transformer feed-forward layers. In CCF International Conference on
+Natural Language Processing and Chinese Computing, pp. 131–143. Springer, 2022.
+Chen Zhu, Ankit Singh Rawat, Manzil Zaheer, Srinadh Bhojanapalli, Daliang Li, Felix Yu, and Sanjiv
+Kumar. Modifying memories in transformer models, 2020.
+13
+
+Published as a conference paper at ICLR 2023
+A
+CAUSAL TRACING
+(a)
+(b)
+(c)
+Figure 8: Causal Tracing (using the method of Meng et al. 2022). Each grid cell’s intensity reflects the average
+causal indirect effect of a hidden state on the expression of a factual association, with strong causal mediators
+highlighted with darker colors. We find that MLPs at the last subject token and attention modules at the last
+token are important. The presence of influential attention activations at the earliest layers of the last subject
+token is investigated with additional path dependent experiments (Figure 3).
+MEMIT begins by identifying MLP layers that are causal mediators for recall of factual associations
+in the model. To do so in GPT-J, we use code provided by Meng et al. (2022): beginning with a
+sample of 501 true statements of facts that are correctly predicted by GPT-J, we measure baseline
+predicted probabilities of each true fact when noise is introduced into encoding of the subject tokens
+to degrade the accuracy of the model. Then in Figure 8 (a) for each individual hl
+t, we restore the
+state to the value that it would have had without injected noise, and we plot the average improvement
+of predicted probability. As in Meng et al. (2022), we use Gaussian noise with standard deviation
+3σ (σ2 is the empirically observed variance of embedding activations) and plot averages for all 501
+statements over 10 noise samples. For (b) and (c) we use the same procedure, except we restore runs
+of 10 layers of MLP outputs ml
+t and 10 layers of Attn al
+t, instead of full hidden states.
+These measurements confirm that GPT-J has a causal structure that is similar to the structure reported
+by Meng et al. (2022) in their study of GPT2-XL. Unlike with GPT-XL, a strong causal effect is
+observed in the earliest layers of Attention at the last subject token, which likely reflects a concentrated
+attention computation when GPT-J is recognizing and chunking the n-gram subject name, but the
+path-dependent experiment (Figure 3) suggests that Attention is not an important mediator of factual
+recall of memories about the subject.
+In the main paper, Figure 3 plots the same data as Figure 8 (a) as a bar graph, focused on only the last
+subject token, and it adds two additional measurements. In red bars, it repeats the measurement of
+causal effects of states with Attention modules at the last subject token frozen in the corrupted state,
+so that cannot be influenced by the state being probed, and in green bars it repeats the experiment
+with the MLP modules at the last subject token similarly frozen, so they cannot be influenced by the
+causal probe. Severing the Attention modules does not shift the curve, which suggests that Attention
+computations do not play a decisive mediating role in knowledge recall at the last subject token. In
+contrast, severing the MLP modules reveals a large gap, which suggests that, at layers where the gap
+is largest, the role of the MLP computation is important. We select the layers where the gap is largest
+as the range R to use for the intervention done by MEMIT.
+B
+IMPLEMENTATION DETAILS
+B.1
+FINE-TUNING WITH WEIGHT DECAY
+Our fine-tuning baseline updates layer 21 of GPT-J, which Meng et al. (2022) found to provide the
+best performance in the single-edit case. Rather than using a hard L∞-norm constraint, we use a
+soft weight decay regularizer. However, the optimal amount of regularization depends strongly on
+the number of edits (more edits require higher-norm edits), so we tune this hyperparameter for the
+n = 10,000 case. Figure 9 shows that 5×10−4 selects for the optimal tradeoff between generalization
+and specificity. FT-W optimization proceeds for a maximum of 25 steps with a learning rate of
+5 × 10−4. To prevent overfitting, early stopping is performed when the loss reaches 10−2. Regarding
+runtime, FT takes 1,716.21 sec ≈0.48 hr to execute 10,000 edits on GPT-J.
+14
+
+Published as a conference paper at ICLR 2023
+Figure 9: Optimizing fine-tuning weight decay on 10,000 edits. We find an evident tradeoff between
+generalization and specificity, opting for the value with the highest Score.
+Note that we choose not to complicate the analysis by tuning FT-W on more than one layer. Table
+2 demonstrates that FT-W, with just one layer, already gets near-perfect efficacy at the cost of low
+specificity, which indicates sufficient edit capacity.
+B.2
+MODEL EDITING NETWORKS WITH GRADIENT DECOMPOSITION (MEND)
+MEND makes concurrent edits by accumulating gradients from all edit examples, then passing them
+through the hypernetwork together. We use the GPT-J MEND hypernetwork trained by Meng et al.
+(2022). During inference, learning rate scale is set to the default value of 1.0. MEND is by far the
+fastest method, taking 98.25 seconds to execute 10,000 updates on GPT-J.
+B.3
+RANK-ONE MODEL EDITING (ROME)
+The default ROME hyperparameters are available in their open source code: GPT-J updates are
+executed at layer 5, where optimization proceeds for 20 steps with a weight decay of 0.5, KL factor
+of 0.0625, and learning rate of 5 × 10−1. ROME uses prefix sampling, resulting in 10 prefixes of
+length 5 and 10 prefixes of length 10. Covariance statistics are collected in fp32 on Wikitext using a
+sample size of 100,000. See Meng et al. (2022) for more details.
+ROME takes 44,248.26 sec ≈12.29 hr for 10,000 edits on GPT-J, which works out to approximately
+4 seconds per edit.
+B.4
+MASS-EDITING MEMORY IN A TRANSFORMER (MEMIT)
+On GPT-J, we choose R = {3, 4, 5, 6, 7, 8} and set λ, the covariance adjustment factor, to 15,000.
+Similar to ROME, covariance statistics are collected using 100,000 samples of Wikitext in fp32.
+δi optimization proceeds for 25 steps with a learning rate of 5 × 10−1. In practice, we clamp the
+L2 norm of δi such that it is less than 3
+4 of the original hidden state norm, ∥hL
+i ∥. On GPT-NeoX,
+we select R = {6, 7, 8, 9, 10} and set λ = 20,000. Covariance statistics are collected over 50,000
+samples of Wikitext in fp16 but stored in fp32. Optimization for δi proceeds for 20 steps using a
+learning rate of 5 × 10−1 while clamping ∥hL
+i ∥to
+3
+10∥hL
+i ∥.
+In MEMIT, we have the luxury of being able to pre-compute and cache zi values, since they are
+inserted in parallel. If all such vectors are already computed, MEMIT takes 3,226.35 sec ≈0.90 hr
+for 10,000 updates on GPT-J, where the most computationally expensive step is inverting a large
+square matrix (Eqn. 14). Computing each zi vector is slightly less expensive than computing a ROME
+update; to get all 10,000 zi vectors, we need 23,546.65 sec ≈6.54 hr. This optimization is currently
+done in series, but it is actually “embarrassingly parallel,” as we can greatly reduce computation time
+by batching the gradient descent steps. Note that this speed-up does not apply to ROME, since each
+update must be done iteratively.
+15
+
+Published as a conference paper at ICLR 2023
+C
+EVALUATION METRICS
+C.1
+FOR ZSRE
+For consistency with previous works that use the zsRE task (Mitchell et al., 2021; Meng et al., 2022),
+we report the same three probability tests:
+• Efficacy is the proportion of edits that G recalls with top-1 accuracy. Note that the prompt matches
+exactly what the edit method sees at runtime:
+Ei
+
+oi = argmax
+xE
+PG [xE | p(si, ri)]
+
+.
+(21)
+• Paraphrase is the accuracy on rephrasings of the original statement:
+Ei
+
+Ep∈paraphrases(si,ri)
+
+oi = argmax
+xE
+PG [xE | p]
+
+.
+(22)
+• Specificity is the proportion of neighborhood prompts that the model gets correct. In COUNTER-
+FACT, all such prompts have the same correct answer oc
+i:
+Ei
+
+Ep∈neighborhood prompts(si,ri)
+
+oc
+i = argmax
+xE
+PG [xE | p]
+
+.
+(23)
+We also report an aggregated Score: the harmonic mean of Efficacy, Paraphrase, and Specificity.
+C.2
+FOR COUNTERFACT
+COUNTERFACT contains an assortment of prompts and texts for evaluating model rewrites (Figure 14).
+This section provides formal definitions for each COUNTERFACT metric. First, the probability tests:
+• Efficacy Success (ES) is the proportion of cases where oi exceeds oc
+i in probability. Note that the
+prompt matches exactly what the edit method sees at runtime:
+Ei [PG [oi | p(si, ri)] > PG [oc
+i | p(si, ri)]] .
+(24)
+• Paraphrase Success (PS) is the proportion of cases where oi exceeds oc
+i in probability on
+rephrasings of the original statement:
+Ei
+
+Ep∈paraphrases(si,ri) [PG [oi | p] > PG [oc
+i | p]]
+
+.
+(25)
+• Neighborhood Success (NS) is the proportion of neighborhood prompts where the models assigns
+higher probability to the correct fact:
+Ei
+
+Ep∈neighborhood prompts(si,ri) [PG [oi | p] < PG [oc
+i | p]]
+
+.
+(26)
+• Editing Score (S), is the harmonic mean of ES, PS, and NS.
+Now, the generation tests:
+• Reference Score (RS) measures the consistency of G’s free-form generations. To compute it, we
+first prompt G with the subject s, then compute TF-IDF vectors for both G(s) and a reference
+Wikipedia text about o; RS is defined as their cosine similarity. Intuitively, G(s) will match better
+with o’s reference text if it has more consistent phrasing and vocabulary.
+• We also check for excessive repetition (a common failure case with model editing) using Genera-
+tion Entropy (GE), which relies on the entropy of n-gram distributions:
+−
+ 
+2
+3
+X
+k
+f2(k) log2 f2(k) + 4
+3
+X
+k
+f3(k) log2 f3(k)
+!
+.
+(27)
+Here, fn(·) is the n-gram frequency distribution.
+16
+
+Published as a conference paper at ICLR 2023
+D
+EDITING DIFFERENT CATEGORIES OF FACTS TOGETHER
+For an edit (s, r, o), r associates a subject s and object o. Both s and o have their associated types τ(s)
+and τ(o). For example, r = “is a citizen of” is an association between a Person and Country.
+We say that τ(s1) and s2 are diverse if τ(s1) ̸= (τ(s2)), and similar otherwise. The definition
+follows similarly for objects. For any relation pair (r1, r2), we sample from COUNTERFACT a set of
+edits Emix = {(s, r, o) | r ∈{r1, r2}}, such that numbers of edits for each relation are equal. We
+compare MEMIT’s performance on the set of edits Emix in four pairs of relations that have different
+levels of diversity between them. Each relation is followed by its corresponding relation_id in
+WikiData:
+(a) Subject different (τ(s1) ̸= τ(s2)), Object different (τ(o1) ̸= τ(o2)):
+(τ(s1) = Person, r1 = citizen of (P27), τ(o1) = Country),
+(τ(s2) = Country, r2 = official language (P37), τ(o2) = Language)
+(b) Subject similar (τ(s1) = τ(s2)), Object different (τ(o1) ̸= τ(o2)):
+(τ(s1) = Person, r1 = plays position in sport (P413), τ(o1) = Sport position),
+(τ(s2) = Person, r2 = native language (P1412), τ(o2) = Language)
+(c) Subject different (τ(s1) ̸= τ(s2)), Object similar (o1 = τ(o2)):
+(τ(s1) = Place, r1 = located in (P17), τ(o1) = Country),
+(τ(s2) = Item/Product, r2 = country of origin(P495), τ(o2) = Country)
+(d) Subject similar (τ(s1) = τ(s2)), Object similar (τ(o1) = τ(o2)):
+(τ(s1) = Person, r1 = citizen of (P27), τ(o1) = Country),
+(τ(s2) = Person, r2 = works in (P937), τ(o2) = City/Country)
+Figure D depicts MEMIT rewrite performance in these four scenarios. We find that the effectiveness
+of Emix closely follows the average of the individual splits. Therefore, the presence of diversity in
+the edits (or lack thereof) does not tangibly influence MEMIT’s performance.
+E
+DEMONSTRATIONS
+This section provides two case studies, in which we apply MEMIT to mass-edit new or corrected
+memories into GPT-J (6B).
+Knowledge freshness.
+On November 8th, 2022, the United States held elections for 435 con-
+gressional seats, 36 governor seats, and 35 senator seats, several of which changed hands. We
+applied MEMIT to incorporate the election results into GPT-J in the form of (congressperson,
+elected from, district) and (governor/senator, elected from, state).4
+The MEMIT edit attained 100% efficacy (ES) and 94% generalization (PS).
+Application in a specialized knowldge domain.
+For a second application, we used MEMIT to
+create a model with specialized knowledge of amateur astronomy. We scraped the names of stars
+that were referenced more than 100 times from WikiData and belong to one of the 18 constellations
+named below.
+Andromeda,
+Aquarius,
+Cancer,
+Cassiopeia,
+Gemini,
+Hercules,
+Hydra,
+Indus,
+Leo,
+Libra,
+Orion,
+Pegasus,
+Perseus,
+Pisces,
+Sagittarius,
+Ursa Major,
+Ursa Minor,
+Virgo
+We obtained 289 tuples of the form (star, belongs to, constellation). The accuracy
+of the unmodified GPT-J in recalling constellation of a star was only 53%. Post-MEMIT, accuracy
+increased to 86%.
+4The results were available before November 14th.
+17
+
+Published as a conference paper at ICLR 2023
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+80
+85
+90
+95
+100
+Score (S)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+95
+96
+97
+98
+99
+100
+Efficacy Succ (ES)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+70
+75
+80
+85
+90
+95
+100
+Generalization Succ (PS)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+50
+60
+70
+80
+90
+100
+Speficity Success (NS)
+P27
+P37
+P27, P37
+avg
+(a) Subject different, Object different
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+80
+85
+90
+95
+100
+Score (S)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+95
+96
+97
+98
+99
+100
+Efficacy Succ (ES)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+70
+75
+80
+85
+90
+95
+100
+Generalization Succ (PS)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+50
+60
+70
+80
+90
+100
+Speficity Success (NS)
+P413
+P1412
+P413, P1412
+avg
+(b) Subject similar, Object different
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+80
+85
+90
+95
+100
+Score (S)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+95
+96
+97
+98
+99
+100
+Efficacy Succ (ES)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+70
+75
+80
+85
+90
+95
+100
+Generalization Succ (PS)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+50
+60
+70
+80
+90
+100
+Speficity Success (NS)
+P17
+P495
+P17, P495
+avg
+(c) Subject different, Object similar
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+80
+85
+90
+95
+100
+Score (S)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+95
+96
+97
+98
+99
+100
+Efficacy Succ (ES)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+70
+75
+80
+85
+90
+95
+100
+Generalization Succ (PS)
+100
+200
+300
+400
+500
+600
+700
+Number of edits
+50
+60
+70
+80
+90
+100
+Speficity Success (NS)
+P27
+P937
+P27, P937
+avg
+(d) Subject similar, Object similar
+Figure 10: MEMIT’s performance while editing memories with four levels of diversity. Each data
+point is a mean of 10 experiments. Filled areas show 90% confidence intervals of the values from
+those experiments.
+18
+
+Published as a conference paper at ICLR 2023
+F
+ABLATIONS
+MEMIT contains several critical design choices: it uses a (i) range of critical mid-layer (ii) MLP
+modules at the (iii) last subject token, with the (iv) hyperparameter λ (Eqn. 15) to control the impact
+of the update. Choice (iii) was already demonstrated by Meng et al. (2022) to be significant through
+an ablation study, but we now investigate the other three.
+F.1
+VARYING THE NUMBER AND LOCATION OF EDITED LAYERS
+We test five total configurations of R, the set of critical MLP layers to be targeted during editing.
+Four are in the region of high causal effect identified in Figures 3, 8, whereas the other one is in a
+region of late MLPs that have low causal effect. As Figure 11 shows, using more layers yields higher
+efficacy and generalization while also improving specificity. Moreover, edits at the late-layer MLPs
+are considerably worse. These results confirm the importance of the causal analysis to MEMIT’s
+performance.
+Figure 11: Varying the edited MLP layers
+F.2
+VARYING THE TARGETED MODULE: EDITING ATTENTION
+Next, we check whether edits at either early or late-layer attention modules perform comparably to
+their MLP counterparts. As Figure 12 shows, attention edits perform considerably worse.
+F.3
+VARYING THE COVARIANCE HYPERPARAMETER λ
+Finally, we investigate the impact of the covariance adjustment factor (denoted λ in Eqn. 15) on
+performance; Figure 13 displays the results. Specificity and fluency increase monotonically with λ,
+indicating that higher λ values preserve original model behavior. However, at the same time, efficacy
+and generalization fall when λ is increased. We can see that around ≈104, the aggregated score
+reaches a maximum.
+19
+
+Published as a conference paper at ICLR 2023
+Figure 12: Varying the edited attention layers
+Figure 13: Varying the covariance adjustment factor λ
+20
+
+Published as a conference paper at ICLR 2023
+{
+"case_id":15,
+"pararel_idx":8062,
+"requested_rewrite":{
+"prompt":"{}, the",
+"relation_id":"P413",
+"target_new":{
+"str":"goaltender",
+"id":"Q1317534"
+},
+"target_true":{
+"str":"linebacker",
+"id":"Q528145"
+},
+"subject":"Percy Snow"
+},
+"paraphrase_prompts":[
+"Victoriano Salado Alvarez (1867–1931). Which position does Percy Snow play? They play as",
+"It is found in the Indomalayan realm. Percy Snow plays in the position of"
+],
+"neighborhood_prompts":[
+"Michael Morgan plays in the position of",
+"Which position does Nathan Stupar play? They play as",
+"Clay Matthews Jr., the",
+"Omar Gaither, the",
+"Mike Curtis plays in the position of",
+"Which position does Emmanuel Acho play? They play as",
+"Clay Matthews Jr. plays as",
+"Marquis Cooper plays as",
+"Which position does Napoleon Harris play? They play as",
+"Brendon Ayanbadejo, the"
+],
+"generation_prompts":[
+"Percy Snow is incredible at",
+"The expertise of Percy Snow becomes important when",
+"The expertise of Percy Snow becomes important when",
+"The expertise of Percy Snow becomes important when",
+"The expertise of Percy Snow becomes important when",
+"The expertise of Percy Snow becomes important when",
+"Percy Snow is incredible at",
+"The expertise of Percy Snow becomes important when",
+"The expertise of Percy Snow becomes important when",
+"Percy Snow is incredible at"
+]
+}
+Figure 14: A sample of the COUNTERFACT dataset.
+21
+

@@ -1,0 +1,1973 @@
+EvoMoE: An Evolutional Mixture-of-Experts
+Training Framework via Dense-To-Sparse Gate
+Xiaonan Nie†
+Xupeng Miao†$
+Shijie Cao‡
+Lingxiao Ma‡
+Qibin Liu†
+Jilong Xue‡
+Youshan Miao‡
+Yi Liu#
+Zhi Yang†
+Bin Cui†§
+†School of Computer Science & Key Laboratory of High Conﬁdence Software Technologies (MOE), Peking University
+$Carnegie Mellon University
+‡Microsoft Research
+#Tencent Inc
+§Institute of Computational Social Science, Peking University (Qingdao), China
+{xiaonan.nie, xupeng.miao, 1700012767, yangzhi, bin.cui}@pku.edu.cn
+{lingxiao.ma, shijiecao, jxue, yomia}@microsoft.com
+callbackliu@tencent.com
+Abstract—Mixture-of-experts (MoE) is becoming popular due
+to its success in improving the model quality, especially in
+Transformers. By routing tokens with a sparse gate to a few
+experts (i.e., a small pieces of the full model), MoE can easily
+increase the model parameters to a very large scale while keeping
+the computation cost in a constant level. Most existing works
+just initialize some random experts, set a ﬁxed gating strategy
+(e.g., Top-k), and train the model from scratch in an ad-hoc
+way. We identify that these MoE models are suffering from the
+immature experts and unstable sparse gate, which are harmful
+to the convergence performance.
+In this paper, we propose an efﬁcient end-to-end MoE training
+framework called EvoMoE. EvoMoE starts from training one
+single expert and gradually evolves into a large and sparse
+MoE structure. EvoMoE mainly contains two phases: the expert-
+diversify phase to train the base expert for a while and spawn
+multiple diverse experts from it, and the gate-sparsify phase to
+learn an adaptive sparse gate and activate a dynamic number of
+experts. EvoMoE naturally decouples the joint learning of both
+the experts and the sparse gate and focuses on learning the basic
+knowledge with a single expert at the early training stage. Then
+it diversiﬁes the experts and continues to train the MoE with
+a novel Dense-to-Sparse gate (DTS-Gate). Speciﬁcally, instead of
+using a permanent sparse gate, DTS-Gate begins as a dense gate
+that routes tokens to all experts, then gradually and adaptively
+becomes sparser while routes to fewer experts. Evaluations
+are conducted on three popular models and tasks, including
+RoBERTa for masked language modeling task, GPT for language
+modeling task and Transformer for machine translation task.
+The results show that EvoMoE outperforms existing baselines,
+including Switch, BASE Layer, Hash Layer and StableMoE.
+Speciﬁcally, EvoMoE outperforms other MoE methods on GLUE
+benchmark up to 0.562 and 0.403 on average. Our code is
+available 1.
+Index Terms—Deep Learning, Transformer, Mixtures of Ex-
+perts, Dense to Sparse.
+I. INTRODUCTION
+The Transformer model architecture is becoming increas-
+ingly important in data mining and has achieved impressive
+results in a wide range of applications, such as natural lan-
+guage processing [1], computer vision [2], graph learning [3],
+and recommendation systems [4]. Recently, there is a trend of
+improving the capability of Transformer models through en-
+larging data and model scales [1]. Speciﬁcally, [5] explored the
+1https://github.com/codecaution/EvoMoE
+scaling law of transformer models which shows that the model
+performance scales as a power-law with data sizes, model
+sizes and the computation. However, with the rapid increasing
+of the model sizes, it is hard to further scale the model to
+extremely large sizes due to the limited computation power
+of available hardware devices. To address these challenges,
+sparsely-gated Mixture-of-Experts (MoE), a popular form of
+conditional computation, has been proposed to increase the
+model size while without increasing the computational cost
+(e.g., FLOPs) proportionally [6, 7, 8, 9, 10, 11]. Speciﬁcally,
+the input tokens are routed by a sparse gate to a few experts,
+leading to lower computational costs compared to a dense
+model with the same model size.
+The success of MoE model relies on both the large model
+capacity introduced by plenty of experts and the sophisticated
+sparse routing connections learned by the gate network. Many
+existing works [8, 9, 10, 11] are exploring novel gating net-
+works to improve the model quality or the training efﬁciency.
+They typically adopt a pre-deﬁned sparse gate architecture
+(e.g., Top-1 or Top-2 with a ﬁxed number of activated experts),
+and then train the model parameters of both the gate and
+experts jointly from scratch. However, such joint-training over
+pre-deﬁned sparse architecture could severely limit the model
+quality, and even the training efﬁciency. Particularly, at the
+beginning of training a MoE model, both the gate and the
+experts are randomly initialized. The gate does not have
+evidence to decide which expert to process an input token,
+and the experts also do not have experiences to process a
+randomly-assigned input token. Training all experts from a
+random state with random routed samples requires a long
+and duplicated warming-up process. Furthermore, these pre-
+deﬁned gates limit the MoE to explore only 1 or 2 experts at a
+time. But in the early stage with a immature gate, such small
+opportunities could be easily inﬂuenced by the random routing
+noises, and the improper routing could even be reinforced for
+a long time. Our observation shows that such random routing
+in the initial stage and long-distance reinforce-based model
+updating in existing approaches could affect both the training
+time and ﬁnal model quality.
+In this paper, to overcome the limitations in existing ap-
+proaches, we revisit the learning process of MoE models and
+arXiv:2112.14397v2  [cs.LG]  9 Oct 2022
+
++
+Sparse Gate
+Expert
+Expert
+Expert
+Token
++
+Dense Gate
+Expert
+Expert
+Expert
+Token
+Expert
+Token
+2
+Gate-Sparsify
+threshold
+threshold
+1
+Expert-Diversify
+degree = 3
+degree = 1
+Fig. 1. Illustration on the workﬂow of EvoMoE, which contains two phases: (1) expert-diversify phase and (2) gate-sparsify phase. In the ﬁrst stage, we train
+one shared-expert instead of N individual experts and then adopts diversify functions (i.e., random masking) to spawn multiple diverse experts from the
+shared expert. In the second stage, we propose the Dense-to-Sparse gate, which starts as a dense gate that routes tokens to most experts and then gradually
+becomes sparser. Different from previous TopK-based gates, we propose the content-based gating mechanism, which activates experts whose weight is beyond
+the threshold.
+advocate a simple but effective end-to-end training paradigm,
+named EvoMoE. Instead of directly training from a pre-deﬁned
+sparse architecture, EvoMoE gradually evolves into a diverse
+and sparse MoE architecture from an initial model in two
+phases: expert-diversify and gate-sparsify. Speciﬁcally, we
+ﬁnd that both the gate and the experts are underachieving in
+MoE training thus resulting in unstable routing performance.
+Motivated by the successes of weight-sharing models, in the
+ﬁrst stage, we introduce the expert-diversify mechanism to
+learn the commonly shared knowledge across different experts.
+Our proposed mechanism only trains one common experts
+with all input tokens at ﬁrst, which could be seen as sharing
+the model parameters across all the experts. To involve the
+diversity of these experts, we then randomly perturb each
+expert with different masks as the initial model state of the
+following training steps. In the gate-sparsify phase, the weight-
+sharing constraint is released and the training of MoE turns
+to the sparsely activated manner over these diverse experts.
+Unlike the pre-deﬁned sparse gate in the previous works, we
+introduce DTS (Dense-to-Sparse) gate to decide the sparse
+gate gradually for MoE models. We proposed DTS gate to
+adaptively learn a better gating network from a dense one and
+gradually route tokens to fewer experts, making the training
+structure sparser and continuously reducing the computation
+cost, while keeping the model quality improving as usual. In
+particular, to implement the DTS gate, our idea is to carefully
+control the temperature of a softmax-based routing function,
+so that to adjust the weights distribution among experts and
+control the sparsity of the MoE layer during training.
+In short, EvoMoE advances in two aspects. First, compared
+to the joint-training of gate and experts from scratch, EvoMoE
+splits joint-training process and provides an opportunity to
+train experts during a warm start. Such mechanism of training
+gate after experts can reduce a lot of random error-trails
+at the beginning. Second, compared to the reinforce-based
+model updating, starting with a dense gate allows us to get
+training feedback from all diverse experts and adjust the
+routing weights directly to the right direction, which not only
+speeds up the convergence of the gate, but also beneﬁts for
+the expert specialization.
+We evalute EvoMoE on three popular models and tasks,
+including RoBERTa [12] (Encoder-Only) for masked language
+modeling (MLM) task, GPT [13] (Decoder-Only) for language
+modeling (LM) task and Transformer [14] (Encoder-Decoder)
+for machine translation (MT) task. The results show that
+EvoMoE outperforms existing baselines, including Switch [8],
+BASE Layer [15], Hash Layer [11] and StableMoE [16].
+Speciﬁcally, on MLM task, EvoMoE outperforms other MoE
+methods up to 0.562 GLUE score and 0.403 in average for
+the GLUE benchmark [17]; on LM task, EvoMoE outperforms
+other MoE methods up to 0.88 ppl and 0.545 ppl on average;
+on translation task, EvoMoE can averagely achieve 1.0 BLEU
+score improvement as well as 1.33x speed-up that Switch
+Transformer. Experiments also verify the ability of EvoMoE
+for scaling models with more experts or more MoE layers.
+The rest of the paper is organized as follows. We ﬁrst
+introduce the background of Transformers and MoEs in Sec-
+tion II. And we identify two key defects in existing MoE
+training process including the conformity and instability in
+Section II-C. Motivated by these properties, we present our
+EvoMoE design in Section III and introduce the expert-
+diversity stage and gate-sparsify stage respectively. Section IV
+describes some implementation details. We provide the evalu-
+ation methodology and conduct substantial experiments under
+various settings in section V to support our claims. More
+relevant approaches are introduced in Section VI. Finally, we
+provide some concluding remarks in section VII.
+II. PRELIMINARY
+A. Transformer
+The model architecture of Transformer [18] has demon-
+strated its superior performance in many sequence-to-sequence
+2
+
+Multi-Head
+Attention
+Add & Norm
+Feed
+Forward
+Add & Norm
+input
+output
+(a) Transformer Layer
+Multi-Head
+Attention
+Add & Norm
+Feed
+Forward
+Add & Norm
+input
+Feed
+Forward
+Feed
+Forward
+output
+Gate
+(b) Transformer Layer with Mixture-of-Expert
+Fig. 2. A brief architecture of Transformer Encoder Layer and Transformer
+with Mixture-of-Expert Layer. The Transformer encoder layer contains two
+main components: a Multi-Head Self-Attention Layer and a Position-wise
+Feed-Forward Layer. Based on Transformer layer, the transformer with MoE
+replaces the FFN with a series of FFNs and introduce a gate network.
+TABLE I
+NOTATIONS
+Symbols
+Deﬁnitions
+Q
+Queries in self-attention module
+K
+Keys in self-attention module
+V
+Values in self-attention module
+dk
+Feature dimension of each Query/Key
+S
+A set of input tokens
+E
+An series of experts
+D
+Feature dimension of each token
+N
+Number of experts in each MoE layer
+ei(xs)
+The output of i-th Expert by taking input xs
+g(xs)i
+The routing score for xs on i-th Expert
+c
+Threshold for expert selection
+GS,E
+The routing score for S on E
+IdS
+The set of selected expert id on S
+natural language processing (NLP) tasks, which contains sev-
+eral encoder layers and decoder layers. Each encoder layer is
+stacked by a multi-head self-attention network and a position-
+wise feed-forward network (FFN), which is illustrated in
+Figure 2(a). It employs a residual connection on each of
+these two sub-layers, followed by a normalization layer [19].
+Formally, each sub-layer, e.g., attention and FFN, produces
+its output as LayerNorm(x + Sublayer(x)). The decoder is
+similarly constructed, except for an additional cross-attention
+mechanism between attention and FFN to introduce the output
+of the encoder. For a sequence of input tokens (x1, ..., xs) ∈
+RD, we formulate the function of each sub-layer in following:
+Attention: The attention module [14] could capture the
+dependencies between tokens in the sequence, and is effective
+in sequence modeling. It performs as a ternary function, which
+maps the input queries (Q), keys (K) and values (V) to the
+output (O). Equation 1 represents the Scaled Dot-Product
+Feed
+Forward
+Feed
+Forward
+Feed
+Forward
+Gate
+𝑾𝒈:
+𝒙𝒔:
+2.01 2.64 1.8
+𝑾𝒈· 𝒙𝒔:
+0.35 0.65
+0
+𝒔𝒐𝒇𝒕𝒎𝒂𝒙(𝑻𝒐𝒑𝟐(𝑾𝒈· 𝒙𝒔)):
++
+0.1
+0.2
+1.3
+1.1
+0.4
+1.8
+0.3
+2.4
+0.6
+-0.2
+0.4
+1.5
+𝒆𝟎(𝒙𝒔)
+𝒆𝟏(𝒙𝒔)
+𝒆𝟐(𝒙𝒔)
+𝒚𝒔= 𝟎. 𝟑𝟓∗𝒆𝟎𝒙𝒔+ 𝟎. 𝟔𝟓∗𝒆𝟏(𝒙𝒔)
+Fig. 3. Illustration on the workﬂow of Mixture-of-Expert (MoE). The input
+token xs is ﬁrst processed by the gate network to calculate similarities between
+xs and each expert. Then, it performs Top-K operation on these similarities to
+determine the target activated experts. Finally, ys is produced by the linearly
+weighted combination of each expert’s output on the token by the gate’s
+output.
+Attention [14], which performs dot products of each query
+with all keys, divides each by √dk and then adopts the softmax
+function to get the weight of each value. In addition, dk is the
+dimension of queries and keys.
+Attention(Q, K, V ) = softmax(QKT
+√dk
+)V
+(1)
+Multi-Head Attention: Vaswani et al. [14] proposed the
+multi-head attention mechanism to jointly learn from differ-
+ent representation subspaces at different positions and thus
+improved the model performance. The multi-head attention
+linearly projected the queries, keys and values h times with
+learned linear projections to dk, dk and dv, dimensions,
+respectively.
+MultiHead(Q, K, V ) = Concat(head1, ..., headh)W O
+(2)
+where headi = Attention(QW Q
+i , KW K
+i , V W V
+i )
+The projections are the trainable parameter matrices, where
+W Q
+i
+∈Rdmodel×dk, W K
+i
+∈Rdmodel×dk, W V
+i
+∈Rdmodel×dv.
+Meanwhile, h is the number of heads, and dk = dv =
+dmodel/h. Because the dimension of each head is reduced from
+dmodel to dmodel/h, the time cost of multi-head attention is
+similar to that of the original attention. In addition, the decoder
+employs a masked self-attention, which only sees the tokens
+on the left of the sequence.
+Position-wise Feed-Forward Networks: Each transformer
+layer also includes a fully connected feed-forward network
+(Equation 3), which consists of two fully connected networks
+and a ReLU activation function.
+FFN(xs) = W2 · ReLU(W1 · xs + b1) + b2
+(3)
+3
+
+0 1 2 3 4 5 6 7 8 9 10 1112 13 14 15
+Expert ID
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+Duration ID
+Expert Loads Distribution
+0.05
+0.10
+0.15
+0.20
+0.25
+0.30
+(a) Expert Loads Distribution .
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+16
+17
+18
+19
+20
+21
+22
+23
+24
+25
+26
+27
+28
+29
+Duration ID
+0
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+11
+12
+13
+14
+15
+Expert ID
+Selected Expert in Top-1 Gate
+(b) Unstable Routing Pattern for Token “the”
+Fig. 4.
+The observations of GPT-MoE with 16 experts and the Top-1 gate among 12 MoE-layers (totally 24 layer). Figure 4(a) shows the expert load
+distribution (deeper color represents heavier workload, i.e., more tokens to be processed) and Figure 4(b) shows the expert selection for a speciﬁc token “the”.
+B. Mixture of Experts
+Because larger pretrained models always achieve better
+model quality [5], the size of state-of-the-art NLP models has
+been increasing 10× per year, e.g., BERT [20], GPT [21],
+T5 [22], GPT-2 [13], GPT-3 [1], which require increasing
+compute budgets. To improve the model capacity without
+increasing computation budgets, researchers sparsely scale
+transformers recently as Figure 2(b) by replacing the feed-
+forward network with the mixture of experts (MoE) architec-
+ture and activating only a subset of these experts for each
+input sample [7, 8, 9]. The main components of the MoE
+architecture include an expert network E for scaling model
+capacity and a sparse gate network G for introducing model
+sparsity.
+Expert Network: The expert network E includes a series
+of experts {e1, ..., eN} to increase the model capacity, where
+each expert ei represents a single neural network, e.g., FFN,
+and contains its own parameters. In Figure 3, the MoE layer
+consists of three FFN networks. For each expert ei (ei : RD →
+RD), it takes the token xs as an input to produce its own output
+ei(xs). The ﬁnal output of the expert network ys is the linearly
+weighted combination of each expert’s output on the token by
+the gate’s output, formulated as Equation 4.
+ys =
+N
+X
+i=1
+g(xs)i · ei(xs)
+(4)
+In Figure 3, the expert network takes the input token xs :
+[−0.2, 0.4, 1.5] and produces the output of each individual
+expert on xs, e.g., e0(xs), e1(xs) and e2(xs). By combining
+the gate’s output, i.e., [0.35, 0.65, 0], the output of this MoE
+layer is ys = 0.35 ∗e0(xs) + 0.65 ∗e1(xs).
+Sparse Gate Network: The sparse gate network G is
+the key component to introduce model sparsity, which takes
+a batch of tokens {x1, ..., xs} as input and produces the
+probability of them with respective to all experts {e1, ..., eN}.
+Shazeer et al. [7] proposes the Top-K gating as Equation 5,
+which keeps only the top k values before the softmax function.
+In addition, Wg is a trainable variable (Wg ∈RD×N) and
+determine the targeted experts for each token.
+g(xs) = softmax(TopK(xs · Wg))
+(5)
+We illustrate the workﬂow of a MoE layer in Figure 3, where
+k = 2 and Wg is a 3 × 3 (i.e., feature dimension × number of
+experts) matrix to represents the parameter of gate network.
+We ﬁrst perform a dot-product on xs and Wg to calculate
+similarity between the input token and the experts. The result,
+[2.01, 2.64, 1.8], indicates that the input prefers e1 > e0 > e2
+and we only activate e0 and e1 as k = 2. Finally, we conduct
+a softmax function to get the weight score of each expert and
+perform a weighted sum to get the ﬁnal output ys.
+Previous work mainly focuses on how to improve the quality
+and efﬁciency of training such sparse gate network. Shazeer
+et al. [7] proposed the noisy Top-K gating on Long Short-
+TerM memory (LSTM) kayers [23] and
+Lepikhin et al. [9]
+introduced MoE with Top-2 gate into Transformer.
+Lewis
+et al. [10] adopted the numerous solution for balanced token-
+to-expert routing and Roller et al. [11] utilized the hash-based
+routing strategy.
+Distributed Training of MoE Models: Expert parallel
+training is a speciﬁc method of parallelism for MoE models,
+which is ﬁrst proposed by GShard [9]. Experts are placed
+on different workers and each worker takes a different batch
+of training samples. For non-MoE layers, expert parallelism
+behaves the same as data parallelism. In MoE layers, tokens
+in the sequence are sent to workers where their desired experts
+reside. Similar to model parallelism, the outputs of each MoE
+layer are exchanged again to be organized back into original
+sequences for the computation of the next layer. As MoE
+models often have numerous experts, expert parallelism can
+scale up with model size better than model parallelism.
+C. Observation and Motivation
+In this section, we revisit the learning process of MoE
+models and introduce our two key ﬁndings in the following,
+which motivates us to design our EvoMoE framework.
+Conformity in Mixture of Experts: One interesting ﬁnding
+is conformity. During the early training stage, existing join-
+training methods of sparse MoE make the routing decision
+4
+
+Shared-Expert
+Expert-0
+Expert-1
+Expert-2
+Fig. 5.
+To spawn multiple diverse experts from the shared-expert, EvoMoE
+adopt the random masking technique. Speciﬁcally, part of the shared expert’s
+weight are masked as 0.
+to comply with most tokens. Here we train a GPT model
+including 24 transformer layers, with every FFN layer replaced
+by 16-expert MoE layer using the Top-1 gate.
+Figure 4(a) shows that most tokens keep concentrating on
+the 8-th expert at ﬁrst, since it has been greedily reinforced.
+After around hundreds of training steps (i.e., 1 duration equals
+40 training steps), the other experts gradually catch up and
+the workload becomes balanced. Such phenomenon motivates
+us to focus on training a common expert and utilize the
+computational resources to accelerate the early stage.
+Instability in Mixture of Experts: Another important
+ﬁnding is the instability. We take a single token “the” as an
+example and Figure 4(b) shows its expert selection results for a
+longer training process. As we can see, the selection is highly
+unstable later since both the gate network and the experts are
+not knowledgeable enough to obtain a stable routing pattern,
+especially at the early stage of the training process. This
+indicates that a pre-deﬁned gates (e.g., Top-K) in existing
+works, which assumes a ﬁxed number of activated experts,
+could limit the exploration of potential valuable experts. Ag-
+gressively increasing the number of activated experts could
+improve the model capacity but inherently violates the original
+design intention of sparse MoE. Such a dilemma motivates us
+to design an adaptive solution to balance the trade-off between
+the convergence performance and computation costs.
+III. METHODS
+The observations in Section II-C motivates EvoMoE, a two-
+phase framework that gradually and adaptively training MoE-
+based models, which is different from existing methods that
+jointly train the gate network and the expert network over a
+pre-deﬁned sparse (e.g., Top-1 or Top-2) gate and a series of
+randomly initialized experts. As shown in Figure 1, EvoMoE
+contains two phases: an expert-diversify phase and a gate-
+sparsify phase. In the expert-diversify phase, EvoMoE shares
+the weights among experts in one MoE layer for several
+training steps and then makes experts diverse by randomly
+masking. In the gate-sparsify phase, EvoMoE introduces the
+dense-to-sparse (i.e., DTS) gate, which begins routing as a
+dense gate that routes tokens to all experts and then adaptively
+learns the weights of routing to each expert and gradually
+anneals to standard Top-1 gating.
+Algorithm 1: Training MoE in the EvoMoE Frame-
+work
+Data: xS: a group of tokens of size S,
+E: expert network
+TS: number of iterations for shared-expert,
+TD: number of iterations for dense-gate,
+T: number of training iterations.
+1 for i ←1 to TS do
+2
+yS ←e(xS) ;
+3 // Diversify experts from the shared ;
+4 for ei ∈E do
+5
+ei ←diversify(e, i) ;
+6 for i ←TS to T do
+7
+τ ←temperature scheduler(i) ;
+8
+// Get selected expert ids and weights for each
+token ;
+9
+GS, E, IdS ←DTS Gate(xS, τ, TD);
+10
+for s ←1 to S do
+11
+ys ←0 for id ∈ids do
+12
+ys ←ys + Gs, id ∗eid(xs) ;
+A. Problem Formulation
+Given an input token xs, a series of experts {e1, ..., eN}
+and a learn-able gate with parameter Wg, Func is adopted
+by the gate network to determine the targeted experts for it,
+i.e., the token-to-expert assignment, formulated in Equation 6.
+g(xs) is a 1×N vector, which represents the scores of xs with
+respect to experts. Meanwhile, each expert will process the
+input token separately as ei(xs) and combine their output as
+Equation 7.
+g(xs) = Func(xs · Wg)
+(6)
+ys =
+N
+X
+i=1
+g(xs)i · ei(xs)
+(7)
+Existing work adopts a pre-deﬁned Top-K as Func, such as
+Top-2 for GShard [9] and Top-1 for Switch-Transformer [8].
+However, due to the non-derivability of Top-K, only the
+selected experts would back-propagate their gradients to the
+gate network and update their corresponding columns in Wg.
+For example, only 1 expert is selected and 1 column of the
+gate would be updated in Switch-Transformer. So it is hard
+for Top-K gate to optimize this expert-selection problem.
+Moreover, as observed in Figure 4(a), the loads of experts
+are extremely imbalanced at the early stage of training and
+thus most GPUs suffer from low utilization due to stragglers
+in expert parallelism.
+B. Stage 1: Expert-Diversify
+As the gate network and expert network are both randomly
+initialized, it requires a vast amount of computation budget
+for trial and errors, which is inefﬁcient for models’ training.
+Based on the observation in Section II-C that most tokens are
+processed by the same expert and other experts waste their
+5
+
+computation budget, we train one shared-expert instead of N
+individual experts in the early stage (illustrated as the left of
+Figure 1). Because all experts within the same MoE layer
+share weights, the model is equal to its corresponding non-
+MoE model as a small dense model.
+Algorithm 1 illustrates the MoE training process in our
+EvoMoE framework. First, input tokens are processed by
+the shared expert e0 (line 1-2). Then EvoMoE switches the
+training into standard MoE models’ training, by adding a gate
+network at each MoE layer and diversifying all experts from
+the shared expert (line 4-5). After this expert-diversify phase,
+EvoMoE steps into the gate-sparsify phase, where it schedules
+the gate temperature coefﬁcients and then obtains the token-
+to-expert routing relation from DTS-gate (line 7-9). Tokens
+will be dispatched to corresponding experts and aggregated
+together by weighted sum operating (line 10-12).
+Multiple diversify techniques can be adopted to spawn
+multiple diverse experts from one expert, such as noise, NAS,
+random mask. EvoMoE adopts the random mask, which masks
+part of the shared expert’s weights as 0 (shown as Figure 5).
+For example, expert-1 is initialized by masking the central
+value. The proposed expert-diversify stage avoids joint training
+from scratch and the well-trained diverse experts could be
+treated as a better initialization to beneﬁt the following model
+convergence.
+C. Stage 2: Gate-Sparsify
+Although sparse gating has demonstrated its superior model
+efﬁciency in both training and inference, prior work tends to
+convergence to a sub-optimal model under the ﬁxed compu-
+tation budget or the dataset size due to the jointly training
+of the randomly initialized gate network and expert network.
+In this paper, we propose a new mechanism for training
+the gate network, named Dense-to-Sparse gate (DTS-
+Gate, as illustrated in Algorithm 2 ), which starts as a dense
+gate that routes tokens to most experts and then gradually
+becomes sparser. DTS-Gate beneﬁts from the sufﬁcient train-
+ing of experts in the early stage and then make the experts
+selection becomes sparser on the basis of specialized experts.
+This dense-to-sparse process only occupies a small fraction
+compared with the total training time, which usually takes
+days to weeks.
+Gate with Temperature: In order to control the sparsity
+during training, we adopt the softmax temperature to adjust
+the weights distribution among experts. Formulated as Equa-
+tion 8, Wg is the parameter of gate, ζ is the extra noise and
+sampled from Gumbel(0, 1) distribution [24], and τ is the
+softmax temperature which controls the distribution. When the
+τ increases, the distribution of g′(xs) becomes more uniform,
+which evolves more experts into the computation of each
+token. As the τ approaching 0, the distribution becomes one-
+hot, which is more conﬁdent for the gate network.
+g′(xs) =
+e(xs·Wg+ζ)/τ
+PN
+s′=1 e(xs′·Wg+ζ)/τ
+(8)
+Content-based Sparsity: Different from existing static
+Top-K based gate [8] [9], EvoMoE adopts the content-based
+sparsity method to determine the number of activated experts,
+which keeps the value beyond an threshold c. As formulated by
+Equation 9, we drop the experts whose weights fall below the
+threshold c and no extra communication or computation will
+be wasted. It’s worth noting that the sum of selected experts’
+score can not be equal to 1 because we don’t normalize
+them after dropping. It is useful to remain the original score,
+especially only one expert is selected, which was veriﬁed in
+Switch. To meet the demand of above two designs, we enable
+each expert with this content-based gate to make them well
+specialized. transformer [8].
+g(xs)i =
+(
+g′(xs)i,
+if
+g(xs)i > c
+0,
+else
+(9)
+Sparsity Scheduler: With temperature τ increasing, the
+distribution tends to be uniform and more experts will be
+selected. So the sparsity decreases and the training cost of
+the neural network would increases. On the opposite, less
+experts are involved into computation and thus the sparsity
+increases. By scheduling the temperature of Equation 8, we
+can control the sparsity of the MoE layer over different training
+stages. There is a trade-off between model quality and training
+cost for the selection of temperature. For example, when the
+distribution of experts is nearly one-hot, it would lead to
+large variance of gradients between experts and thus make the
+learning of MoE learning difﬁcult. To optimize this problem,
+our DTS-Gate starts at a large temperature that routes tokens
+to most experts and then anneals to a small temperature that
+gradually sparsiﬁes the MoE layer.
+Balance Loss: Similar to Switch transformer [8], we utilize
+the balance loss Lbalance to avoid imbalanced assignments for
+different experts which would cause the straggler problem and
+thus lead to low training efﬁciency.
+Lbalance = αN
+N
+X
+i=1
+(
+P
+xs∈B I{g(xs)i > 0}
+|B|2
+X
+xs∈B
+g′(xs)i)
+(10)
+As formulated in Equation 10, α is a hyper-parameter and
+B represents current batch of tokens. P
+xs∈B I{g(xs)i > 0}
+represents the number of tokens dispatch to expert i and
+P
+xs∈B g′(xs)i represents the gate probability allocated for
+expert i. Intuitively, the balance loss will reduce the amount
+of data for overloaded-experts and move towards to balanced
+loads at the batch data level.
+Training Objective: In the ﬁrst stage, the experts of each
+MoE layer share same weights and thus the loads can be
+divided to them equally. The training objective is to optimize
+the model quality (i.e., Ltask). In the second stage, both the
+model quality and training efﬁciency (i.e., balanced workloads
+between experts) need to be considered.
+L =
+(
+Ltask,
+if
+stage = 1
+Ltask + Lbalance,
+else
+(11)
+6
+
+Algorithm 2: Dense-to-Sparse Gate Mechanism
+Data: xS: a group of tokens of size S, τ: temperature,
+TD: number of iterations of dense-gate.
+Result: GS, E: group combine weights, IdS: Index of
+selected experts
+1 Function DTS Gate(xS, τ, TD):
+2
+gS, E ←gumbel softmax(xS · Wg, τ) ;
+3
+if current iteration < TD then
+4
+//select experts for token, N ≥len(ids) ≥1 ;
+5
+IdS ←select gS, E>threshold ;
+6
+else
+7
+//select Top-1 expert for token, len(ids) = 1 ;
+8
+IdS ←select Top1(gS, E);
+9
+for s ←1 to S do
+10
+for id ∈ids do
+11
+Gs, id ←gs, id ;
+12
+Return IdS, GS, E ;
+IV. IMPLEMENTATION
+EvoMoE is implemented by adding support for MoE mod-
+els on FairSeq2 [25]. Meanwhile, EvoMoE proposes several
+system optimizations, including:
+Topology-Aware Hierarchical All-To-All Communica-
+tion: In AllToAll operation, each GPU sends its data to all
+GPUs (one-for-all) and receives data sent by all GPUs (all-
+for-one), where each data will be divided equally into n parts.
+Current AllToAll operations implemented in NCCL and MPI
+may suffer from low utilization of network bandwidth because
+of the small message size. We propose Topology-Aware
+Hierarchical AllToAll, which combines hierarchical
+networks (intra-node and inter-node) and aggregates messages,
+to optimize the communication between multi-nodes equipped
+with one NIC. It ﬁrst gathers the data of eight GPUs inside
+the same node into one GPU, and then performs a data
+layout transformation to orignize the placement of tokens.
+Afterwards, it launches All-To-All communication between
+nodes, and then performs the data layout transformation and
+scatters tokens to its corresponding expert. In this way, the
+size of data transferred between nodes is #GPU2 times larger
+than before. Meanwhile, this two-level decoupled AllToAll
+also fully utilizes the intra-node (NvLink or PCIe) and inter-
+node bandwidth (Inﬁniband or Ethernet).
+MoE-Aware Recomputation: Recomputation is a main-
+stream techniques to reduce the memory footprint of training
+models, which evicts feature map tensors in the forward pass
+for memory saving and then regenerates them for calculating
+gradients by executing corresponding computation. Existing
+systems, e.g., DeepSpeed [26] and FairSeq [27], adopt recom-
+putation as the recommended conﬁguration for training large
+models, which only saves the input tensor of each Transformer
+layer and re-executes the whole Transformer in the backward.
+As the MoE layer involves two All-To-All communication in
+the forward, re-executing them may lead to large time cost. To
+keep the memory efﬁciency while improve training efﬁciency,
+2https://github.com/facebookresearch/fairseq
+we propose the MoE-aware recomputation, which save three
+tensors of each Transformer layer, including the input tensor
+of Transformer layer, and the input tensor of two All-To-All
+operations.
+V. EXPERIMENTS
+A. Experimental Setup
+1) Machine Environment:
+We conduct experiments on
+DGX-A100, where each server is equipped 2 AMD CPUs
+and 8 NVIDIA Ampere A100 (40GB) GPUs, with Ubuntu
+20.04, CUDA 11.3, CuDNN 8.2.0 and NCCL 2.12.7. GPUs
+inside a server are connected via NVLink 3.0 with and
+servers are connected with 8 InﬁniBand NICs via 8*200
+Gbps bandwidth totally. The RDMA is used by default and
+the PyTorch version is 1.11.
+2) Baselines: To verify the effectiveness of our method, we
+compare it with the several representative baselines, including
+Switch-Transformer [8], BASELayer [15], HashLayer [11],
+DSelectK [28] and StableMoE [16]. Switch-Transformer [8]
+proposed to adopt Top-1 gate for the training of large-
+scale models. BASELayer [10] formulates the token-expert
+routing as a linear assignment problem and guarantees bal-
+anced compute loads by employing numerous algorithms.
+HashLayer [11] replaces the gating network with a hash-
+based routing strategy (e.g., random hash, clustered hash).
+DSelectK [28] involves sparse gates (Top-K) in the multi-
+gate MoE (i.e., MMoE) architecture for better parameter
+sharing among different tasks and trains gates from dense
+to sparse for smoothness. StableMoE [16] also proposed two
+training stages, which learn the gate as well as distill it into
+a lightweight one in the ﬁrst stage, and freezes the parameter
+of gate for stable routing in the second stage. Our EvoMoE
+mainly contains two phases: an expert-diversify phase
+to spawn multiple diverse experts from one single well-trained
+base expert, and a gate-sparsify phase that gradually and
+adaptively learns a increasingly sparse gate from a dense gate.
+3) Benchmark and Datasets: We evaluate EvoMoE on three
+popular tasks, including the machine translation (MT) task
+for domain-speciﬁc models, the Masked Language Modeling
+(MLM) task and the language modeling (LM) task for pre-
+trained models.
+We adopt standard Transformer architecture [18] (Encoder-
+Decoder) for the MT task and train models on four pop-
+ular translation datasets, WMT17 (English to German/Ger-
+man to English)3, and WMT14 (English to French/French
+to English)4. BLEU scores of the test sets are reported for
+comparison.
+We adopt RoBERTa architecture architecture [12] (Encoder-
+only) for the MLM task and train models on the combination
+of datasets, including Wikipedia5, BooksCorpus6, OpenWeb-
+3https://www.statmt.org/wmt17/
+4https://www.statmt.org/wmt14/
+5https://dumps.wikimedia.org/enwiki/latest/enwiki-latest-abstract.xml.gz
+6https://battle.shawwn.com/sdb/books1/books1.tar.gz
+7
+
+TABLE II
+EVALUATING THE PRE-TRAINED MODELS ON THE GLUE BENCHMARK. WE SCALE THE STANDARD TRANSFORMER(TRM) INTO THE MOE MODEL BY
+REPLACING EVERY THE OTHER FFN WITH A MOE LAYER.
+Models
+#Shared Params.
+#Expert Params.
+FLOPs
+MNLI
+QNLI
+QQP
+RTE
+SST-2
+MRPC
+CoLA
+STS
+Avg
+Standard TRM
+355M
+-
+207B
+88.2
+93.2
+92.1
+85.1
+95.8
+88.6
+84.5
+90.5
+89.750
+Larger TRM
+370M
+-
+220B
+88.4
+93.5
+92.2
+85.3
+95.8
+88.9
+84.7
+90.6
+89.925
+Switch TRM
+259M
+1536M
+220B
+89.2
+93.7
+92.2
+86.4
+95.8
+89.1
+85.3
+90.8
+90.313
+BASE Layer
+259M
+1536M
+220B
+89.5
+93.9
+92.4
+87.3
+96.0
+89.4
+85.5
+91.2
+90.650
+Hash Layer
+259M
+1536M
+220B
+89.4
+93.9
+92.2
+87.1
+95.9
+89.2
+85.5
+90.9
+90.513
+StableMoE
+259M
+1536M
+220B
+89.3
+93.8
+92.1
+86.7
+95.8
+89.2
+85.4
+91.0
+90.413
+EvoMoE
+259M
+1536M
+220B
+89.9
+93.9
+92.3
+88.1
+96.1
+89.6
+85.6
+91.5
+90.875
+Text7 and CC-1008. Moreover, these datasets are tokenized by
+byte-pair encoding with a vocabulary size of 50257. Models
+are validated on the famous General Language Understanding
+Evaluation(GLUE) benchmark [17] for comparison.
+We adopt GPT architecture architecture [13] (Decoder-only)
+for the LM task and train models on OpenWebText as Radford
+et al. [13]. We report train/valid/test perplexity (PPL) for
+comparison.
+We also report the inference FLOPs of each model, which
+represents the speed of deploying this model at industry.
+All the training data are downloaded and pre-processed by
+following the example scripts from Fairseq9.
+4) Hyper-Parameter Detail: We sparsely scale these mod-
+els by replacing every other the feed-forward layer (FFN) with
+MoE-FFN Layer, which contains a series of FFN experts. All
+models use the GeLU activation functions [29], polynomial
+learning rate scheduler and Adam optimizer [30], where
+β1 = 0.9 and β2 = 0.98 . We set clip norm as 0.0, weight
+decay as 0.1 and dropout rate as 0.1. We use CrossEntropy
+as the criterion and utilize the label smoothed technique with
+coefﬁcient of 0.1 for the MT task. The coefﬁcient of balance
+loss is set as 0.1 in Switch-Transformer [8], StableMoE [16]
+and our EvoMoE. We set the threshold c of our dense-to-sparse
+gate as 0.001 over training steps, which determines how large
+the expert’s weight is important and is a trade-off between
+training cost and model quality from our point of view.
+B. GLUE Results
+Model
+Architecture:
+We
+pretrain
+the
+representative
+RoBERTa model for the masked language modeling task,
+where we set standard Transformer(TRM) with 24 encoder
+layers, hidden dimension as 1024 and number of attention
+heads as 16. We replace every other FFN layer in standard
+Transformer with the MoE layer (16 experts per layers) to
+construct the MoE models. The standard Transformer is a
+dense model and contains 355M parameters totally, whose
+inference FLOPs is 207B. Meanwhile, the sparse MoE model
+contains 1759M parameters totally, including 259M parame-
+ters for shared backbone and 1536M parameters for the expert
+7https://zenodo.org/record/3834942/ﬁles/openwebtext.tar.xz
+8https://data.statmt.org/cc-100/
+9https://github.com/facebookresearch/fairseq/tree/main/examples
+network. In our setting that only 1 expert is active at a time,
+each input token will activate 335M parameters of the sparse
+MoE models, which is the same as standard Transformer
+model except for the gate network. To exactly match the
+inference speed (FLOPs) of MoE models, we slightly increase
+the FFN hidden size of standard TRM to construct the larger
+TRM.
+Model Performance: We pretrained each model for 100k
+steps totally, 5k of which was the warm-up phase. For our Evo-
+MoE, we scheduled the ﬁrst 5k steps as the expert-diversify
+stage and the following 5k steps for annealing temperature
+from 2.0 to 0.3. After the pre-training stage, we ﬁnetune the
+pre-trained models on each GLUE task and summarized the
+results in Table II. As for RTE, we ﬁnetune it starting from the
+MNLI model rather than the pretrained model as
+Liu et al.
+[12].
+Compared with other baselines, EvoMoE achieves state-of-
+the-art results on 7 out of 8 tasks and the best averaged score.
+The MoE model is constructed by adding the gate network
+and replacing the original FFN layer of standard Transformer,
+which increases its model size and thus enlarges its capacity.
+Thus all MoE models outperform their backbone model (stan-
+dard TRM), e.g., 89.750 for standard TRM and 90.313 (+
+0.563) for Switch TRM with respect to the avg score. Larger
+TRM slightly outperforms standard TRM because of its large
+model size. As veriﬁed by Kaplan et al. [5], larger models tend
+to be more sample-efﬁcient, which represents better model
+quality with ﬁxed training data/steps.
+Compared with other MoE methods, EvoMoE beneﬁts from
+the sufﬁcient training of experts in the early stage and then
+make the experts selection becomes sparser on the basis of
+specialized experts. Speciﬁcally, EvoMoE outperforms other
+MoE methods on GLUE benchmark up to 0.562 and 0.403 on
+average. Switch TRM [8] jointly trains the randomly initialized
+experts and gates, which aims to learn better parameter as well
+as balanced routing. It is hard to optimize them simultaneously
+and thus performs bad among MoE models. To alleviate this
+problem, StableMoE [16] freezes the parameter of gate net-
+work after the early training stage and improves over Switch-
+TRM. Hash Layer [11] utilizes the ﬁxed hash strategy to
+route tokens, which is based on the input embedding. Because
+both the hash strategy and input embedding is ﬁxed, Hash
+8
+
+TABLE III
+PERPLEXITY RESULTS OF LANGUAGE MODELING TASK.
+Models
+#Shared Params.
+#Expert
+#Expert Params.
+FLOPs
+Perplexity(↓)
+Standard TRM
+345M
+-
+-
+207B
+15.14
+Larger TRM (wider)
+360M
+-
+-
+220B
+14.92
+Switch TRM
+249M
+192
+1536M
+220B
+13.12
+BASE Layer
+249M
+192
+1536M
+220B
+12.45
+Hash Layer
+249M
+192
+1536M
+220B
+12.87
+StableMoE
+249M
+192
+1536M
+220B
+12.91
+EvoMoE
+249M
+192
+1536M
+220B
+12.24
+TABLE IV
+BLEU SCORE ON EACH MACHINE TRANSLATION DATASETS
+Models
+En-De
+De-En
+En-Fr
+Fr-En
+TRM-Base
+28.1
+34.8
+39.2
+38.1
+Switch-TRM
+28.4
+34.6
+39.1
+38.2
+EvoMoE
+29.6
+36.7
+40.3
+39.2
+w/o stage 1
+29.6
+36.5
+40.2
+39.3
+w/o stage 2
+28.7
+35.2
+39.4
+38.3
+Layers only need to learn the parameter of experts. However,
+it may lead to sub-optimal because the hash strategy is selected
+based on human knowledge and may be inappropriate. BASE
+Layer [15] enforces a balanced token-to-expert assignment
+through a linear assignment problem, which simplify the
+training in another way. All these work ﬁnd the problem of
+jointly training and targeting at alleviate it.
+C. Language Modeling Results
+Model Architecture: We pretrain the representative GPT
+model for the language modeling task, where we set standard
+Transformer(TRM) with 24 decoder layers, hidden dimension
+as 1024 and number of attention heads as 16. Every other FFN
+layer is replaced by in standard Transformer with the MoE
+layer (16 experts per layers) to construct the MoE models.
+There totally exists 12 MoE layers and thus 192 experts (i.e.,
+12 × 16). Meanwhile, larger TRM is scaled by increasing its
+FFN hidden size.
+Model Performance: We pretrained each model on the
+OpenWebText dataset for 200k steps totally, 10k of which was
+the warm-up phase. For our EvoMoE, we scheduled the ﬁrst
+10k steps as the expert-diversify stage and the following 5k
+steps for annealing temperature from 2.0 to 0.3. We report the
+perplexity on the test set. Results are summarized in Table III.
+Compared with other baselines, our EvoMoE achieves the
+best result among all baselines. Speciﬁcally, the perplexity
+of EvoMoE is 12.24, which achieves a 2.90 improvement
+compared with 15.14 of standard TRM. Meanwhile, all MoE
+models outperform their backbone model (standard TRM)
+because of their large model capacity. Larger TRM slightly
+outperforms standard TRM because of its large model size,
+which demonstrates the sample-efﬁcient of large models.
+Compared with other MoE methods, EvoMoE beneﬁts from
+the sufﬁcient training of experts in the early stage and then
+make the experts selection becomes sparser on the basis of
+TABLE V
+BLEU PERFORMANCE OF MOE MODELS WITH DIFFERENT EXPERT
+NUMBER.
+Number of Experts
+4
+8
+16
+Switch
+28.4
+28.6
+28.7
+EvoMoE
+29.6
+29.9
+30.0
+w/o stage 1
+29.6
+29.9
+30.1
+w/o stage 2
+28.7
+28.9
+28.9
+TABLE VI
+EFFICIENCY OF MOE MODELS WITH DIFFERENT EXPERT NUMBER, AND
+THE RESULTS ARE NORMALIZED OVER SWITCH.
+Number of Experts
+4
+8
+16
+Switch
+1
+1
+1
+EvoMoE
+0.82
+0.78
+0.75
+w/o stage 1
+0.86
+0.82
+0.81
+w/o stage 2
+0.95
+0.93
+0.92
+specialized experts. Speciﬁcally, EvoMoE outperforms other
+MoE methods up to 0.88 ppl and 0.545 ppl on average. The
+analysis between different methods is same as that in GLUE
+results.
+D. Machine Translation Results
+Model Architecture: We pretrain the representative T5
+model for the machine translation task, where we set standard
+Transformer(TRM) with 12 encoder-decoder layers, hidden
+dimension as 768 and number of attention heads as 12. Every
+other FFN layer is replaced by in standard Transformer with
+the MoE layer (4 experts per layers) to construct the MoE
+models.
+Model Performance: We compare EvoMoE with Trans-
+former and Switch-Transformer on four language-pair datasets,
+including English to German, German to English, English
+to French and French to English. Results are shown in
+Table IV, V, VI. We remark that these models all have
+the same inference speed even if MoE models enlarge the
+parameter size. We show the BLEU score on the test set of
+each dataset in Table IV. EvoMoE outperforms other methods
+by 1 BLEU score on average. Although Switch-Transformer
+scale the model size, it still achieves a similar performance
+with Transformer-Base, which is parameter-efﬁcient. Table V
+9
+
+2x Speedup
+(a) Validation PPL over steps
+1.25x Speedup
+(b) Validation PPL over FLOPs
+Fig. 6.
+End-to-end performance comparison between GPT-ori, GPT-Switch and GPT-DTS. Figure 6(a) and Figure 6(b) represent the curve of PPL over
+iterations and FLOPs, where GPT-DTS can obtain 2.0x speed-up to reach the same validation perplexity, as well as higher FLOPs-efﬁciency of a 1.42x
+speed-up.
+shows the BLEU performance of different expert number on
+the English-German datasets. EvoMoE can still outperform
+the Switch-Transformer about 1.3 BLEU with the increasing
+number of experts. Because of the datasets’ quality, the effect
+of increasing expert number is limited.
+Model-Efﬁcency: Table VI show the model efﬁciency of
+EvoMoE and Switch Gate on the English-German datasets.
+EvoMoE is efﬁcient at the speed of converge. For exam-
+ple, EvoMoE need only 75% compute budget of Switch-
+Transformer to reach the same PPL. It is worth noting that
+the speedup over Switch-Transformer improves as the expert
+number increases.
+Ablation Study: We present a ablation study on EvoMoE
+to show the inﬂuence of two stages by removing the expert-
+diversify phase and the gate-sparsify phase respectively. Re-
+sults are summarized in Table IV V VI. As for the model
+performance metric, it will lead to performance degrada-
+tion when EvoMoE removes the gate-sparsify stage, such as
+38.3/39.2 in Fr-En of Table IV. Meanwhile, it is worth noting
+that inﬂuence is little as for w/ and w/o the expert-diversify
+stage, which encourages us to involve this stage for saving
+computation budget. As for the FLOPs-efﬁciency metric, the
+gate-sparsify phase can improve the FLOPs-efﬁciency by 17%.
+By introducing the expert-diversify stage, EvoMoE can obtain
+an extra 4% improvement.
+In summary, the gate-sparsify phase can both improve the
+model performance and FLOPs-efﬁciency signiﬁcantly and the
+expert-diversify phase can introduce extra FLOPs-efﬁciency
+without performance degradation. In the following sections,
+we will detail analyze the gate-sparsify phase and evaluate it
+at large scale.
+E. Breakdown on the Gate-Sparsify Phase
+Model Architecture: We pretrain the representative GPT
+model for the language modeling task, where we set GPT-ori
+with 24 decoder layers, hidden dimension as 1024 and number
+of attention heads as 16. Every other FFN layer is replaced
+by in standard Transformer with the MoE layer (16 experts
+per layers) to construct the GPT-MoE model. GPT-Switch
+represents training MoE models with Switch gate, which keeps
+Top-1 selection. GPT-DTS represents training MoE models
+with the dense-to-sparse gate, which starts as a dense
+gate that routes tokens to most experts and then gradually
+becomes sparser.
+We compare the required FLOPs to train models to show the
+FLOPs-efﬁciency of different methods. The FLOPs-efﬁciency
+is deﬁned as the best model performance (PPL) can be
+achieved given the ﬁxed number of ﬂoating-point operations
+(computation budget). Because the actual training time could
+be affected by the system engineering efforts on the implemen-
+tation details, which are not our focus in this approach. Instead,
+in our experiments, we prefer to choose the computation
+complexity for fair comparisons.
+Model Performance: We pretrained each model on the
+OpenWebText dataset for 300k steps totally, 10k of which
+was the warm-up phase. For our EvoMoE, we scheduled the
+ﬁrst 10k steps for annealing temperature from 2.0 to 0.3. We
+report the perplexity on the validation set. Results are shown
+in Figure 6. To improve the computation efﬁciency, only part
+parameters are used for each token in sparse models with the
+cost of model performance. DTS-Gate aims to shift the model
+training from dense to sparse, and keep the inference cost same
+as sparse models. Experiments show that compared with the
+state-of-the-art Switch-Transformer in GPT-MoE model with
+OpenWebText dataset, GPT-DTS can obtain 2.0x speed-up to
+reach the same validation perplexity (Figure 6(a)), as well as
+higher FLOPs-efﬁciency of a 1.42x speed-up (Figure 6(b)).
+Experiments also verify the ability of dense-to-sparse
+gate for scaling models with more experts or more MoE layers.
+Comparison with Sparse Models. MoE-Switch pre-deﬁnes
+its static Top-1 gating network and jointly training the gate
+and experts networks. Different from GPT-Switch, GPT-DTS
+utilizes temperature to adjust the distribution of the token-to-
+experts (one-hot or uniform) and threshold to remove compu-
+tation of experts with low weights. EvoMoE performs better
+10
+
+1
+2
+3
+4
+5
+6
+7
+FLOPs
+1e12
+14
+15
+16
+17
+18
+19
+20
+21
+22
+Validation PPL
+Scale with more experts
+1-expert
+4-experts
+8-experts
+16-experts
+(a) More Experts
+1
+2
+3
+4
+5
+6
+7
+FLOPs
+1e12
+14
+16
+18
+20
+22
+24
+26
+Validation PPL
+Scale with more MoE layers
+0-MoE-Layer
+1-MoE-Layer
+4-MoE-Layer
+6-MoE-Layer
+(b) More MoE Layers
+Fig. 7. Scalability for DTS gate. It shows that more experts or more MoE-layers (larger models with constant FLOPs), will lead to better FLOPs-efﬁciency.
+than GPT-Switch in sample-efﬁciency because of more experts
+involved in training and updates at the beginning, shown as
+Figure 6(a). As for FLOPs-efﬁciency, DTS-Gate ﬁrst involves
+more experts into warm-up training, which is poor FLOPs-
+efﬁcency. But with the training going on, GPT-DTS can obtain
+greater than 25% improvements in FLOPs-efﬁciency com-
+pared with the state-of-the-art Switch-Transformer in GPT-
+MoE model with OpenWebText dataset.
+F. Scalability
+In this subsection, we investigate different experiment set-
+tings to validate the scalability of our DTS-Gate.
+Model Architecture: We choose the GPT-small as the
+backbone model for the language modeling task, where we
+set the model with 12 decoder layers, hidden dimension as
+768 and number of attention heads as 12.
+Increase the Expert Number: Based on GPT-Small model
+with 117M parameters, we replace the 7-th FFN layer by one
+MoE layer and vary its experts number within {1, 4, 8, 16}.
+As shown by Figure 7(a), with increasing expert numbers,
+EvoMoE keeps consistent improvements (i.e., lower PPL)
+during training.
+Increase the MoE layer number: Similarly, we also vary
+the number of MoE layers to validate the performance of
+DTS gate. We insert k MoE layers in GPT-Small, where
+k ∈{0, 1, 4, 6} and each MoE layer contains 8 experts.
+Figure 7(b) shows that by increasing MoE layers, EvoMoE
+can achieve better model performance with same FLOPs.
+G. Effect of Sparsity Scheduler
+It is worth noting that several hyper-parameters are intro-
+duced in Dense-To-Sparse gate, such as max/min temperature
+and decay iterations. In this section, we analyze the effect of
+different hyper-parameter setting by conducting experiments
+of various settings. The training model is GPT-MoE, 24-layer
+decoder with 12 MoE-layer (16 experts per layer) and the
+dataset is OpenWebText.
+We decay temperature τ from max value to min value in
+the ﬁrst 15000 iterations and switch to Top1 then. Experiments
+with different max value to min value are evaluated, and
+the results are shown in Figure 8.
+1.0
+1.5
+2.0
+2.5
+3.0
+3.5
+4.0
+FLOPs
+1e13
+16
+17
+18
+19
+20
+21
+22
+23
+24
+Validation PPL
+Different Temperature Scheduler
+1 to 0.1
+2 to 0.1
+2 to 0.3
+2 to 0.5
+Fig. 8. Effect of different temperature scheduler.
+TABLE VII
+THE MOST FREQUENT TOKENS ASSIGNED TO EACH EXPERT IN THE
+VALIDATION SET, WHICH SHOWS THAT SOME EXPERTS ASSIGNMENT
+DECISIONS ARE MADE BASED ON LOCAL CONTEXTS. FOR MANY OTHER
+EXPERTS, THE ASSIGNMENT DECISION DEPENDS ON LONGER CONTEXT,
+AND IS HARDER TO VISUALIZE.
+Expert
+Top5 Proceeding Tokens
+Descriptions
+1
+is
+was
+be
+are
+have
+auxiliary verbs
+3
+.
+\n
+/
+(
+;
+punctuations
+4
+in
+,
+of
+and
+from
+prepositions
+6
+and
+I
+it
+that
+they
+possessive cases
+12
+out
+up
+go
+back
+down
+directional prepositions
+Max/Min Temperature Under small temperatures, the
+weight distribution of experts is close to one-hot, which
+leads to the one-token-one-expert distribution and low training
+cost, but the variance of gradients is large. In contrast, large
+temperatures result in nearly uniform distribution gate weights,
+which evolves more experts into training but the variance of
+gradients is small. As shown in Figure 8, we ﬁnd the these
+two hyper-parameters have low inﬂuence on the model quality
+under the same training budget, except for the extrame value,
+e.g., 1.0 for max value and 0.1 for min value.
+H. Visualization of Expert Specialization
+We visualize the routing strategy of the pre-trained GPT
+model by EvoMoE in Table VII through its corresponding
+11
+
+input embedding, where each MoE layer contains 16 experts.
+For each expert, we present the Top5 proceeding tokens
+assigned and give descriptions for explanations from our points
+of view. For example, Expert 1 captures the auxiliary verbs and
+Expert 6 captures possessive cases. These experts can capture
+local contexts of each embedding well. For other experts, it is
+diff cult to visualize because of the long contexts’ inﬂuence.
+VI. RELATED WORK
+a) Static Sparse Neural Networks: Exploiting the spar-
+sity in deep neural networks can reduce both storage and com-
+putation requirements for model training and inference. One of
+the most widely used sparsiﬁcation methods is weight pruning
+[31, 32]. Previous studies proposed to prune away redundant
+or less useful weights based on various pruning criteria (e.g.,
+the importance of individual weights [32] or groups of weights
+[33, 34, 35]) and then ﬁne-tune remaining weights to regain the
+lost accuracy. After pruning and ﬁne-tuning, parts of weights
+are permanently removed, inducing a static sparsity pattern in
+DNNs. The sparsity pattern/structure is a trade-off between
+model effectiveness and hardware efﬁciency [36]. Early work
+attempts to increase the sparsity ratio or model accuracy by
+employing unstructured sparsiﬁcation methods, while recent
+work focuses more on structured sparsity for practical speedup
+on hardware. Interestingly, [37] points out training a sparse
+network from scratch is superior or comparable to pruning-
+based methods. Our EvoMoE adopts a dense-to-sparse gate,
+which is analogous to pruning-based methods that train all
+experts ﬁrst and then learning the sparse gate routing.
+b) Conditional Computation with MoE: Different from
+previous static sparse neural networks that permanently re-
+move partial weights, conditional computation [6] only acti-
+vates the relevant parameter of the model on a per-sample
+basis, which can be regarded as a dynamic sparsity structure
+that remains all model weights but brings sparsity into the
+computation. The mixture-of-expert (MoE) architecture [7],
+as a speciﬁc form of conditional computation, contains a
+series of experts and a trainable gating network which routes
+each input sample to its corresponding experts. Conditional
+computation is capable of reducing inference cost (without
+reducing model capacity) or increasing model capacity (with-
+out increasing inference cost) from a model acceleration or
+scaling perspective. On the other hand, the sparsely activated
+parts (i.e., MoE in models) can be regarded as structured
+sparse blocks, which does not introduce additional compu-
+tational overhead. However, conditional computation models
+are often difﬁcult to train, since they require learning discrete
+routing decisions from individual examples to experts and
+the gating network tends to converge to a state that only
+selects the same few experts [38]. LSTM-MoE [7], GShard [9]
+and Switch-Transformer [8] utilize auxiliary load-balancing
+losses to mitigate this self-reinforcement phenomenon and
+thus improve training efﬁciency. In such MoE models, the
+gating network and experts, as two critical components, are
+jointly trained which may interfere with each other. In Evo-
+MoE, we consider decoupling the training of experts and the
+gating network by involving all experts starting with a high
+temperature in Gumbel-Softmax and then training the gating
+network to be sparser and select the best expert through decay-
+ing this temperature. BASELayer [10] formulates the token-
+expert routing as a linear assignment problem and guarantees
+balanced compute loads by employing numerous algorithms.
+HashLayer [11] replaces the gating network with a hash-based
+routing strategy (e.g., random hash, clustered hash dispersed
+hash). MoEﬁcation [39] utilizes the sparse activation in feed-
+forward networks (FFNs) of a Transformer model and divides
+each large dense FFN into several experts to accelerate model
+inference, while EvoMoE evolves a small dense model into a
+large and sparse MoE model.
+c) Multi-Task Learning with MoE: The multi-task learn-
+ing (MTL) adopts a shared architecture to learn multiple tasks,
+which exploits relationships among tasks and achieve better
+generalization performance [40]. However, sharing parameters
+between unrelated tasks can potentially degrade performance.
+The multi-gate MoE (i.e., MMoE) architecture is introduced
+as an effective way to exploit both the commonalities and
+differences among tasks, where each task has its own gate
+that adaptively controls the extent of parameter sharing [41].
+DSelect-K [28] involves sparse gates (Top-K) for better param-
+eter sharing and trains gates from dense to sparse for smooth-
+ness, Regarding DSelect-K and the DTS gate in our EvoMoE
+both propose the dense-to-sparse mechanism, they are trying
+to address two totally different problems, though both two
+pieces of work show SparseMoE is better than DenseMoE by
+coincidence. For our DTS work, because DenseMoE performs
+well but cost for large model pretraining, we tried to ﬁnd
+a more efﬁcient solution (SparseMoE). While for the multi-
+task work, because DenseMoE performs badly for multi-task
+learning, they tried to ﬁnd a better solution to deal with various
+tasks, i.e., DSelectK. Therefore, this two pieces of work have
+clearly different motivations.
+VII. CONCLUSION AND FUTURE WORK
+MoE models suffer from the training efﬁciency challenge
+due to the difﬁculty of training many experts and the gate
+network jointly. In this work, we presented an MoE training
+framework EvoMoE that decouples the training of experts
+and the gate network by ﬁrst spawning multiple diverse
+experts from one single well-trained base expert and then
+learning a increasingly sparse gate from a dense gate. Our
+evaluations show that EvoMoE can not only achieve better
+model quality in Transformers with given computation budget
+but also achieve better FLOPs-efﬁciency when comparing with
+previous works in MoE training. On the other hand, EvoMoE
+opens challenges for system execution due to the computation
+in the early stage and the adaptive capacity of experts. In
+the future, we would like to design and implement system-
+level optimizations to achieve efﬁcient training in both model
+quality and system execution.
+12
+
+REFERENCES
+[1] T. B. Brown, B. Mann, N. Ryder, M. Subbiah, J. Ka-
+plan, P. Dhariwal, A. Neelakantan, P. Shyam, G. Sastry,
+A. Askell, S. Agarwal, A. Herbert-Voss, G. Krueger,
+T. Henighan, R. Child, A. Ramesh, D. M. Ziegler, J. Wu,
+C. Winter, C. Hesse, M. Chen, E. Sigler, M. Litwin,
+S. Gray, B. Chess, J. Clark, C. Berner, S. McCandlish,
+A. Radford, I. Sutskever, and D. Amodei, “Language
+models are few-shot learners,” in NeurIPS, 2020.
+[2] A. Dosovitskiy, L. Beyer, A. Kolesnikov, D. Weis-
+senborn, X. Zhai, T. Unterthiner, M. Dehghani, M. Min-
+derer, G. Heigold, S. Gelly, J. Uszkoreit, and N. Houlsby,
+“An image is worth 16x16 words: Transformers for
+image
+recognition
+at
+scale,”
+in
+9th
+International
+Conference on Learning Representations, ICLR 2021,
+Virtual Event, Austria, May 3-7, 2021, 2021. [Online].
+Available: https://openreview.net/forum?id=YicbFdNTTy
+[3] C. Ying, T. Cai, S. Luo, S. Zheng, G. Ke, D. He, Y. Shen,
+and T.-Y. Liu, “Do transformers really perform bad for
+graph representation?” arXiv preprint arXiv:2106.05234,
+2021.
+[4] Q. Chen, H. Zhao, W. Li, P. Huang, and W. Ou, “Be-
+havior sequence transformer for e-commerce recommen-
+dation in alibaba,” in Proceedings of the 1st Interna-
+tional Workshop on Deep Learning Practice for High-
+Dimensional Sparse Data, 2019, pp. 1–4.
+[5] J. Kaplan, S. McCandlish, T. Henighan, T. B. Brown,
+B. Chess, R. Child, S. Gray, A. Radford, J. Wu, and
+D. Amodei, “Scaling laws for neural language models,”
+CoRR, vol. abs/2001.08361, 2020. [Online]. Available:
+https://arxiv.org/abs/2001.08361
+[6] Y. Bengio, N. L´eonard, and A. C. Courville, “Estimating
+or propagating gradients through stochastic neurons for
+conditional computation,” CoRR, vol. abs/1308.3432,
+2013. [Online]. Available: http://arxiv.org/abs/1308.3432
+[7] N. Shazeer, A. Mirhoseini, K. Maziarz, A. Davis, Q. V.
+Le, G. E. Hinton, and J. Dean, “Outrageously large
+neural networks: The sparsely-gated mixture-of-experts
+layer,” in 5th International Conference on Learning
+Representations, ICLR 2017, Toulon, France, April 24-
+26, 2017, Conference Track Proceedings, 2017. [Online].
+Available: https://openreview.net/forum?id=B1ckMDqlg
+[8] W. Fedus, B. Zoph, and N. Shazeer, “Switch transform-
+ers: Scaling to trillion parameter models with simple and
+efﬁcient sparsity,” CoRR, vol. abs/2101.03961, 2021.
+[Online]. Available: https://arxiv.org/abs/2101.03961
+[9] D. Lepikhin, H. Lee, Y. Xu, D. Chen, O. Firat,
+Y. Huang, M. Krikun, N. Shazeer, and Z. Chen, “Gshard:
+Scaling giant models with conditional computation and
+automatic sharding,” in 9th International Conference on
+Learning Representations, ICLR 2021, Virtual Event,
+Austria, May 3-7, 2021, 2021. [Online]. Available:
+https://openreview.net/forum?id=qrwe7XHTmYb
+[10] M. Lewis, S. Bhosale, T. Dettmers, N. Goyal, and
+L. Zettlemoyer, “Base layers: Simplifying training of
+large, sparse models,” arXiv preprint arXiv:2103.16716,
+2021.
+[11] S. Roller, S. Sukhbaatar, A. Szlam, and J. Weston,
+“Hash layers for large sparse models,” arXiv preprint
+arXiv:2106.04426, 2021.
+[12] Y. Liu, M. Ott, N. Goyal, J. Du, M. Joshi, D. Chen,
+O. Levy, M. Lewis, L. Zettlemoyer, and V. Stoyanov,
+“Roberta: A robustly optimized bert pretraining ap-
+proach,” arXiv, 2019.
+[13] A. Radford, J. Wu, R. Child, D. Luan, D. Amodei,
+I. Sutskever et al., “Language models are unsupervised
+multitask learners.”
+[14] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit,
+L. Jones, A. N. Gomez, L. Kaiser, and I. Polosukhin,
+“Attention is all you need,” in NeurIPS, 2017, pp. 5998–
+6008.
+[15] M. Lewis, S. Bhosale, T. Dettmers, N. Goyal, and
+L. Zettlemoyer, “BASE layers: Simplifying training
+of
+large,
+sparse
+models,”
+in
+Proceedings
+of
+the
+38th International Conference on Machine Learning,
+ICML 2021, 18-24 July 2021, Virtual Event, ser.
+Proceedings of Machine Learning Research, M. Meila
+and T. Zhang, Eds., vol. 139.
+PMLR, 2021, pp.
+6265–6274. [Online]. Available: http://proceedings.mlr.
+press/v139/lewis21a.html
+[16] D. Dai, L. Dong, S. Ma, B. Zheng, Z. Sui, B. Chang,
+and F. Wei, “Stablemoe: Stable routing strategy for
+mixture
+of
+experts,”
+in
+Proceedings
+of
+the
+60th
+Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), ACL 2022, Dublin,
+Ireland, May 22-27, 2022, S. Muresan, P. Nakov, and
+A. Villavicencio, Eds.
+Association for Computational
+Linguistics, 2022, pp. 7085–7095. [Online]. Available:
+https://doi.org/10.18653/v1/2022.acl-long.489
+[17] A. Wang, A. Singh, J. Michael, F. Hill, O. Levy, and
+S. R. Bowman, “GLUE: A multi-task benchmark and
+analysis platform for natural language understanding,” in
+Proceedings of the Workshop: Analyzing and Interpreting
+Neural Networks for NLP, BlackboxNLP@EMNLP 2018,
+Brussels,
+Belgium,
+November
+1,
+2018,
+T.
+Linzen,
+G. Chrupala, and A. Alishahi, Eds.
+Association for
+Computational Linguistics, 2018, pp. 353–355. [Online].
+Available: https://doi.org/10.18653/v1/w18-5446
+[18] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit,
+L. Jones, A. N. Gomez, Ł. Kaiser, and I. Polosukhin,
+“Attention is all you need,” Advances in neural informa-
+tion processing systems, vol. 30, 2017.
+[19] L. J. Ba, J. R. Kiros, and G. E. Hinton, “Layer
+normalization,”
+CoRR,
+vol.
+abs/1607.06450,
+2016.
+[Online]. Available: http://arxiv.org/abs/1607.06450
+[20] J. Devlin, M. Chang, K. Lee, and K. Toutanova,
+“BERT: pre-training of deep bidirectional transformers
+for language understanding,” in Proceedings of the
+2019
+Conference
+of
+the
+North
+American
+Chapter
+of
+the
+Association
+for
+Computational
+Linguistics:
+Human Language Technologies, NAACL-HLT 2019,
+13
+
+Minneapolis, MN, USA, June 2-7, 2019, Volume 1
+(Long
+and
+Short
+Papers),
+J.
+Burstein,
+C.
+Doran,
+and T. Solorio, Eds.
+Association for Computational
+Linguistics, 2019, pp. 4171–4186. [Online]. Available:
+https://doi.org/10.18653/v1/n19-1423
+[21] A.
+Radford,
+K.
+Narasimhan,
+T.
+Salimans,
+and
+I.
+Sutskever,
+“Improving
+language
+understanding
+by generative pre-training,” 2018.
+[22] C. Raffel, N. Shazeer, A. Roberts, K. Lee, S. Narang,
+M. Matena, Y. Zhou, W. Li, and P. J. Liu, “Exploring
+the limits of transfer learning with a uniﬁed text-
+to-text transformer,” J. Mach. Learn. Res., vol. 21,
+pp.
+140:1–140:67,
+2020.
+[Online].
+Available:
+http:
+//jmlr.org/papers/v21/20-074.html
+[23] S. Hochreiter and J. Schmidhuber, “Long short-term
+memory,” Neural Comput., vol. 9, no. 8, pp. 1735–1780,
+1997. [Online]. Available: https://doi.org/10.1162/neco.
+1997.9.8.1735
+[24] E.
+Jang,
+S.
+Gu,
+and
+B.
+Poole,
+“Categorical
+reparameterization
+with
+gumbel-softmax,”
+in
+5th
+International Conference on Learning Representations,
+ICLR
+2017,
+Toulon,
+France,
+April
+24-26,
+2017,
+Conference
+Track
+Proceedings,
+2017.
+[Online].
+Available: https://openreview.net/forum?id=rkE3y85ee
+[25] M. Baines, S. Bhosale, V. Caggiano, N. Goyal, S. Goyal,
+M. Ott, B. Lefaudeux, V. Liptchinsky, M. Rabbat,
+S. Sheiffer, A. Sridhar, and M. Xu, “Fairscale: A
+general purpose modular pytorch library for high per-
+formance and large scale training,” https://github.com/
+facebookresearch/fairscale, 2021.
+[26] J. Rasley, S. Rajbhandari, O. Ruwase, and Y. He,
+“Deepspeed: System optimizations enable training deep
+learning models with over 100 billion parameters,” in
+KDD ’20: The 26th ACM SIGKDD Conference on
+Knowledge Discovery and Data Mining, Virtual Event,
+CA, USA, August 23-27, 2020.
+ACM, 2020, pp.
+3505–3506. [Online]. Available: https://doi.org/10.1145/
+3394486.3406703
+[27] M. Ott, S. Edunov, A. Baevski, A. Fan, S. Gross, N. Ng,
+D. Grangier, and M. Auli, “fairseq: A fast, extensible
+toolkit for sequence modeling,” in Proceedings of
+the 2019 Conference of the North American Chapter
+of
+the
+Association
+for
+Computational
+Linguistics:
+Human Language Technologies, NAACL-HLT 2019,
+Minneapolis, MN, USA, June 2-7, 2019, Demonstrations,
+W. Ammar, A. Louis, and N. Mostafazadeh, Eds.
+Association for Computational Linguistics, 2019, pp.
+48–53. [Online]. Available: https://doi.org/10.18653/v1/
+n19-4009
+[28] H. Hazimeh, Z. Zhao, A. Chowdhery, M. Sathiamoor-
+thy, Y. Chen, R. Mazumder, L. Hong, and E. H. Chi,
+“Dselect-k: Differentiable selection in the mixture of
+experts with applications to multi-task learning,” in Ad-
+vances in Neural Information Processing Systems 34:
+Annual Conference on Neural Information Processing
+Systems 2021, NeurIPS 2021, December 6-14, 2021,
+virtual, M. Ranzato, A. Beygelzimer, Y. N. Dauphin,
+P. Liang, and J. W. Vaughan, Eds., 2021, pp. 29 335–
+29 347.
+[29] D. Hendrycks and K. Gimpel, “Gaussian error linear
+units (gelus),” arXiv preprint arXiv:1606.08415, 2016.
+[30] D. P. Kingma and J. Ba, “Adam: A method for
+stochastic optimization,” in 3rd International Conference
+on Learning Representations, ICLR 2015, San Diego,
+CA, USA, May 7-9, 2015, Conference Track Proceedings,
+Y. Bengio and Y. LeCun, Eds., 2015. [Online]. Available:
+http://arxiv.org/abs/1412.6980
+[31] Y. LeCun, J. S. Denker, and S. A. Solla, “Optimal brain
+damage,” in Advances in neural information processing
+systems, 1990, pp. 598–605.
+[32] S. Han, H. Mao, and W. J. Dally, “Deep compres-
+sion: Compressing deep neural networks with pruning,
+trained quantization and huffman coding,” arXiv preprint
+arXiv:1510.00149, 2015.
+[33] W. Wen, C. Wu, Y. Wang, Y. Chen, and H. Li, “Learning
+structured sparsity in deep neural networks,” Advances
+in neural information processing systems, vol. 29, pp.
+2074–2082, 2016.
+[34] J.-H. Luo, J. Wu, and W. Lin, “Thinet: A ﬁlter level
+pruning method for deep neural network compression,”
+in Proceedings of the IEEE international conference on
+computer vision, 2017, pp. 5058–5066.
+[35] Y. He, X. Zhang, and J. Sun, “Channel pruning for
+accelerating very deep neural networks,” in Proceedings
+of the IEEE international conference on computer vision,
+2017, pp. 1389–1397.
+[36] H. Mao, S. Han, J. Pool, W. Li, X. Liu, Y. Wang,
+and W. J. Dally, “Exploring the granularity of sparsity
+in convolutional neural networks,” in Proceedings of
+the IEEE Conference on Computer Vision and Pattern
+Recognition Workshops, 2017, pp. 13–20.
+[37] J. Frankle and M. Carbin, “The lottery ticket hypothesis:
+Finding sparse, trainable neural networks,” in Interna-
+tional Conference on Learning Representations, 2018.
+[38] D. Eigen, M. Ranzato, and I. Sutskever, “Learning fac-
+tored representations in a deep mixture of experts,” arXiv
+preprint arXiv:1312.4314, 2013.
+[39] Z.
+Zhang,
+Y.
+Lin,
+Z.
+Liu,
+P.
+Li,
+M.
+Sun,
+and
+J. Zhou, “Moeﬁcation: Conditional computation of trans-
+former models for efﬁcient inference,” arXiv preprint
+arXiv:2110.01786, 2021.
+[40] S. Ruder, “An overview of multi-task learning in deep
+neural networks,” CoRR, vol. abs/1706.05098, 2017.
+[Online]. Available: http://arxiv.org/abs/1706.05098
+[41] J. Ma, Z. Zhao, X. Yi, J. Chen, L. Hong, and E. H.
+Chi, “Modeling task relationships in multi-task learning
+with multi-gate mixture-of-experts,” in Proceedings of
+the 24th ACM SIGKDD International Conference on
+Knowledge Discovery & Data Mining, KDD 2018,
+London, UK, August 19-23, 2018, Y. Guo and F. Farooq,
+Eds.
+ACM, 2018, pp. 1930–1939. [Online]. Available:
+https://doi.org/10.1145/3219819.3220007
+14
+

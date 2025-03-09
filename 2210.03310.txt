@@ -1,0 +1,4455 @@
+Published as a conference paper at ICLR 2023
+SCALING FORWARD GRADIENT WITH LOCAL LOSSES
+Mengye Ren1∗, Simon Kornblith2, Renjie Liao3, Geoffrey Hinton2,4
+1NYU, 2Google, 3UBC, 4Vector Institute
+ABSTRACT
+Forward gradient learning computes a noisy directional gradient and is a biologi-
+cally plausible alternative to backprop for learning deep neural networks. However,
+the standard forward gradient algorithm, when applied naively, suffers from high
+variance when the number of parameters to be learned is large. In this paper, we
+propose a series of architectural and algorithmic modiﬁcations that together make
+forward gradient learning practical for standard deep learning benchmark tasks. We
+show that it is possible to substantially reduce the variance of the forward gradient
+estimator by applying perturbations to activations rather than weights. We further
+improve the scalability of forward gradient by introducing a large number of local
+greedy loss functions, each of which involves only a small number of learnable pa-
+rameters, and a new MLPMixer-inspired architecture, LocalMixer, that is more suit-
+able for local learning. Our approach matches backprop on MNIST and CIFAR-10
+and signiﬁcantly outperforms previously proposed backprop-free algorithms on Im-
+ageNet. Code is released at https://github.com/google-research/
+google-research/tree/master/local_forward_gradient.
+1
+INTRODUCTION
+Most deep neural networks today are trained using the backpropagation algorithm (a.k.a. back-
+prop) (Werbos, 1974; LeCun, 1985; Rumelhart et al., 1986), which efﬁciently computes the gradients
+of the weight parameters by propagating the error signal backwards from the loss function to each
+layer. Although artiﬁcial neural networks were originally inspired by biological neurons, backprop
+has always been considered as “biologically implausible” as the brain does not form symmetric
+backward connections or perform synchronized computations. From an engineering perspective,
+backprop is incompatible with a massive level of model parallelism, and restricts potential hardware
+designs. These concerns call for a drastically different learning algorithm for deep networks.
+In the past, there have been attempts to address the above weight transport problem by introducing
+random backward weights (Lillicrap et al., 2016; Nøkland, 2016), but they have been found to scale
+poorly on larger datasets such as ImageNet (Bartunov et al., 2018). Addressing the issue of global
+synchronization, several papers showed that greedy local loss functions can be almost as good as
+end-to-end learning (Belilovsky et al., 2019; Löwe et al., 2019; Xiong et al., 2020). However, they
+still rely on backprop for learning a number of internal layers within each local module.
+Approaches based on weight perturbation, on the other hand, directly send the loss signal back to the
+weight connections and hence do not require any backward weights. In the forward pass, the network
+adds a slight perturbation to the synaptic connections and the weight update is then multiplied by the
+negative change in the loss. Weight perturbation was previously proposed as a biologically plausible
+alternative to backprop (Xie & Seung, 1999; Seung, 2003; Fiete & Seung, 2006). Instead of directly
+perturbing the weights, it is also possible to use forward-mode automatic differentiation (AD) to
+compute a directional gradient of the ﬁnal loss along the perturbation direction (Pearlmutter, 1994).
+Algorithms based on forward-mode AD have recently received renewed interest in the context of
+deep learning (Baydin et al., 2022; Silver et al., 2022). However, existing approaches suffer from the
+curse of dimensionality, and the variance of the estimated gradients is too high to effectively train
+large networks.
+In this paper, we revisit activity perturbation (Le Cun et al., 1988; Widrow & Lehr, 1990; Fiete
+& Seung, 2006) as an alternative to weight perturbation. As previous works focused on speciﬁc
+settings, we explore the general applicability to large networks trained on challenging vision tasks.
+∗Work done as a visiting faculty researcher at Google. Correspondence to: mengye@cs.nyu.edu.
+1
+arXiv:2210.03310v3  [cs.LG]  2 Mar 2023
+
+Published as a conference paper at ICLR 2023
+We prove that activity perturbation yields lower-variance gradient estimates than weight perturbation,
+and provide a continuous-time rate-based interpretation of our algorithm. We directly address the
+scalability issue of forward gradient learning by designing an architecture with many local greedy
+loss functions, isolating the network into local modules and hence reducing the number of learnable
+parameters per loss. Unlike prior work that only adds local losses along the depth dimension, we
+found that having patch-wise and channel group-wise losses is also critical. Lastly, inspired by the
+design of MLPMixer (Tolstikhin et al., 2021), we designed a network called LocalMixer, featuring a
+linear token mixing layer and grouped channels for better compatibility with local learning.
+We evaluate our local greedy forward gradient algorithm on supervised and self-supervised image
+classiﬁcation problems. On MNIST and CIFAR-10, our learning algorithm performs comparably
+with backprop, and on ImageNet, it performs signiﬁcantly better than other biologically plausible
+alternatives using asymmetric forward and backward weights. Although we have not fully matched
+backprop on larger-scale problems, we believe that local loss design could be a critical ingredient for
+biologically plausible learning algorithms and the next generation of model-parallel computation.
+2
+RELATED WORK
+Ever since the perceptron era, the design of learning algorithms for neural networks, especially algo-
+rithms that could be realized by biological brains, has been a central interest. Review papers by Whit-
+tington & Bogacz (2019) and Lillicrap et al. (2020) have systematically summarized the progress
+of biologically plausible deep learning. Here, we discuss related work in the following subtopics.
+Forward gradient and reinforcement learning. Our work leverages forward-mode automatic
+differentiation (AD), which was ﬁrst proposed by Wengert (1964). Later it was used to learn recurrent
+neural networks (Williams & Zipser, 1989) and to compute Hessian vector products (Pearlmutter,
+1994). Computing the true gradient using forward-mode AD requires the full Jacobian, which is often
+large and expensive to compute. Recently, Baydin et al. (2022) and Silver et al. (2022) proposed
+to update the weights based on the directional gradient along a random or learned perturbation
+direction. They found that this approach is sufﬁcient for small-scale problems. This general family
+of algorithms is also related to reinforcement learning (RL) and evolution strategies (ES), since in
+each case the network receives a global reward. RL and ES have a long history of application in
+neural networks (Whitley, 1993; Stanley & Miikkulainen, 2002; Salimans et al., 2017), and they
+are effective for certain continuous control and decision-making tasks. Clark et al. (2021) found
+global credit assignment can also work well in vector neural networks where weights are only present
+between vectorized groups of neurons.
+Greedy local learning. There have been numerous attempts to use local greedy learning objectives
+for training deep neural networks. Greedy layerwise pretraining (Bengio et al., 2006; Hinton et al.,
+2006; Vincent et al., 2010) trains individual layers or modules one at a time to greedily optimize
+an objective. Local losses are typically applied to different layers or residual stages, using common
+supervised and self-supervised loss formulations (Belilovsky et al., 2019; Nøkland & Eidnes, 2019;
+Löwe et al., 2019; Belilovsky et al., 2020). Xiong et al. (2020); Gomez et al. (2020) proposed to
+use overlapped losses to reduce the impact of greedy learning. Patel et al. (2022) proposed to split a
+network into neuron groups. Laskin et al. (2020) applied greedy local learning on model parallelism
+training, and Wang et al. (2021) proposed to add a local reconstruction loss for preserving information.
+However, most local learning approaches proposed in the last decade rely on backprop to compute
+the weight updates within a local module. One exception is the work of Nøkland & Eidnes (2019),
+which avoided backprop by using layerwise objectives coupled with a similarity loss or a feedback
+alignment mechanism. Gated linear networks and their variants (Veness et al., 2017; 2021; Sezener
+et al., 2021) ask every neuron to make a prediction, and have shown interesting results on avoiding
+catastrophic forgetting. From a theoretical perspective, Baldi & Sadowski (2016) provided insights
+and proofs on why local learning can be worse than global learning.
+Asymmetric feedback weights. Backprop relies on weight symmetry: the backward weights are the
+same as the forward weights. Past research has looked at whether this constraint is necessary. Lillicrap
+et al. (2016) proposed feedback alignment (FA) that uses random and ﬁxed backward weights and
+found it can support error driven learning in neural networks. Direct FA (Nøkland, 2016) uses a
+single backward layer to wire the loss function back to each layer. There have also been methods that
+aim to explicitly update backward weights. Recirculation (Hinton & McClelland, 1987) and target
+propagation (TP) (Bengio, 2014; Lee et al., 2015; Bartunov et al., 2018) use local reconstruction
+2
+
+Published as a conference paper at ICLR 2023
+objective to learn separate forward and backward weights as approximate inverses of each other.
+Ladder networks (Rasmus et al., 2015) found local reconstruction objectives and asymmetric weights
+can help achieve strong semi-supervised learning performance. However, Bartunov et al. (2018)
+reported both FA and TP algorithms do not scale to larger problems such as ImageNet, where their
+error rates are over 90%. Liao et al. (2016); Xiao et al. (2019) proposed sign symmetry (SS) where
+each backward connection weight share the same sign as the forward counterpart. Akrout et al. (2019)
+proposed weight mirroring and the modiﬁed Kolen-Pollack algorithm (Kolen & Pollack, 1994) to
+align forward and backward weights. Woo et al. (2021) proposed to update using activities from
+several layers below to avoid bidirectional connections. Compared to these works, we circumvent
+the issue of weight symmetry, and more generally network symmetry, by using only reward (and the
+change rate thereof), instead of backward weights.
+Biologically plausible perturbation learning. Forward gradient is related to perturbation learning
+in the biology context. Traditionally, neural plasticity learning rules focus on deriving weight updates
+as a function of the input and output activity of a neuron (Hebb, 1949; Widrow & Hoff, 1960; Oja,
+1982; Bienenstock et al., 1982; Abbott & Nelson, 2000). Weight perturbation learning (Jabri & Flower,
+1992), on the other hand, is much more general as it permits any form of global reward (Schultz
+et al., 1997). It was developed in both rated-based and spiking-based formuations (Xie & Seung,
+1999; Seung, 2003). Activity (or node) perturbation was proposed in shallow networks (Le Cun
+et al., 1988; Widrow & Lehr, 1990) and later in a spike-based continuous time network (Fiete &
+Seung, 2006), where it was interpreted as the perturbation of the conductance of neurons. Werfel
+et al. (2003) showed that backprop has a faster convergence rate than perturbation learning, and
+activity perturbation wins over weight perturbation by another factor. In our work, we show activity
+perturbation has lower gradient estimation variance compared to weight perturbation.
+3
+FORWARD GRADIENT LEARNING
+In this section, we review and establish the technical background for our learning algorithm. We ﬁrst
+review the technique of forward-mode automatic differentiation (AD). Second, we formulate two
+different types of perturbation in the weight space or activity space.
+3.1
+FORWARD-MODE AUTOMATIC DIFFERENTIATION (AD)
+Let f : Rm 7→Rn. The Jacobian of f, Jf, is a matrix of size n × m. Forward-mode AD computes
+the matrix-vector product Jfv, where v ∈Rm. It is deﬁned as the directional gradient along v
+evaluated at x:
+Jfv := lim
+δ7→0
+f(x + δv) −f(x)
+δ
+.
+(1)
+For comparison, backprop, also known as reverse-mode AD, computes the vector-Jacobian product
+vJf, where v ∈Rn, which corresponds to the last term in the chain rule. In contrast to reverse-mode
+AD, forward-mode AD only requires one forward pass, which is augmented with the derivative
+information. To compute the Jacobian vector product of a node in a computation graph, ﬁrst the
+input node will be augmented with v, which is the vector to be multiplied. Then for other nodes, we
+send in a tuple of (x, x′) as inputs and compute a tuple (y, y′) as outputs, where x′ and y′ are the
+intermediate derivatives at node x and node y, i.e. y′ = dy
+dxx′, and dy
+dx is the Jacobian between y and
+x. In the JAX library (Bradbury et al., 2018), forward-mode AD is implemented as jax.jvp.
+3.2
+WEIGHT-PERTURBED FORWARD GRADIENT
+Weight perturbation to generate weight updates was originally explored in (Barto et al., 1983; Xie
+& Seung, 1999; Seung, 2003). Baydin et al. (2022) uses the technique of forward-mode AD to
+implement weight perturbation, which is better than ﬁnite differences in terms of numerical stability.
+Let wij be the weight connection between unit i and j, and f be the loss function. We can estimate
+the gradient by sampling a random matrix with iid elements vij drawn from a zero-mean unit-variance
+Gaussian distribution. The estimator is
+gw(wij) =
+P
+i′j′ ∇wi′j′vi′j′
+
+vij.
+(2)
+Intuitively, this estimator samples a random perturbation direction vij and tests how it aligns with
+the true gradient ∇wi′j′ by using forward-mode to perform the dot product, and then multiplies the
+scalar alignment with the perturbation direction again. Baydin et al. (2022) referred this form of
+gradient estimation using forward-mode AD as “forward gradient”. To distinguish with another form
+3
+
+Published as a conference paper at ICLR 2023
+Unbiased?
+Avg. Variance (shared)
+Avg. Variance (independent)
+gw(·)
+Yes
+pq+2
+N V + (pq + 1)S
+pq+2
+N V + pq+1
+N S
+ga(·)
+Yes
+q+2
+N V + (q + 1)S
+q+2
+N V + q+1
+N S
+Table 1: Comparing weight (gw) and activity (ga) perturbation. V =dimension-wise avg. gradient
+variance, S=dimension-wise avg. squared gradient norm; p=fan-in; q=fan-out; N=batch size.
+of perturbation we detail later, we refer this to as “weight-perturbed forward gradient”, or simply as
+“weight perturbation”.
+3.3
+ACTIVITY-PERTURBED FORWARD GRADIENT
+An alternative to perturbing the weights is to instead perturb the activities, which can reduce the num-
+ber of perturbation dimensions per example. Activity perturbation was originally explored in Le Cun
+et al. (1988); Widrow & Lehr (1990) under restrictive assumptions. Here, we introduce a general way
+to estimate gradients using activity perturbation. It is potentially biologically plausible, since it could
+correspond to perturbation of the conductance in each neuron (Fiete & Seung, 2006). Here, we focus
+on a discrete-time rate-based formulation for simplicity. Let xi denote the activity of the i-th pre-
+synaptic neuron and zj denote that of the j-th post-synaptic neuron before the non-linear activation
+function, and uj be the perturbation of zj. The activity-perturbed forward gradient estimator is
+ga(wij) = xi
+P
+j′ ∇zj′uj′
+
+uj,
+(3)
+where the inner product between ∇z and u is again computed by using forward-mode AD.
+3.4
+THEORETICAL PROPERTIES
+In this section we aim to analyze the expectation and variance properties of forward gradient
+estimators. We focus our analysis on the gradient of one weight matrix {wij}, but the conclusion
+holds for a network with many weight matrices too.
+Table 1 summarizes the theoretical results1. With a batch size of N, independent perturbation
+can achieve 1/N reduction of variance, whereas shared perturbation has a constant variance term
+dominated by the squared gradient norm. However, when performing independent weight perturbation,
+matrix multiplications cannot be batched because each example’s activation vector is multiplied
+with a different weight matrix. By contrast, independent activity perturbation admits batched matrix
+multiplications. Moreover, activity perturbation enjoys a factor of fan-in (p) times smaller variance
+compared to weight perturbation since the number of perturbed elements is the number of output
+units instead of the size of the whole weight matrix. The only drawback of activity perturbation is the
+memory required for storage of intermediate activations, in exchange for a factor of Np reduction
+in variance. However, for both activity and weight perturbation, the variance still grows with larger
+networks. In Section 4 we will further reduce the variance by introducing local loss functions.
+3.5
+CONTINUOUS-TIME RATE-BASED MODELS
+Forward-mode AD can be viewed as computing the ﬁrst-order time derivative in a continuous-time
+physical system. Suppose the tuples passed between nodes of the computation graph are (x, ˙x),
+where ˙x is the change in x over time. The computation is then the same as forward-mode AD. For
+each node, ˙y = dy
+dx ˙x, where dy
+dx is the Jacobian between the output and the input. Note that in a
+physical system we don’t have to explicitly perform the differentiation operation by running two
+forward passes. Instead the ﬁrst-order derivative information is readily available in the analog signal,
+and we only need to plug the output signal into a differentiator circuit.
+The activity-perturbed learning rule for a continuous time system is thus ˙wij ∝xi ˙yj ˙r, where xi
+is the pre-synaptic activity, and ˙yj is the rate of change in the post-synaptic activity, which is the
+perturbation direction for a small period of time, and ˙r is the rate of change of reward (or the negative
+loss). The reward controls whether learning is Hebbian or anti-Hebbian. Both Hinton et al. (2007)
+and Bengio et al. (2017) propose to use a product of pre-synaptic activity and the rate of change
+of postsynaptic activity. However, they did not consider using the rate of change of reward as a
+modulator and instead relied on another set of feedback weights to communicate the error signal
+through inputs. In contrast, we show that by broadcasting the rate of change of reward, we can
+actually bypass the weight transport problem.
+1All proofs can be found in Appendix 8 and 9. Numerical simulation results can be found in Appendix 10.
+4
+
+Published as a conference paper at ICLR 2023
+Channel
+Mixing
+Token
+Mixing
+Channel
+Mixing
++
+Token
+Mixing
+Channel
+Mixing
++
+… …
+Local 
+Losses
+A
+A
+A
+Local 
+Losses
+Local 
+Losses
+Figure 1: A LocalMixer network consists of several mixer blocks. A=Activation function (ReLU).
+…     …
+LN+FC+LN
+Channels
+Patches
+Token Mixing
+Channels
+Patches
+T
+LN+FC+LN+A
+T
+Channel Mixing
+Channel Groups
+LN+FC+LN+A
+LN+FC+LN+A
+…    …
+LN+FC+LN+A
+LN+FC+LN+A
+…
+LN+FC+LN
+LN+FC+LN
+Reshape
++
+LN+FC+LN
+LN+FC+LN
+LN+FC+LN
+Local Losses
+Project
+LN+FC
+LN+FC
+LN+FC
+LN+FC
+LN+FC
+LN+FC
+N x HW x C
+N x C x HW
+N x HW x C
+N x HW x G x C/G
+N x HW x G
+…     …
+A
+Figure 2: A LocalMixer residual block with local losses. Token mixing consists of a linear layer and
+channels are grouped in the channel mixing layers. Layer norm is applied before and after every linear
+layer. LN=Layer Norm; FC=Fully Connected layer; A=Activation function (ReLU); T=Transpose.
+3.6
+ACTIVATION SPARSITY AND NORMALIZATION FUNCTIONS
+In networks with ReLU activations, we can leverage ReLU sparsity to achieve further variance
+reduction, because the inactivated units will have zero gradient and therefore we should not perturb
+these units, and set the perturbation to be zero.
+Normalization layers are often added in deep neural networks after the linear layer. To compute the
+correct gradient in activity perturbation, we also need to account for normalization in the weight
+update rule. Since there is no backward weight connections, one option is to simply apply backprop
+on normalization layers. However, we also found that it is also ﬁne to ignore the gradient of
+normalization layer when using layer normalization.
+4
+SCALING WITH LOCAL LOSSES
+As we have explained in the previous section, perturbation learning can suffer from a curse of
+dimensionality: the variance grows with the number of perturbation dimensions, and in deep networks
+there are often millions of parameters changing at the same time. One way to limit the number of
+learnable dimensions is to divide the network into submodules, each with a separate loss function. In
+this section, we will explore several ways to increase the number of local losses to tame the variance.
+1) Blockwise loss. First, we will divide the network into modules in depth. Each module consists of
+several layers. At the end of each module, we compute a loss function, and that loss is used to update
+the parameters in that module. This approach is equivalent of adding a “stop gradient” operator in
+between modules. Such local greedy losses were previously explored in Belilovsky et al. (2019) and
+Löwe et al. (2019).
+2) Patchwise loss. Sensory input signals such as images have spatial dimensions. We will apply
+a separate loss patchwise along these spatial dimensions. In the Vision Transformer architec-
+ture (Vaswani et al., 2017; Dosovitskiy et al., 2021), each spatial token represents a patch in the
+image. In modern deep networks, parameters in each spatial location are often shared to improve data
+efﬁciency and reduce memory bandwidth utilization. Although naive weight sharing is not biolog-
+ically plausible, we still consider shared weights in this work. It may be possible to mimic the effect
+of weight sharing by adding knowledge distillation (Hinton et al., 2015) losses in between patches.
+3) Groupwise loss. Lastly, we turn to the channel dimension. To create multiple losses, we split the
+channels into a number of groups, and each group is attached to a loss function (Patel et al., 2022).
+To prevent groups from communicating between each other, channels are only connected to other
+channels within the same group. A grouped linear layer is computed as zg,j = P
+i wg,i,jxg,i, for
+individual group g. Whereas previous work used channel groups to improve computational efﬁciency
+(Krizhevsky et al., 2012; Ioannou et al., 2017; Xie et al., 2017), in our work, adding groups contributes
+to the total number of losses and thus reduces variance.
+Feature aggregators. Naively applying losses separately to the spatial and channel dimensions leads
+to suboptimal performances, since each dimension contains only local information. For losses of
+5
+
+Published as a conference paper at ICLR 2023
+Groups
+Stack + StopGradient
+Patches
+AvgPool + StopGradient
+Avg
+Avg
+Avg
+Avg
+N x HW x G x C/G
+N x HW x G x C
+N x HW x HW x G x C
+N x HW x G x C
+B. Replicated
+A. Conventional
+Patches
+Avg
+N x C
+N x HW x C
+Figure 3: Feature aggregator designs. A) In the conventional design, average pooling is performed
+to aggregate features from different spatial locations. B) We propose the replicated design, features
+are ﬁrst concatenated across groups and then averaged across spatial locations. We create copies of
+the same feature with different stop gradient masks so that we obtain more local losses instead of a
+global one. The stop gradient mask makes sure that perturbation in one spatial group corresponds to
+its loss function. The numerical value of the loss function is the same as the conventional design.
+standard tasks such as classiﬁcation, the model needs a global view of the inputs to make a decision.
+Standard architectures obtain this global view by performing global average pooling layer before
+the ﬁnal classiﬁcation layer. We therefore explore strategies for aggregating information from other
+groups and spatial patches before the local loss function.
+We would prefer to perform aggregation without reducing the total number of dimensions. We thus
+propose a replicated design for feature aggregation, shown in Figure 3. First, channel groups are
+copied and communicated to one another, but every group except the active group itself is masked
+with stop gradient so that other groups do not affect the forward gradient computation:
+xp,g = [StopGrad(xp,1...xp,g−1), xp,g, StopGrad(xp,g+1, ..., xp,G)],
+(4)
+where p and g index the patches and groups respectively. Similarly, each spatial location is also
+copied, communicated, and masked, and then averaged locally:
+xp,g = 1
+P
+
+xp,g + P
+p′̸=p StopGrad(xp′,g)
+
+.
+(5)
+The output of feature aggregation is the same as that of the conventional global average pooling layer.
+The difference is that here the loss is replicated and different patch groups are activated in each loss.
+Learning objectives. We consider the supervised classiﬁcation loss and the contrastive InfoNCE
+loss (van den Oord et al., 2018; Chen et al., 2020), which are the two most commonly used
+losses in image representation learning. For supervised classiﬁcation, we attach a shared linear
+layer (shared across p, g) on top of the aggregated features for a cross entropy loss: Ls
+p,g =
+−P
+k tk log softmax(Wlxp,g)k. The loss is of the same value across each group and patch location.
+For contrastive learning, the linear layer becomes a linear feature projector. Suppose x(1)
+n
+and
+x(2)
+n
+are the two different views of the n-th example, the InfoNCE loss for contrastive learning is:
+Step
+Training Loss
+0
+5
+10
+15
+20000
+40000
+60000
+80000
+Original
+Different Perturbation
+StopGrad
+Figure 4: Importance of StopGradi-
+ent in the InfoNCE loss, using M/8 on
+CIFAR-10 with 256 channels 1 group.
+Lc
+p,g = −
+X
+n
+log
+(Wx(1)
+n,p,g)⊤StopGrad(Wx(2)
+n )
+P
+m(Wx(1)
+n,p,g)⊤StopGrad(Wx(2)
+m )
+.
+(6)
+Note that we add a stop gradient operator on the second
+view. It is usually unnecessary to add this stop gradient
+in the InfoNCE loss; however, we found that perturbation-
+based methods require a stop gradient and otherwise the
+loss will not go down. This is likely because we share the
+perturbations on both views, and having the same perturba-
+tion will increase the dot product between the two views
+but is not desired from a representation learning perspective.
+Figure 4 shows a comparison of the loss curves. Non-shared
+perturbations also work but are worse than stop gradient.
+6
+
+Published as a conference paper at ICLR 2023
+Type
+Blocks
+Patches
+Channels
+Groups
+Params
+Dataset
+LocalMixer S/1/1
+1
+1×1
+256
+1
+272K
+MNIST
+LocalMixer M/1/16
+1
+1×1
+512
+16
+429K
+MNIST
+LocalMixer M/8/16
+4
+8×8
+512
+16
+919K
+CIFAR-10
+LocalMixer L/8/64
+4
+8×8
+2048
+64
+13.1M
+CIFAR-10
+LocalMixer L/32/64
+4
+32×32
+2048
+64
+17.3M
+ImageNet
+Table 2: LocalMixer Architecture Details
+5
+IMPLEMENTATION
+Network architecture. We propose the LocalMixer architecture that is more suitable for local
+learning. It takes inspiration from MLPMixer (Tolstikhin et al., 2021), which consists of fully
+connected networks and residual blocks. We leverage the fully connected networks so that each
+spatial patch performs computations without interfering with other patches, which is more compatible
+with our local learning objective. An image is divided into non-overlapping patches (i.e. tokens), and
+each block consists of token and channel mixing layers. Figure 1 shows the high level architecture, and
+Figure 2 shows the detailed diagram for one residual block. We add a linear projector/classiﬁcation
+layer to attach a loss function at the end of each block. The last layer always uses backprop to update
+weights. For token mixing layers, we use one linear fully connected layer instead of an MLP, since we
+would like to make each block as shallow as possible. Before the last channel mixing layer, features
+are reshaped into a number of groups, and the last layer is fully connected within each feature group.
+Table 2 shows architectural details for the different sizes of models we investigate.
+Normalization. There are many ways of performing normalization within a neural network across
+different tensor dimensions (Krizhevsky et al., 2012; Ioffe & Szegedy, 2015; Ba et al., 2016; Ren et al.,
+2017; Wu & He, 2018). We opted for a local variant of layer normalization that normalizes within each
+local spatial patch of features (Ren et al., 2017). For grouped linear layers, each group is normalized
+separately (Wu & He, 2018). Empirically, we found such local normalization performs better on
+contrastive learning experiments and about the same as layer normalization on supervised experiments.
+Local normalization is also more biologically plausible as it does not perform global communication.
+Conventionally, normalization layers are placed after linear layers. In MLPMixer (Tolstikhin et al.,
+2021), layer normalization is placed at the beginning of each residual block. We found it is the best to
+place normalization before and after each linear layer, as shown in Figure 2. Empirically this design
+choice does not make much difference for backprop, but it allows forward gradient learning to learn
+much faster and achieve lower training errors.
+Number of Groups
+GPU Memory (G)
+0
+10
+20
+30
+40
+1
+2
+4
+8
+16
+32
+Naïve
+Fused
+Number of Groups
+Compute (sec/epoch)
+0
+50
+100
+150
+200
+1
+2
+4
+8
+16
+32
+Naïve
+Fused
+Figure 5: Memory and compute usage of
+naïve and fused implementation of replicated
+losses.
+Efﬁcient implementation of replicated losses.
+Due to the design of feature aggregation and repli-
+cated losses, a naïve implementation of groups can be
+very inefﬁcient in terms of both memory consumption
+and compute. However, each spatial group actually
+computes the same aggregated feature and loss func-
+tion. This means that it is possible to share most of
+the computation across loss functions when perform-
+ing both backprop and forward gradient. We imple-
+mented our custom JAX JVP/VJP functions (Brad-
+bury et al., 2018) and observed signiﬁcant memory
+savings and compute speed-ups for replicated losses,
+which would otherwise not be feasible to run on mod-
+ern hardware. The results are reported in Figure 5. A
+code snippet is included in Appendix 12.
+6
+EXPERIMENTS
+We compare our proposed algorithm to a set of alternatives: Backprop, Feedback Alignment and other
+global variants of Forward Gradient. Backprop is a biologically implausible oracle, since it computes
+true gradients whereas we compute noisy gradients. Feedback alignment computes approximate
+gradients by using a set of random backward weights. We explain each method below.
+1) Backprop (BP). We include the standard backprop algorithm as well as its local variants. Local
+Backprop (L-BP) adds local losses as proposed, but still permits gradient to ﬂow in an end-to-end
+fashion. Local Greedy Backprop (LG-BP) in addition adds stop gradient operators in between
+blocks. This is to provide a comparison to our methods by computing true local gradients. LG-BP
+is similar in spirit to recent local learning algorithms (Belilovsky et al., 2019; Löwe et al., 2019).
+7
+
+Published as a conference paper at ICLR 2023
+Dataset
+MNIST
+MNIST
+CIFAR-10
+ImageNet
+Network
+S/1/1
+M/1/16
+M/8/16
+L/32/64
+Metric
+Test / Train Err. (%)
+Test / Train Err. (%)
+Test / Train Err. (%)
+Test / Train Err. (%)
+BP
+2.66 / 0.00
+2.41 / 0.00
+33.62 / 0.00
+36.82 / 14.69
+L-BP
+2.38 / 0.00
+2.16 / 0.00
+30.75 / 0.00
+42.38 / 22.80
+LG-BP
+2.43 / 0.00
+2.81 / 0.00
+33.84 / 0.05
+54.37 / 39.66
+BP-free algorithms
+FA
+2.82 / 0.00
+2.90 / 0.00
+39.94 / 28.44
+94.55 / 94.13
+L-FA
+3.21 / 0.00
+2.90 / 0.00
+39.74 / 28.98
+87.20 / 85.69
+LG-FA
+3.11 / 0.00
+2.50 / 0.00
+39.73 / 32.32
+85.45 / 82.83
+DFA
+3.31 / 0.00
+3.17 / 0.00
+38.80 / 33.69
+91.17 / 90.28
+FG-W
+9.25 / 8.93
+8.56 / 8.64
+55.95 / 54.28
+97.71 / 97.58
+FG-A
+3.24 / 1.53
+3.76 / 1.75
+59.72 / 41.29
+98.83 / 98.80
+LG-FG-W
+9.25 / 8.93
+5.66 / 4.59
+52.70 / 51.71
+97.39 / 97.29
+LG-FG-A
+3.24 / 1.53
+2.55 / 0.00
+30.68 / 19.39
+58.37 / 44.86
+Table 3: Supervised learning for image classiﬁcation
+Dataset
+CIFAR-10
+CIFAR-10
+ImageNet
+Network
+M/8/16
+L/8/64
+L/32/64
+Metric
+Test / Train Err. (%)
+Test / Train Err. (%)
+Test / Train Err. (%)
+BP
+24.11 / 21.08
+17.53 / 13.35
+55.66 / 49.79
+L-BP
+24.69 / 21.80
+19.13 / 13.60
+59.11 / 52.50
+LG-BP
+29.63 / 25.60
+23.62 / 16.80
+68.36 / 62.53
+BP-free algorithms
+FA
+45.87 / 44.06
+67.93 / 65.32
+82.86 / 80.21
+L-FA
+37.73 / 36.13
+31.05 / 26.97
+83.18 / 79.80
+LG-FA
+36.72 / 34.06
+30.49 / 25.56
+82.57 / 79.53
+DFA
+46.09 / 42.76
+39.26 / 37.17
+93.51 / 92.51
+FG-W
+53.37 / 51.56
+50.45 / 45.64
+91.94 / 89.69
+FG-A
+54.59 / 52.96
+56.63 / 56.09
+97.83 / 97.79
+LG-FG-W
+52.66 / 50.23
+52.27 / 48.67
+91.36 / 88.81
+LG-FG-A
+32.88 / 29.73
+26.81 / 23.90
+73.24 / 66.89
+Table 4: Self-supervised contrastive learning with linear readout
+2) Feedback Alignment (FA). The standard FA algorithm (Lillicrap et al., 2016) adds a set of
+random and ﬁxed backward weights. We assume that the gradients to normalization layers and
+activation functions are known since they do not have weight connections. Local Feedback Alignment
+(L-FA) adds local losses as proposed, but still permits error signals to ﬂow back. Local Greedy
+Feedback Alignment (LG-FA) adds a stop gradient to prevent error signals from ﬂowing back, similar
+to the backprop-free algorithm in Nøkland & Eidnes (2019).
+3) Forward Gradient (FG). This family of methods comprises our proposed algorithm and related
+approaches. Weight-perturbed forward gradient (FG-W) was proposed by Baydin et al. (2022).
+In this paper, we propose the activity perturbation variant (FG-A). We further add local objective
+functions, producing LG-FG-W and LG-FG-A, which stand for Local Greedy Forward Gradient
+Weight/Activity-Perturbed. For local perturbation to work, we have to add a stop gradient in between
+blocks so each perturbation has a single corresponding loss. We expect LG-FG-A to achieve the best
+performance among other variants because it can leverage the variance reduction beneﬁt from both
+activity perturbation and local losses.
+Datasets. We use standard image classiﬁcation datasets to benchmark the learning algorithms.
+MNIST (LeCun, 1998) contains 70,000 28×28 handwritten digit images of class 0-9. CIFAR-
+10 (Krizhevsky et al., 2009) contains 60,000 32×32 natural images of 10 semantic classes. Ima-
+geNet (Deng et al., 2009) contains 1.3 million natural images of 1000 classes, which we resized
+to 224×224. For CIFAR-10 and ImageNet, we applied both supervised learning and contrastive
+learning. For MNIST, we applied supervised learning only. We designed different conﬁgurations of
+the LocalMixer architecture for each dataset, listed in Table 2.
+Data augmentation. For MNIST and CIFAR-10 supervised experiments, we do not apply data
+augmentation. Data augmentation on ImageNet follows the open source implementation by Grill
+8
+
+Published as a conference paper at ICLR 2023
+Accuracy (%)
+35
+45
+55
+65
+75
+85
+Global
+Block
+Block + 
+Patch
+Patch + 
+Group
+Block + 
+Patch + 
+Group
+Test
+Train
+(a) CIFAR-10 Supervised M/8
+Accuracy (%)
+35
+40
+45
+50
+55
+60
+65
+70
+Global
+Block
+Block + 
+Patch
+Patch + 
+Group
+Block + 
+Patch + 
+Group
+Test
+Train
+(b) CIFAR-10 Contrastive M/8
+Accuracy (%)
+0
+20
+40
+60
+Global
+Block
+Patch + 
+Group
+Block + 
+Patch
+Block + 
+Patch + 
+Group
+Test
+Train
+(c) ImageNet Supervised L/32
+Figure 6: Effect of adding local losses at different locations on the performance of forward gradient
+Steps
+Error Rate (%)
+25
+35
+45
+55
+65
+0
+25000
+50000
+75000
+(a) Supervised Test
+Steps
+15
+25
+35
+45
+55
+65
+0
+25000
+50000
+75000
+(b) Supervised Train
+Steps
+25
+35
+45
+55
+65
+20000
+40000
+60000
+80000
+(c) Contrastive Test
+Steps
+25
+35
+45
+55
+65
+20000
+40000
+60000
+80000
+Group 1
+Group 2
+Group 4
+Group 8
+Group 16
+Group 32
+(d) Contrastive Train
+Figure 7: Error rate of M/8/* during CIFAR-10 training using different number of groups.
+et al. (2020). Because forward gradient suffers from variance, we apply weaker augmentations for
+contrastive learning experiments, increasing the area lower bound for random crops from 0.08 to
+0.3-0.5. We ﬁnd that this change has relatively little effect on the performance of backprop.
+Main results. Our main results are shown in Table 3 and Table 4. In supervised experiments, there
+is almost no cost of introducing local greedy losses, and our local forward gradient method can
+match the test error of backprop on MNIST and CIFAR. Note that LG-FG-A fails to overﬁt the
+training set to 0% error when trained without data augmentation. This suggests that variance could
+still be an issue. For CIFAR-10 contrastive learning, our method obtains an error rate approaching
+that obtained by backprop (26.81% vs. 17.53%), and most of the gap is due to greedy learning
+vs. gradient estimation (6.09% vs. 3.19%). On ImageNet, we achieve reasonable performance
+compared to backprop (58.37% vs. 36.82% for supervised and 73.24% vs. 55.66% for contrastive).
+However, we ﬁnd that the error due to greediness grows as the problem gets more complex and
+requires more layers to cooperate. We signiﬁcantly outperform the FA family on ImageNet (by 25%
+for supervised and 10% for contrastive). Interestingly, local greedy FA also performs better than
+global feedback alignment, which suggests that the beneﬁt of local learning transfers to other types of
+gradient approximation. TP-based methods were evaluated in Bartunov et al. (2018) and were found
+to be worse than FA on ImageNet. In sum, although there is still some noticeable gap between our
+method and backprop, we have made a large stride forward compared to backprop-free algorithms.
+More results are included in the Appendix 14.
+Effect of local losses. In Figure 6 we ablate the beneﬁt of placing local losses at different locations:
+blockwise, patchwise and groupwise. A combination of all three is the strongest. Global perturbation
+learning fails to learn as the accuracy is similar to initializing with random weights.
+Effect of groups. In Figure 7 we investigate the effect of different number of groups by showing the
+training curves. Adding more groups bring signiﬁcant improvement to local perturbation learning in
+terms of lowering both training and test errors, but the effect vanishes around 8 channels / group.
+7
+CONCLUSION
+It is often believed that perturbation-based learning cannot scale to large and deep networks. We
+show that this is to some extent true because the gradient estimation variance grows with the number
+of hidden dimensions for activity perturbation, and is even worse for shared weight perturbation. But
+more optimistically, we show that a huge number of local greedy losses can help forward gradient
+learning scale much better. We explored blockwise, patchwise, and groupwise local losses, and a
+combination of all three, with a total of a quarter of a million losses in one of the larger networks,
+performs the best. Local activity-perturbed forward gradient performs better than previous backprop-
+free algorithms on larger networks. The idea of local losses opens up opportunities for different loss
+designs and sheds light on the search for biologically plausible learning algorithms in the brain and
+alternative computing devices.
+9
+
+Published as a conference paper at ICLR 2023
+ACKNOWLEDGMENT
+We thank Timothy Lillicrap for his helpful feedback on our earlier draft.
+REFERENCES
+Larry F Abbott and Sacha B Nelson. Synaptic plasticity: taming the beast. Nature neuroscience, 3
+(11):1178–1183, 2000.
+Mohamed Akrout, Collin Wilson, Peter C. Humphreys, Timothy P. Lillicrap, and Douglas B. Tweed.
+Deep learning without weight transport. In Advances in Neural Information Processing Systems
+32, NeurIPS, 2019.
+Lei Jimmy Ba, Jamie Ryan Kiros, and Geoffrey E. Hinton.
+Layer normalization.
+CoRR,
+abs/1607.06450, 2016.
+Pierre Baldi and Peter J. Sadowski. A theory of local learning, the learning channel, and the optimality
+of backpropagation. Neural Networks, 83:51–74, 2016. doi: 10.1016/j.neunet.2016.07.006.
+Andrew G Barto, Richard S Sutton, and Charles W Anderson. Neuronlike adaptive elements that can
+solve difﬁcult learning control problems. IEEE Transactions on Systems, Man, and Cybernetics,
+(5):834–846, 1983.
+Sergey Bartunov, Adam Santoro, Blake A. Richards, Luke Marris, Geoffrey E. Hinton, and Timo-
+thy P. Lillicrap. Assessing the scalability of biologically-motivated deep learning algorithms and
+architectures. In Advances in Neural Information Processing Systems 31, NeurIPS, 2018.
+Atilim Günes Baydin, Barak A. Pearlmutter, Don Syme, Frank Wood, and Philip H. S. Torr. Gradients
+without backpropagation. CoRR, abs/2202.08587, 2022.
+Eugene Belilovsky, Michael Eickenberg, and Edouard Oyallon. Greedy layerwise learning can scale
+to imagenet. In Proceedings of the 36th International Conference on Machine Learning, ICML,
+2019.
+Eugene Belilovsky, Michael Eickenberg, and Edouard Oyallon. Decoupled greedy learning of cnns.
+In Proceedings of the 37th International Conference on Machine Learning, ICML, 2020.
+Yoshua Bengio. How auto-encoders could provide credit assignment in deep networks via target
+propagation. CoRR, abs/1407.7906, 2014.
+Yoshua Bengio, Pascal Lamblin, Dan Popovici, and Hugo Larochelle. Greedy layer-wise training of
+deep networks. In Advances in Neural Information Processing Systems 19, NIPS, 2006.
+Yoshua Bengio, Thomas Mesnard, Asja Fischer, Saizheng Zhang, and Yuhuai Wu. Stdp as presynaptic
+activity times rate of change of postsynaptic activity approximates back-propagation. Neural
+Computation, 10, 2017.
+Elie L Bienenstock, Leon N Cooper, and Paul W Munro. Theory for the development of neuron selec-
+tivity: orientation speciﬁcity and binocular interaction in visual cortex. Journal of Neuroscience, 2
+(1):32–48, 1982.
+James Bradbury, Roy Frostig, Peter Hawkins, Matthew James Johnson, Chris Leary, Dougal
+Maclaurin, George Necula, Adam Paszke, Jake VanderPlas, Skye Wanderman-Milne, and
+Qiao Zhang.
+JAX: composable transformations of Python+NumPy programs, 2018.
+URL
+http://github.com/google/jax.
+Ting Chen, Simon Kornblith, Mohammad Norouzi, and Geoffrey E. Hinton. A simple framework for
+contrastive learning of visual representations. In Proceedings of the 37th International Conference
+on Machine Learning, ICML, 2020.
+David G. Clark, L. F. Abbott, and SueYeon Chung. Credit assignment through broadcasting a global
+error vector. In Advances in Neural Information Processing Systems 34, NeurIPS, 2021.
+10
+
+Published as a conference paper at ICLR 2023
+Jia Deng, Wei Dong, Richard Socher, Li-Jia Li, Kai Li, and Li Fei-Fei. Imagenet: A large-scale
+hierarchical image database. In IEEE Conference on Computer Vision and Pattern Recognition,
+CVPR, 2009.
+Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov, Dirk Weissenborn, Xiaohua Zhai, Thomas
+Unterthiner, Mostafa Dehghani, Matthias Minderer, Georg Heigold, Sylvain Gelly, Jakob Uszkoreit,
+and Neil Houlsby. An image is worth 16x16 words: Transformers for image recognition at scale.
+In 9th International Conference on Learning Representations, ICLR, 2021.
+Ila R Fiete and H Sebastian Seung. Gradient learning in spiking neural networks by dynamic
+perturbation of conductances. Physical review letters, 97(4):048104, 2006.
+Aidan N. Gomez, Oscar Key, Stephen Gou, Nick Frosst, Jeff Dean, and Yarin Gal. Interlocking
+backpropagation: Improving depthwise model-parallelism. CoRR, abs/2010.04116, 2020.
+Jean-Bastien Grill, Florian Strub, Florent Altché, Corentin Tallec, Pierre H. Richemond, Elena
+Buchatskaya, Carl Doersch, Bernardo Ávila Pires, Zhaohan Guo, Mohammad Gheshlaghi Azar,
+Bilal Piot, Koray Kavukcuoglu, Rémi Munos, and Michal Valko. Bootstrap your own latent - A
+new approach to self-supervised learning. In Advances in Neural Information Processing Systems
+33, NeurIPS, 2020.
+Donald Olding Hebb. The organization of behavior: a neuropsychological theory. J. Wiley; Chapman
+& Hall, 1949.
+Geoffrey Hinton et al. How to do backpropagation in a brain. In Invited talk at the NIPS 2007 deep
+learning workshop, 2007.
+Geoffrey E. Hinton and James L. McClelland. Learning representations by recirculation. In Neural
+Information Processing Systems, 1987.
+Geoffrey E. Hinton, Simon Osindero, and Yee Whye Teh. A fast learning algorithm for deep belief
+nets. Neural Comput., 18(7):1527–1554, 2006. doi: 10.1162/neco.2006.18.7.1527.
+Geoffrey E. Hinton, Oriol Vinyals, and Jeffrey Dean. Distilling the knowledge in a neural network.
+CoRR, abs/1503.02531, 2015.
+Yani Ioannou, Duncan P. Robertson, Roberto Cipolla, and Antonio Criminisi. Deep roots: Improving
+CNN efﬁciency with hierarchical ﬁlter groups. In IEEE Conference on Computer Vision and
+Pattern Recognition, CVPR, 2017.
+Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training by
+reducing internal covariate shift. In Proceedings of the 32nd International Conference on Machine
+Learning, ICML, 2015.
+Marwan Jabri and Barry Flower. Weight perturbation: An optimal architecture and learning technique
+for analog vlsi feedforward and recurrent multilayer networks. IEEE Transactions on Neural
+Networks, 3(1):154–157, 1992.
+John F Kolen and Jordan B Pollack. Backpropagation without weight transport. In Proceedings of
+IEEE International Conference on Neural Networks, ICNN, 1994.
+Alex Krizhevsky, Geoffrey Hinton, et al. Learning multiple layers of features from tiny images. 2009.
+Alex Krizhevsky, Ilya Sutskever, and Geoffrey E. Hinton. Imagenet classiﬁcation with deep con-
+volutional neural networks. In Advances in Neural Information Processing Systems 25, NIPS,
+2012.
+Michael Laskin, Luke Metz, Seth Nabarrao, Mark Sarouﬁm, Badreddine Noune, Carlo Luschi, Jascha
+Sohl-Dickstein, and Pieter Abbeel. Parallel training of deep networks with local updates. CoRR,
+abs/2012.03837, 2020.
+Yann Le Cun, Conrad Galland, and Geoffrey E Hinton. Gemini: Gradient estimation through matrix
+inversion after noise injection. In Advances in Neural Information Processing Systems, NIPS,
+volume 1. Morgan-Kaufmann, 1988.
+11
+
+Published as a conference paper at ICLR 2023
+Yann LeCun. A learning scheme for asymmetric threshold networks. Proceedings of COGNITIVA,
+85(537):599–604, 1985.
+Yann LeCun. The mnist database of handwritten digits, 1998. URL http://yann.lecun.com/
+exdb/mnist/.
+Dong-Hyun Lee, Saizheng Zhang, Asja Fischer, and Yoshua Bengio. Difference target propagation.
+In Joint european conference on machine learning and knowledge discovery in databases, pp.
+498–515. Springer, 2015.
+Qianli Liao, Joel Z. Leibo, and Tomaso A. Poggio. How important is weight symmetry in back-
+propagation? In Proceedings of the Thirtieth AAAI Conference on Artiﬁcial Intelligence, AAAI,
+2016.
+Timothy P. Lillicrap, Daniel Cownden, Douglas B. Tweed, and Colin J. Akerman. Random synaptic
+feedback weights support error backpropagation for deep learning. Nature Communications, 7(1):
+13276, Nov 2016. ISSN 2041-1723. doi: 10.1038/ncomms13276.
+Timothy P. Lillicrap, Adam Santoro, Luke Marris, Colin J. Akerman, and Geoffrey Hinton. Backprop-
+agation and the brain. Nature Reviews Neuroscience, 21(6):335–346, Jun 2020. ISSN 1471-0048.
+doi: 10.1038/s41583-020-0277-3.
+Sindy Löwe, Peter O’Connor, and Bastiaan S. Veeling. Putting an end to end-to-end: Gradient-
+isolated learning of representations. In Advances in Neural Information Processing Systems 32,
+NeurIPS, 2019.
+Arild Nøkland. Direct feedback alignment provides learning in deep neural networks. In Advances in
+Neural Information Processing Systems 29, NeurIPS, 2016.
+Arild Nøkland and Lars Hiller Eidnes.
+Training neural networks with local error signals.
+In
+Proceedings of the 36th International Conference on Machine Learning, ICML, 2019.
+Erkki Oja. Simpliﬁed neuron model as a principal component analyzer. Journal of mathematical
+biology, 15(3):267–273, 1982.
+Adeetya Patel, Michael Eickenberg, and Eugene Belilovsky. Local learning with neuron groups. In
+From Cells to Societies: Collective Learning Across Scales - ICLR 2022 Workshop, 2022.
+Barak A Pearlmutter. Fast exact multiplication by the hessian. Neural computation, 6(1):147–160,
+1994.
+Antti Rasmus, Mathias Berglund, Mikko Honkala, Harri Valpola, and Tapani Raiko. Semi-supervised
+learning with ladder networks. In Advances in Neural Information Processing Systems 28, NIPS,
+2015.
+Mengye Ren, Renjie Liao, Raquel Urtasun, Fabian H. Sinz, and Richard S. Zemel. Normalizing the
+normalizers: Comparing and extending network normalization schemes. In Proceedings of the 5th
+International Conference on Learning Representations, ICLR, 2017.
+D. E. Rumelhart, G. E. Hinton, and R. J. Williams. Learning internal representations by error
+propagation. In Parallel Distributed Processing: Explorations in the Microstructure of Cognition,
+Vol. 1: Foundations, pp. 318–362, Cambridge, MA, USA, 1986. MIT Press. ISBN 026268053X.
+Tim Salimans, Jonathan Ho, Xi Chen, and Ilya Sutskever. Evolution strategies as a scalable alternative
+to reinforcement learning. CoRR, abs/1703.03864, 2017.
+Wolfram Schultz, Peter Dayan, and P Read Montague. A neural substrate of prediction and reward.
+Science, 275(5306):1593–1599, 1997.
+H Sebastian Seung. Learning in spiking neural networks by reinforcement of stochastic synaptic
+transmission. Neuron, 40(6):1063–1073, 2003.
+Eren Sezener, Agnieszka Grabska-Barwi´nska, Dimitar Kostadinov, Maxime Beau, Sanjukta Krish-
+nagopal, David Budden, Marcus Hutter, Joel Veness, Matthew Botvinick, Claudia Clopath, et al. A
+rapid and efﬁcient learning rule for biological neural circuits. BioRxiv, 2021.
+12
+
+Published as a conference paper at ICLR 2023
+David Silver, Anirudh Goyal, Ivo Danihelka, Matteo Hessel, and Hado van Hasselt. Learning by
+directional gradient descent. In Proceedings of the 10th International Conference on Learning
+Representations, ICLR, 2022.
+Kenneth O Stanley and Risto Miikkulainen. Evolving neural networks through augmenting topologies.
+Evol Comput, 10(2):99–127, 2002.
+Ilya O. Tolstikhin, Neil Houlsby, Alexander Kolesnikov, Lucas Beyer, Xiaohua Zhai, Thomas
+Unterthiner, Jessica Yung, Andreas Steiner, Daniel Keysers, Jakob Uszkoreit, Mario Lucic, and
+Alexey Dosovitskiy. Mlp-mixer: An all-mlp architecture for vision. In Advances in Neural
+Information Processing Systems 34, NeurIPS, 2021.
+Aäron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive predictive
+coding. CoRR, abs/1807.03748, 2018.
+Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez,
+Lukasz Kaiser, and Illia Polosukhin. Attention is all you need. In Advances in Neural Information
+Processing Systems 30, NIPS, 2017.
+Joel Veness, Tor Lattimore, Avishkar Bhoopchand, Agnieszka Grabska-Barwinska, Christopher Mat-
+tern, and Peter Toth. Online learning with gated linear networks. arXiv preprint arXiv:1712.01897,
+2017.
+Joel Veness, Tor Lattimore, David Budden, Avishkar Bhoopchand, Christopher Mattern, Agnieszka
+Grabska-Barwinska, Eren Sezener, Jianan Wang, Peter Toth, Simon Schmitt, et al. Gated linear
+networks. In Proceedings of the AAAI Conference on Artiﬁcial Intelligence, AAAI, 2021.
+Pascal Vincent, Hugo Larochelle, Isabelle Lajoie, Yoshua Bengio, and Pierre-Antoine Manzagol.
+Stacked denoising autoencoders: Learning useful representations in a deep network with a local
+denoising criterion. J. Mach. Learn. Res., 11:3371–3408, 2010. doi: 10.5555/1756006.1953039.
+Yulin Wang, Zanlin Ni, Shiji Song, Le Yang, and Gao Huang. Revisiting locally supervised learning:
+an alternative to end-to-end training. In 9th International Conference on Learning Representations,
+ICLR, 2021.
+Yeming Wen, Paul Vicol, Jimmy Ba, Dustin Tran, and Roger B. Grosse. Flipout: Efﬁcient pseudo-
+independent weight perturbations on mini-batches. In 6th International Conference on Learning
+Representations, ICLR, 2018.
+R. E. Wengert. A simple automatic derivative evaluation program. Commun. ACM, 7(8):463–464,
+1964.
+Paul Werbos. Beyond regression:" new tools for prediction and analysis in the behavioral sciences.
+Ph. D. dissertation, Harvard University, 1974.
+Justin Werfel, Xiaohui Xie, and H Seung. Learning curves for stochastic gradient descent in linear
+feedforward networks. Advances in Neural Information Processing Systems 16, NIPS, 2003.
+L. Darrell Whitley. Genetic reinforcement learning for neurocontrol problems. Mach. Learn., 13:
+259–284, 1993.
+James C.R. Whittington and Rafal Bogacz. Theories of error back-propagation in the brain. Trends in
+Cognitive Sciences, 23(3):235–250, Mar 2019. ISSN 1364-6613. doi: 10.1016/j.tics.2018.12.005.
+Bernard Widrow and Marcian E Hoff. Adaptive switching circuits. Technical report, Stanford Univ
+Ca Stanford Electronics Labs, 1960.
+Bernard Widrow and Michael A. Lehr. 30 years of adaptive neural networks: perceptron, madaline,
+and backpropagation. Proc. IEEE, 78(9):1415–1442, 1990.
+Ronald J Williams and David Zipser. A learning algorithm for continually running fully recurrent
+neural networks. Neural computation, 1(2):270–280, 1989.
+13
+
+Published as a conference paper at ICLR 2023
+Sunghyeon Woo, Jeongwoo Park, Jiwoo Hong, and Dongsuk Jeon. Activation sharing with asymmet-
+ric paths solves weight transport problem without bidirectional connection. In Advances in Neural
+Information Processing Systems 34, NeurIPS, 2021.
+Yuxin Wu and Kaiming He. Group normalization. In 15th European Conference on Computer Vision,
+ECCV, 2018.
+Will Xiao, Honglin Chen, Qianli Liao, and Tomaso A. Poggio. Biologically-plausible learning
+algorithms can scale to large datasets. In Proceedings of the 7th International Conference on
+Learning Representations, ICLR, 2019.
+Saining Xie, Ross B. Girshick, Piotr Dollár, Zhuowen Tu, and Kaiming He. Aggregated residual
+transformations for deep neural networks. In IEEE Conference on Computer Vision and Pattern
+Recognition, CVPR, 2017.
+Xiaohui Xie and H Sebastian Seung. Spike-based learning rules and stabilization of persistent neural
+activity. Advances in Neural Information Processing Systems 12, NIPS, 1999.
+Yuwen Xiong, Mengye Ren, and Raquel Urtasun. Loco: Local contrastive representation learning. In
+Advances in Neural Information Processing Systems 33, NeurIPS, 2020.
+14
+
+Published as a conference paper at ICLR 2023
+8
+PROOFS OF UNBIASEDNESS
+In this section, we show the unbiasedness of gw(wij) and ga(wij). The ﬁrst proof was given
+by Baydin et al. (2022).
+Proposition 1. gw(wij) is an unbiased gradient estimator if {vij} are independent zero-mean
+uni-variance random variables (Baydin et al., 2022).
+Proof. We can rewrite the weight perturbation estimator as
+gw(wij) =
+
+X
+i′j′
+∇wi′j′vi′j′
+
+vij = ∇wijv2
+ij +
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′.
+(7)
+Note that since each dimension of v is an independent zero-mean uni-variance random variable,
+E[vij] = 0, E[v2
+ij] = Var[vij] + E[vij]2 = 1 + 0 = 1, and E[vijvi′j′] = 0 if ij ̸= i′j′.
+E[gw(wij)] = E
+
+∇wijv2
+ij
+
++ E
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
+
+(8)
+= ∇wij E
+
+v2
+ij
+
++
+X
+i′j′̸=ij
+∇wi′j′ E [vijvi′j′]
+(9)
+= ∇wij · 1 +
+X
+i′j′̸=ij
+∇wi′j′ · 0
+(10)
+= ∇wij.
+(11)
+Proposition 2. ga(wij) is an unbiased gradient estimator if {uj} are independent zero-mean uni-
+variance random variables.
+Proof. The true gradient to the weights ∇wij is the product between xj and ∇zk. Therefore, we can
+rewrite the weight perturbation estimator as
+ga(wij) = xi
+
+X
+j′
+∇zj′uj′
+
+uj = xj∇zju2
+j + xi
+
+X
+j′̸=j
+∇zj′uj′
+
+uj
+(12)
+= xi∇zju2
+j +
+
+X
+j′̸=j
+xi∇zj′uj′
+
+uj
+(13)
+= ∇wiju2
+j +
+
+X
+j′̸=j
+∇wij′uj′
+
+uj.
+(14)
+Since each dimension of u is an independent zero-mean uni-variance random variable, E[uj] = 0,
+E[u2
+j] = Var[uj] + E[uj]2 = 1 + 0 = 1, and E[ujuj′] = 0 if j ̸= j′.
+E[ga(wij)] = E
+
+∇wiju2
+j +
+
+X
+j′̸=j
+∇wij′uj′
+
+uj
+
+
+(15)
+= ∇wij E
+
+u2
+j
+
++
+X
+j′̸=j
+∇wij′ E [ujuj′]
+(16)
+= ∇wij · 1 +
+X
+j′̸=j
+∇wij′ · 0
+(17)
+= ∇wij.
+(18)
+15
+
+Published as a conference paper at ICLR 2023
+9
+PROOFS OF VARIANCES
+We followed Wen et al. (2018) and show that the variance of the gradient estimators can be decom-
+posed.
+Lemma 1. The variance of the gradient estimator can be decomposed into three parts:
+Var (g(wij)|x) = Z1 + Z2 + Z3, where Z1 = 1
+N V1 Varx (∇wij|x), Z2 = 1
+N Ex [Varv (g(wij)| x)],
+Z3 =
+1
+N2 EB
+hP
+x(n)∈B
+P
+x(m)∈B\{x(n)} Covv(g(wij)| x(n), g(wij)| x(m))
+i
+.
+Proof. By the law of total variance,
+Var (g(wij)) = Var
+B
+
+E
+v [g(wij)|B]
+
++ E
+B
+h
+Var
+v (g(wij)|B)
+i
+.
+(19)
+The ﬁrst term comes from the gradient variance from data sampling, and it vanishes as batch size
+grows:
+Var
+B
+
+E
+v [g(wij)|B]
+
+(20)
+= Var
+B
+
+E
+v
+
+1
+N
+X
+x(n)∈B
+g(wij)|x(n)
+
+
+
+
+(21)
+= 1
+N 2 Var
+B
+
+E
+v
+
+X
+x(n)∈B
+g(wij)|x(n)
+
+
+
+
+(22)
+= 1
+N 2 Var
+B
+
+X
+x(n)∈B
+E
+v
+h
+g(wij)|x(n)i
+
+
+(23)
+= 1
+N 2 Var
+B
+
+X
+x(n)∈B
+∇wij|x(n)
+
+
+(24)
+= 1
+N 2
+X
+n
+Var
+x (∇wij|x) = 1
+N Var
+x (∇wij|x) = Z1.
+(25)
+The second term comes from the gradient estimation variance:
+E
+B
+h
+Var
+v (g(wij)|B)
+i
+(26)
+= E
+B
+
+Var
+v
+
+1
+N
+X
+x(n)∈B
+g(wij)
+
+x(n)
+
+
+
+
+(27)
+= E
+B
+
+1
+N 2 Var
+v
+
+X
+x(n)∈B
+g(wij)
+
+x(n)
+
+
+
+
+(28)
+= E
+B
+
+1
+N 2
+X
+x(n)∈B
+Var
+v
+
+g(wij)| x(n)
++
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+v (g(wij)| x(n), g(wij)| x(m))
+
+
+(29)
+= 1
+N E
+x
+h
+Var
+v (g(wij)| x)
+i
++ 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+v (g(wij)| x(n), g(wij)| x(m))
+
+
+(30)
+=Z2 + Z3.
+(31)
+Remark. Z2 is the variance of the gradient estimator in the deterministic case, and Z3 measures the
+correlation between different gradient estimation within the batch. The Z3 is zero if the perturbations
+are independent, and non-zero if the perturbations are shared within the mini-batch.
+16
+
+Published as a conference paper at ICLR 2023
+Proposition 3. Let p × q be the size of the weight matrix, the element-wise average variance of the
+weight perturbed gradient estimator with a batch size N is pq+2
+N V + (pq + 1)S if the perturbations
+are shared across the batch, and pq+2
+N V + pq+1
+N S if they are independent, where V is the element-wise
+average variance of the true gradient, and S is the element-wise average squared gradient.
+Proof. We ﬁrst derive Z2.
+Z2 = 1
+N E
+x
+h
+Var
+v (gw(wij)| x)
+i
+(32)
+= 1
+N E
+x
+
+Var
+v
+
+
+
+X
+i′j′
+∇wi′j′vi′j′
+
+vij
+
+
+
+
+(33)
+= 1
+N E
+x
+
+Var
+v
+
+∇wijv2
+ij +
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
+
+
+
+(34)
+= 1
+N E
+x
+
+Var
+v
+ ∇wijv2
+ij
+
++ Var
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
++ 2 Cov
+v
+
+∇wijv2
+ij,
+X
+i′j′̸=ij
+∇wijvijvi′j′
+
+
+
+
+(35)
+= 1
+N E
+x
+
+Var
+ ∇wijv2
+ij
+
++ Var
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
++
+(36)
+2 E
+v
+
+X
+i′j′̸=ij
+∇wij∇wi′j′v3
+ijvi′j′
+
+−2 E
+v
+
+∇wijv2
+ij
+
+E
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
+
+
+
+(37)
+= 1
+N E
+x
+
+∇w2
+ij Var
+v
+ v2
+ij
+
++ Var
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
++
+(38)
+2
+X
+i′j′̸=ij
+∇wij∇wi′j′ E
+v
+
+v3
+ijvi′j′
+−2∇wij E
+v
+
+v2
+ij
+
+
+X
+i′j′̸=ij
+∇wi′j′ E
+v [vijvi′j′]
+
+
+
+
+(39)
+= 1
+N E
+x
+
+∇w2
+ij Var
+v
+ v2
+ij
+
++ Var
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
++
+(40)
+2
+X
+i′j′̸=ij
+∇wij∇wi′j′ · 0 −2∇wij · 1
+
+X
+i′j′̸=ij
+∇wi′j′ · 0
+
+
+
+
+(41)
+= 1
+N E
+x
+
+∇w2
+ij Var
+v
+ v2
+ij
+
++ Var
+v
+
+X
+i′j′̸=ij
+∇wi′j′vijvi′j′
+
+
+
+
+(42)
+= 1
+N E
+x
+
+∇w2
+ij · (E[v4
+ij] −E
+v[v2
+ij]2) +
+X
+i′j′̸=ij
+Var
+v (∇wi′j′vijvi′j′)
+
+
+(43)
+= 1
+N E
+x
+
+∇w2
+ij(3 Var
+v [vij]2 −E
+v[v2
+ij]2) +
+X
+i′j′̸=ij
+∇w2
+i′j′ Var
+v (vijvi′j′)
+
+
+(44)
+= 1
+N E
+x
+
+2∇w2
+ij
+
++ 1
+N E
+x
+
+X
+i′j′̸=ij
+∇w2
+i′j′(Var
+v [vij] + E
+v[vi′j′]2)(Var
+v [vi′j′] + E
+v[vi′j′]2) −E
+v[vij]2 E
+v[vi′j′]2
+
+
+(45)
+17
+
+Published as a conference paper at ICLR 2023
+= 2
+N ∇w
+2
+ij + 2
+N Var
+x (∇wij|x) + 1
+N E
+x
+
+X
+i′j′̸=ij
+∇w2
+i′j′ Var
+v (vij) Var
+v (vi′j′)
+
+
+(46)
+= 2
+N ∇w
+2
+ij + 2
+N Var
+x (∇wij|x) + 1
+N
+X
+i′j′̸=ij
+E
+x
+
+∇w2
+i′j′
+
+(47)
+= 1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+i′j′
+
+∇w
+2
+i′j′ + Var
+x (∇wi′j′|x)
+
+
+.
+(48)
+Z3 is nonzero if the perturbations are shared within a batch. Assuming that the perturbations are
+shared,
+Z3 = 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+v (gw(wij)| x(n), gw(wij)| x(m))
+
+
+(49)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+gw(wij)| x(n) gw(wij)| x(m)i
+−E
+v
+h
+gw(wij)| x(n)i
+E
+v
+h
+gw(wij)| x(m)i
+
+
+(50)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+gw(wij)| x(n) gw(wij)| x(m)i
+−∇wij|x(n)∇wij|x(m)
+
+
+(51)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+
+
+
+X
+i′j′
+∇wi′j′|x(n)vi′j′
+
+vij
+
+X
+i′j′
+∇wi′j′|x(m)vi′j′
+
+vij
+
+−
+(52)
+∇wij|x(n)∇wij|x(m)i
+(53)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+
+
+
+∇wij|x(n)v2
+ij +
+X
+i′j′̸=ij
+∇wi′j′|x(n)vi′j′vij
+
+
+(54)
+
+∇wij|x(m)v2
+ij +
+X
+i′j′̸=ij
+∇wi′j′|x(m)vi′j′vij
+
+
+
+
+
+−
+(55)
+1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+
+(56)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v4
+ij+
+(57)
+∇wij|x(n)v2
+ij
+X
+i′j′̸=ij
+∇wi′j′|x(m)vi′j′vij + ∇wij|x(m)v2
+ij
+X
+i′j′̸=ij
+∇wi′j′|x(n)vi′j′vij+ (58)
+X
+i′j′̸=ij
+∇wi′j′|x(n)vi′j′vij
+X
+i′j′̸=ij
+∇wi′j′|x(m)vi′j′vij
+
+
+
+−
+(59)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(60)
+18
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v4
+ij+
+(61)
+
+X
+i′j′̸=ij
+∇wi′j′|x(n)vi′j′
+
+
+
+X
+i′j′̸=ij
+∇wi′j′|x(m)vi′j′
+
+v2
+ij
+
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+(62)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v4
+ij+
+(63)
+X
+i′j′̸=ij
+∇wi′j′|x(n)∇wi′j′|x(m)v2
+i′j′v2
+ij +
+X
+i′j′̸=ij
+X
+i′′j′′̸=ij,i′j′
+∇wi′j′|x(n)∇wi′j′|x(m)vi′j′vi′′j′′v2
+ij
+
+
+
+−
+(64)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(65)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+
+∇wij|x(n)∇wij|x(m)v4
+ij +
+X
+i′j′̸=ij
+∇wi′j′|x(n)∇wi′j′|x(m)v2
+i′j′v2
+ij
+
+
+
+−
+(66)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(67)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m) E
+v
+
+v4
+ij
+
++
+(68)
+X
+i′j′̸=ij
+∇wi′j′|x(n)∇wi′j′|x(m) E
+v
+
+v2
+i′j′
+
+E
+v
+
+v2
+ij
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(69)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+3∇wij|x(n)∇wij|x(m) +
+X
+i′j′̸=ij
+∇wi′j′|x(n)∇wi′j′|x(m)
+
+−
+(70)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(71)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+
+3 E
+x [∇wij|x]2 +
+X
+i′j′̸=ij
+E
+x [∇wi′j′|x]2
+
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(72)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+
+3∇w
+2
+ij +
+X
+i′j′̸=ij
+∇w
+2
+i′j′
+
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(73)
+= 1
+N 2
+X
+n
+X
+m̸=n
+
+2∇w
+2
+ij +
+X
+i′j′̸=ij
+∇w
+2
+i′j′
+
+= N(N −1)
+N 2
+
+∇w
+2
+ij +
+X
+i′j′
+∇w
+2
+i′j′
+
+.
+(74)
+19
+
+Published as a conference paper at ICLR 2023
+Lastly, we average the variance across all weight dimensions:
+mVar(gw(wij)) = 1
+pq
+X
+ij
+Var(gw(wij))
+(75)
+= 1
+pq
+X
+ij
+{Z1 + Z2 + Z3}
+(76)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(77)
+1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+i′j′
+
+∇w
+2
+i′j′ + Var
+x (∇wi′j′|x)
+
+
++
+(78)
+N(N −1)
+N 2
+
+∇w
+2
+ij +
+X
+i′j′
+∇w
+2
+i′j′
+
+
+
+
+
+(79)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(80)
+1
+N
+
+Var
+x (∇wij|x) +
+X
+i′j′
+Var
+x (∇wi′j′|x)
+
++
+
+∇w
+2
+ij +
+X
+i′j′
+∇w
+2
+i′j′
+
+
+
+
+
+(81)
+= 2
+N mVar (∇w) + pq
+N mVar (∇w) + (pq + 1) mSqNorm(∇w)
+(82)
+=pq + 2
+N
+V + (pq + 1)S.
+(83)
+If the perturbations are independent, we show that Z3 is 0.
+Z3 = 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+v (gw(wij)| x(n), gw(wij)| x(m))
+
+
+(84)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+gw(wij)| x(n) gw(wij)| x(m)i
+−E
+v
+h
+gw(wij)| x(n)i
+E
+v
+h
+gw(wij)| x(m)i
+
+
+(85)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+gw(wij)| x(n) gw(wij)| x(m)i
+−∇wij|x(n)∇wij|x(m)
+
+
+(86)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+
+
+
+X
+j′
+∇wij′|x(n)v(n)
+i′j′
+
+v(n)
+ij
+
+X
+j′
+∇wij′|x(m)v(m)
+i′j′
+
+v(m)
+ij
+
+
+(87)
+−∇wij|x(n)∇wij|x(m)i
+(88)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+
+X
+j′
+X
+j′′
+∇wij′|x(n)∇wij′′|x(m)v(n)
+i′j′v(m)
+i′′j′′v(n)
+ij v(m)
+ij
+
+
+
+−
+(89)
+1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+
+(90)
+20
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v(n)2
+ij
+v(m)2
+ij
++
+(91)
+∇wij|x(n)v(n)2
+ij
+v(m)
+ij
+X
+i′j′̸=j
+∇wij′|x(m)v(m)
+i′j′ + ∇wij|x(m)v(m)2
+ij
+v(n)
+ij
+X
+i′j′̸=j
+∇wij′|x(n)v(n)
+i′j′+
+(92)
+X
+i′j′̸=ij
+∇wij′|x(m)∇wij′|x(n)v(m)
+i′j′ v(n)
+i′j′v(m)
+ij
+v(n)
+ij +
+(93)
+X
+i′j′̸=ij
+X
+i′′j′′ /∈{ij,j′j′}
+∇wi′j′|x(n)vi′j′∇wij′|x(m)v(n)
+i′j′v(m)
+i′′j′′v(n)
+ij v(m)
+ij
+
+
+
+−
+(94)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(95)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v(n)2
+ij
+v(m)2
+ij
++
+(96)
+X
+i′j′̸=ij
+∇wi′j′|x(m)∇wi′j′|x(n)v(m)
+i′j′ v(n)
+i′j′v(m)
+ij
+v(n)
+ij
+
+
+
+−
+(97)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(98)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+v
+h
+∇wij|x(n)∇wij|x(m)v(n)2
+ij
+v(m)2
+ij
+i
+
+−
+(99)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(100)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m) E
+v
+h
+v(n)2
+ij
+i
+E
+v
+h
+v(m)2
+ij
+i
+
+−
+(101)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(102)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(103)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+E
+x [∇wij|x]2
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(104)
+=0.
+(105)
+21
+
+Published as a conference paper at ICLR 2023
+Then the average variance becomes:
+mVar(gw(wij)) = 1
+pq
+X
+ij
+Var(gw(wij))
+(106)
+= 1
+pq
+X
+ij
+{Z1 + Z2 + Z3}
+(107)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(108)
+1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+i′j′
+
+∇w
+2
+i′j′ + Var
+x (∇wi′j′|x)
+
+
+
+(109)
+=pq + 2
+N
+mVar (∇w) + pq + 1
+N
+mSqNorm(∇w)
+(110)
+=pq + 2
+N
+V + pq + 1
+N
+S.
+(111)
+Proposition 4. Let p × q be the size of the weight matrix, the element-wise average variance of the
+activity perturbed gradient estimator with a batch size N is q+2
+N V + (q + 1)S if the perturbations
+are shared across the batch, and q+2
+N V + q+1
+N S if they are independent, where V is the element-wise
+average variance of the true gradient, and S is the element-wise average squared gradient.
+Proof.
+Z2 = 1
+N E
+x
+h
+Var
+u (ga(wij)| x)
+i
+(112)
+= 1
+N E
+x
+
+Var
+u
+
+
+
+X
+j′
+∇wij′uj′
+
+uj
+
+
+
+
+(113)
+= 1
+N E
+x
+
+Var
+u
+
+∇wiju2
+j +
+X
+j′̸=j
+∇wj′ujuj′
+
+
+
+
+(114)
+= 1
+N E
+x
+
+Var
+u
+ ∇wiju2
+j
+
++ Var
+u
+
+X
+j′̸=j
+∇wij′ujuj′
+
++
+(115)
+2 Cov
+u
+
+∇wiju2
+j,
+X
+j′̸=j
+∇wijujuj′
+
+
+
+
+(116)
+= 1
+N E
+x
+
+Var
+u
+ ∇wiju2
+j
+
++ Var
+u
+
+X
+i′j′̸=ij
+∇wij′ujuj′
+
++
+(117)
+2 E
+u
+
+X
+j′̸=j
+∇wij∇wij′u3
+juj′
+
+−2 E
+u
+
+∇wiju2
+j
+
+E
+u
+
+X
+j′̸=j
+∇wij′ujuj′
+
+
+
+
+(118)
+= 1
+N E
+x
+
+∇w2
+ij Var
+u
+ u2
+j
+
++ Var
+u
+
+X
+j′̸=j
+∇wij′ujuj′
+
++
+(119)
+2
+X
+j′̸=j
+∇wij∇wij′ E
+u
+
+u3
+juj′
+−2∇wij E
+u
+
+u2
+j
+
+
+X
+j′̸=j
+∇wij′ E
+u [ujuj′]
+
+
+
+
+(120)
+22
+
+Published as a conference paper at ICLR 2023
+= 1
+N E
+x
+
+∇w2
+ij Var
+u
+ u2
+j
+
++ Var
+u
+
+X
+j′̸=j
+∇wij′ujuj′
+
++
+(121)
+2
+X
+j′̸=j
+∇wij∇wij′ · 0 −2∇wij · 1
+
+X
+j′̸=j
+∇wi′j′ · 0
+
+
+
+
+(122)
+= 1
+N E
+x
+
+∇w2
+ij Var
+u
+ u2
+j
+
++ Var
+u
+
+X
+j′̸=j
+∇wij′ujuj′
+
+
+
+
+(123)
+= 1
+N E
+x
+
+∇w2
+ij · (E
+u[u4
+j] −E
+u[u2
+j]2) +
+X
+j′̸=j
+Var
+u (∇wij′ujuj′)
+
+
+(124)
+= 1
+N E
+x
+
+∇w2
+ij(3 Var
+u (uj)2 −E
+u[u2
+j]2) +
+X
+j′̸=j
+∇w2
+j′ Var
+u (ujuj′)
+
+
+(125)
+= 1
+N E
+x
+
+2∇w2
+ij
+
++
+(126)
+1
+N E
+x
+
+X
+j′̸=j
+∇w2
+ij′(Var
+u [uj] + E
+u[uj′]2)(Var
+u [uj′] + E
+u[uj′]2) −E
+u[uj]2 E
+u[uj′]2
+
+
+(127)
+= 2
+N ∇w
+2
+ij + 2
+N Var
+x (∇wij|x) + 1
+N E
+x
+
+X
+j′̸=j
+∇w2
+ij′ Var
+u (uj) Var
+u (uj′)
+
+
+(128)
+= 2
+N ∇w
+2
+ij + 2
+N Var
+x (∇wij|x) + 1
+N
+X
+j′̸=j
+E
+x
+
+∇w2
+j′
+
+(129)
+= 1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+j′
+
+∇w
+2
+ij′ + Var
+x (∇wij′|x)
+
+
+.
+(130)
+Z3 is nonzero if the perturbations are shared within a batch. Assuming that the perturbations are
+shared,
+Z3 = 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+u (ga(wij)| x(n), ga(wij)| x(m))
+
+
+(131)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+ga(wij)| x(n) ga(wij)| x(m)i
+−E
+u
+h
+ga(wij)| x(n)i
+E
+u
+h
+ga(wij)| x(m)i
+
+
+(132)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+ga(wij)| x(n) ga(wij)| x(m)i
+−∇wij|x(n)∇wij|x(m)
+
+
+(133)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+
+
+X
+j′
+∇wij′|x(n)uj′
+
+uj
+
+X
+j′
+∇wij′|x(m)uj′
+
+uj
+
+−
+(134)
+∇wij|x(n)∇wij|x(m)i
+(135)
+23
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+X
+j′
+X
+j′′
+∇wij′|x(n)∇wij′′|x(m)uj′uj′′u2
+j
+
+
+
+−
+(136)
+1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+
+(137)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+∇wij|x(n)∇wij|x(m)v4
+ij+
+(138)
+∇wij|x(n)u3
+j
+X
+j′̸=j
+∇wij′|x(m)uj′ + ∇wij|x(m)u3
+j
+X
+j′̸=j
+∇wij′|x(n)uj′+
+(139)
+X
+j′̸=j
+∇wij′|x(m)∇wij′|x(n)u2
+j′u2
+j+
+(140)
+X
+j′̸=j
+X
+j′′ /∈{j,j′}
+∇wij′|x(n)uj′∇wij′|x(m)uj′uj′′u2
+j
+
+
+
+−
+(141)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(142)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+∇wij|x(n)∇wij|x(m)v4
+ij +
+X
+j′̸=j
+∇wij′|x(m)∇wij′|x(n)u2
+j′u2
+j
+
+
+
+−
+(143)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(144)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+∇wij|x(n)∇wij|x(m)v4
+ij +
+X
+j′̸=j
+∇wij′|x(m)∇wij′|x(n)u2
+j′u2
+j
+
+
+
+−
+(145)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(146)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m) E
+v
+
+v4
+ij
+
++
+X
+j′̸=j
+∇wij′|x(n)∇wij′|x(m) E
+u
+
+u2
+j′
+
+E
+u
+
+u2
+j
+
+
+−
+(147)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(148)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+3∇wij|x(n)∇wij|x(m) +
+X
+j′̸=j
+∇wij′|x(n)∇wij′|x(m)
+
+−
+(149)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(150)
+24
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+
+3 E
+x [∇wij|x]2 +
+X
+j′̸=j
+E
+x [∇wij′|x]2
+
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(151)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+
+2∇w
+2
+ij +
+X
+j′̸=j
+∇w
+2
+ij′
+
+
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(152)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+
+∇w
+2
+ij +
+X
+j′̸=j
+∇w
+2
+ij′
+
+
+
+
+(153)
+=N(N −1)
+N 2
+
+∇w
+2
+ij +
+X
+j′̸=j
+∇w
+2
+ij′
+
+.
+(154)
+Then we compute the average variance across all weight dimensions (for shared perturbation):
+mVar(ga(wij)) = 1
+pq
+X
+ij
+Var(ga(wij))
+(155)
+= 1
+pq
+X
+ij
+{Z1 + Z2 + Z3}
+(156)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(157)
+1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+j′
+
+∇w
+2
+ij′ + Var
+x (∇wij′|x)
+
+
++
+(158)
+N(N −1)
+N 2
+
+∇w
+2
+ij +
+X
+j′̸=j
+∇w
+2
+ij′
+
+
+(159)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(160)
+1
+N
+
+Var
+x (∇wij|x) +
+X
+j′
+Var
+x (∇wij′|x)
+
++
+
+∇w
+2
+ij +
+X
+j′
+∇w
+2
+ij′
+
+
+
+
+
+(161)
+= 2
+N mVar (∇w) + q
+N mVar (∇w) + (q + 1) mSqNorm(∇w)
+(162)
+=q + 2
+N
+V + (q + 1)S.
+(163)
+If the perturbations are independent, we show that Z3 is 0.
+Z3 = 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+Cov
+u (ga(wij)| x(n), ga(wij)| x(m))
+
+
+(164)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+ga(wij)| x(n) ga(wij)| x(m)i
+−E
+u
+h
+ga(wij)| x(n)i
+E
+u
+h
+ga(wij)| x(m)i
+
+
+(165)
+25
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+ga(wij)| x(n) ga(wij)| x(m)i
+−∇wij|x(n)∇wij|x(m)
+
+(166)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+
+
+X
+j′
+∇wij′|x(n)u(n)
+j′
+
+u(n)
+j
+
+X
+j′
+∇wij′|x(m)u(m)
+j′
+
+u(m)
+j
+
+−
+(167)
+∇wij|x(n)∇wij|x(m)i
+(168)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+
+X
+j′
+X
+j′′
+∇wij′|x(n)∇wij′′|x(m)u(n)
+j′ u(m)
+j′′ u(n)
+j
+u(m)
+j
+
+
+
+−(169)
+1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+
+(170)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+∇wij|x(n)∇wij|x(m)u(n)2
+j
+u(m)2
+j
++
+(171)
+∇wij|x(n)u(n)2
+j
+u(m)
+j
+X
+j′̸=j
+∇wij′|x(m)u(m)
+j′
++ ∇wij|x(m)u(m)2
+j
+u(n)
+j
+X
+j′̸=j
+∇wij′|x(n)u(n)
+j′ +
+(172)
+X
+j′̸=j
+∇wij′|x(m)∇wij′|x(n)u(m)
+j′ u(n)
+j′ u(m)
+j
+u(n)
+j
++
+(173)
+X
+j′̸=j
+X
+j′′ /∈{j,j′}
+∇wij′|x(n)uj′∇wij′|x(m)u(n)
+j′ u(m)
+j′′ u(n)
+j
+u(m)
+j
+
+
+
+−
+(174)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(175)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+∇wij|x(n)∇wij|x(m)u(n)2
+j
+u(m)2
+j
++
+(176)
+X
+j′̸=j
+∇wij′|x(m)∇wij′|x(n)u(m)
+j′ u(n)
+j′ u(m)
+j
+u(n)
+j
+
+
+
+−
+(177)
+1
+N 2
+
+E
+x(n) E
+x(m)
+
+X
+n
+X
+m̸=n
+∇wij|x(n)∇wij|x(m)
+
+
+
+
+(178)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+E
+u
+h
+∇wij|x(n)∇wij|x(m)u(n)2
+j
+u(m)2
+j
+i
+
+−
+(179)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(180)
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m) E
+u
+h
+u(n)2
+j
+i
+E
+u
+h
+u(m)2
+j
+i
+
+−
+(181)
+1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(182)
+26
+
+Published as a conference paper at ICLR 2023
+= 1
+N 2 E
+B
+
+X
+x(n)∈B
+X
+x(m)∈B\{x(n)}
+∇wij|x(n)∇wij|x(m)
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(183)
+= 1
+N 2
+
+X
+n
+X
+m̸=n
+E
+x [∇wij|x]2
+
+−1
+N 2
+
+X
+n
+X
+m̸=n
+∇w
+2
+ij
+
+
+(184)
+=0.
+(185)
+Then the average variance becomes:
+mVar(ga(wij)) = 1
+pq
+X
+ij
+Var(ga(wij))
+(186)
+= 1
+pq
+X
+ij
+{Z1 + Z2 + Z3}
+(187)
+= 1
+pq
+X
+ij
+ 1
+N Var
+x (∇wij|x) +
+(188)
+1
+N
+
+∇w
+2
+ij + Var
+x (∇wij|x) +
+X
+j′
+
+∇w
+2
+ij′ + Var
+x (∇wij′|x)
+
+
+
+
+
+
+(189)
+=q + 2
+N
+mVar (∇w) + q + 1
+N
+mSqNorm(∇w)
+(190)
+=q + 2
+N
+V + q + 1
+N
+S.
+(191)
+100
+101
+102
+103
+N (Batch Size) (p=4, q=4)
+10
+2
+10
+1
+100
+101
+102
+Gradient Variance
+wt perturb
+ind wt perturb
+act perturb
+backprop
+wt perturb (theory)
+ind wt perturb (theory)
+act perturb (theory)
+backprop (theory)
+100
+101
+102
+p (Fan In) (N=4, q=4)
+100
+101
+102
+100
+101
+102
+q (Fan Out) (N=4, p=4)
+100
+101
+102
+103
+104
+105
+Figure 8: Numerical veriﬁcation of the theoretical variance properties
+10
+NUMERICAL SIMULATION OF VARIANCES
+In Figure 8, we ran numerical simulation experiments to verify our analytical variance properties.
+We used a multi-layer network with 4 input units, 4 hidden units, 1 output unit, a tanh activation
+function, and the mean squared error loss. We varied the batch size (N) between 1 and 4096. We
+tested the gradient estimator of the ﬁrst layer weights using 5000 random samples. We also calculated
+the theoretical variance by applying the gradient norm and gradient variance constants found by
+backprop, from 5000 mini-batch true gradients. We then ﬁxed the batch size to be 4 and vary the
+number of input units (p, fan in) and the number of hidden units (q, fan out) between 1 and 256. The
+theoretical variance for backprop was only computed for the batch size experiment since it is an
+inverse relationship ( 1
+N ), but for fan in and fan out, we do not aim to analyze the theoretical variances
+here. “wt perturb” stands for weight perturbation with shared noise; “ind wt perturb” stands for
+weight perturbation with independent noise; and “act perturb” stands for activity perturbation with
+independent noise. Note that indepedent weight perturbation is much more costly to compute in
+27
+
+Published as a conference paper at ICLR 2023
+neural networks. As shown in the ﬁgure, the empirical variances match very well with our theoretical
+predictions.
+11
+TRAINING DETAILS
+Here we provide more training details.
+MNIST. We use a batch size of 128, and the SGD optimizer with learning rate 0.01 and momentum
+0.9 for a total of 1000 epochs with no data augmentation and a linear learning rate decay schedule.
+CIFAR-10. For the supervised experiments, we use a batch size of 128 and the SGD optimizer with
+learning rate 0.01 and momentum 0.9 for a total of 200 epochs with no data augmentation and a
+linear learning rate decay schedule. For the contrastive M/8 experiments, we use a batch size of 512
+and the SGD optimizer with learning rate 1.0 and momentum 0.9 for a total of 1000 epochs with
+BYOL data augmentation using area crop lower bound to be 0.5 and a cosine decay schedule with
+a warm-up period of 10 epochs. For the contrastive L/8 experiments, we use a batch size of 2048
+and the SGD optimizer with learning rate 4.0 and momentum 0.9 for a total of 1000 epochs with
+BYOL data augmentation (Grill et al., 2020) using area crop lower bound to be 0.3 and a cosine
+decay schedule with a warm-up period of 10 epochs.
+ImageNet. For the supervised experiments, we use a batch size of 256 and the SGD optimizer with
+learning rate 0.05 and momentum 0.9 for a total of 120 epochs with BYOL data augmentation (Grill
+et al., 2020) using area crop lower bound to be 0.3 and a cosine learning rate decay schedule with a
+warm-up period of 10 epochs. For the contrastive experiments, we use a batch size of 2048 and the
+LARS optimizer with learning rate 0.1 and momentum 0.9 for a total of 800 epochs with BYOL data
+augmentation (Grill et al., 2020) using area crop lower bound to be 0.08 and a cosine learning rate
+decay schedule with a warm-up period of 10 epochs.
+12
+FUSED JVP/VJP DETAILS
+In Algorithm 1, we provide a JAX code snippet implementing fused operators for the supervised
+cross entropy loss. “Fused” here means that we package several operations into one function. In the
+supervised cross entropy loss, we combine average pooling, channel concatenation, a linear classiﬁer
+layer, and cross entropy all together. Key steps and expected tensor shapes are annotated in the
+comments. The fused InfoNCE loss implementation will be included in our full code release.
+13
+LOCALMIXER ARCHITECTURE
+In Algorithm 2, we provide code in JAX style that implements our proposed LocalMixer architecture.
+14
+ADDITIONAL RESULTS
+In this section we provide additional experimental results.
+Normalization scheme. Table 5 compares different normalization schemes. Layer normalization
+(LN) is often better than batch normalization (BN) on our mixer architecture. Local LN is better
+on contrastive learning experiments and achieves lower error rates using forward gradient learning.
+Although in our main paper, backprop were used in normalization layers, backprop is not necessary
+for Local LN, c.f. “NG” (No Gradient) columns in Table 5.
+Place of normalization. We investigate the places where we add normalization layers. Traditionally,
+normalization is added after linear layers. In MLPMixer, LN is added at the beginning of each block.
+With our forward gradient learning, it is now a question of which location is the optimal design.
+Adding it after the linear layer has the advantage of shaping the activations to be more well behaved,
+which can make perturbation learning more effective. Adding it before the linear layer can also help
+reduce the variance since the inputs always get multiplied with the gradient of the output activity.
+The results are reported in Table 6. Adding normalization both before and after the linear layer
+helps forward gradient to achieve lower training errors. While this could result in some overﬁtting
+on supervised learning, it is good for contrastive learning which needs more model capacity. This
+is reasonable as forward gradient introduce a lot of variances, and more normalization layers help
+achieve better training performance.
+28
+
+Published as a conference paper at ICLR 2023
+Algorithm 1 Naïve and fused local cross entropy, with custom JVP and VJP operators.
+# N: batch size; P: num patches; G: num grps; C: num channels; D: channels / grp; K: num cls
+# x: encoder features [N,P,G,C/G]
+# w: classifier weights [C,K]; b: classifier bias [K]
+# labels: class labels [N,K]
+import jax
+import jax.numpy as jnp
+from jax.scipy.special import logsumexp
+def naive_avg_group_linear_xent(x, w, b, labels):
+N, P, G, _ = x.shape
+# Average pooling, with stop gradients. [N,P,G,C/G] -> [N,1,G,C/G]
+avg_pool_p = jnp.mean(x, axis=1, keepdims=True)
+x_div_p = x / float(P)
+# [N,P,G,C/G]
+x = x_div_p + jax.lax.stop_gradient(avg_pool_p - x_div_p)
+# Concatenate everything, with stop gradients. [N,P,G,C] -> [N,P,G,G,C/G]
+x = jnp.tile(jnp.reshape(x, [N, P, 1, G, -1]), [1, 1, G, 1, 1])
+mask = jnp.eye(G)[None, None, :, :, None]
+x = mask * x + jax.lax.stop_gradient((1.0 - mask) * x)
+# [N,P,G,G,C/G] -> [N,P,G,C]
+x = jnp.reshape(x, [N, P, G, -1])
+logits = jnp.einsum(’npgc,cd->npgd’, x, w) + b
+logits = logits - logsumexp(logits, axis=-1, keepdims=True)
+loss = -jnp.sum(logits * labels[:, None, None, :], axis=-1)
+return loss
+def fused_avg_group_linear_xent(x, w, b, labels):
+# This is for forward pass. The numerical value of each local loss should be the same.
+# So we compute one and replicate it many times.
+N, P, G, _ = x.shape
+# [N,P,G,C/G] -> [N,G,C/G]
+x_avg = jnp.mean(x, axis=1)
+# [N,G,C/G] -> [N,C]
+x_grp = jnp.reshape(x_avg, [x_avg.shape[0], -1])
+# [N,C] -> [N,K]
+logits = jnp.einsum(’nc,ck->nk’, x_grp, w) + b
+logits = logits - logsumexp(logits, axis=-1, keepdims=True)
+loss = -jnp.sum(logits * labels, axis=-1)
+# Key step: after computing the loss, replicate it for PxG times. [N] -> [N,P,G]
+return jnp.tile(jnp.reshape(loss, [N, 1, 1]), [1, P, G])
+def fused_avg_group_linear_xent_jvp(primals, tangents):
+# This JVP operator performs both regular forward pass and the forward autodiff.
+x, w, b, labels = primals
+dx, dw, db, dlabels = tangents
+N, P, G, D = x.shape
+dx_avg = dx / float(P)
+# Reshape the classifier weights, since only one group passes gradient at a time.
+w_ = jnp.reshape(w, [G, D, -1])
+b = jnp.reshape(b, [-1])
+# Regular forward pass
+# [N,P,G,C/G] -> [N,G,C/G]
+x_avg = jnp.mean(x, axis=1)
+# [N,G,C/G] -> [N,C]
+x_grp = jnp.reshape(x_avg, [x_avg.shape[0], -1])
+# [N,C] -> [N,K]
+logits = jnp.einsum(’nd,dk->nk’, x_grp, w) + b
+logits = logits - logsumexp(logits, axis=-1, keepdims=True)
+loss = -jnp.sum(logits * labels, axis=-1)
+# We can compute the gradient through cross entropy first.
+dlogits_bwd = jax.nn.softmax(logits, axis=-1) - labels # [N,K]
+# Key step: dloss = dx * w * dloss/dlogit + (x * dw + db) * dloss/dlogit
+# Do the einsum together to avoid replicating outputs.
+dloss = jnp.einsum(’npgd,gdk,nk->npg’, dx_avg, w_, dlogits_bwd) + jnp.einsum(’nk,nk->n’,
+(jnp.einsum(’nc,ck->nk’, x_grp, dw) + db), dlogits_bwd)[:, None, None] # [N,P,G]
+# Return loss and loss gradients [N,P,G].
+return jnp.tile(jnp.reshape(loss, [N, 1, 1]), [1, P, G]), dloss
+def fused_avg_group_linear_xent_vjp(res, g):
+# This is a fused backprop (VJP) operator.
+x, w, logits, labels = res
+N, P, G, D = x.shape
+x_avg = jnp.mean(x, axis=1)
+x_grp = jnp.reshape(x_avg, [x_avg.shape[0], -1])
+# Key step: only the first patch/group gradients since everything is the same.
+g_ = g[:, 0:1, 0]
+dlogits = g_ * (jax.nn.softmax(logits, axis=-1) - labels) # [N,K]
+# Remember to multiply gradients by PG times due to weight sharing.
+db = jnp.reshape(jnp.sum(dlogits, axis=[0]), [-1]) * float(P * G)
+dw = jnp.reshape(jnp.einsum(’nc,nk->ck’, x_grp, dlogits),
+[G * D, -1]) * float(P * G)
+# Key step: use grouped weights to perform backprop.
+dx = jnp.einsum(’nd,gcd->ngc’, dlogits, jnp.reshape(w, [G, C, -1])) / float(P)
+# Broadcast gradients across patches.
+dx = jnp.tile(dx[:, None, :, :], [1, P, 1, 1])
+return dx, dw, db, None
+29
+
+Published as a conference paper at ICLR 2023
+Algorithm 2 A LocalMixer architecture implemented with JAX style code.
+import jax
+import jax.numpy as jnp
+def linear(x, w, b):
+"""Linear layer."""
+return jnp.einsum(’npc,cd->npd’, x, w) + b
+def group_linear(x, w, b):
+"""Linear layer with groups."""
+return jnp.einsum(’npgc,gcd->npgd’, x, w) + b
+def normalize(x, axis=-1, eps=1e-5):
+"""Normalization layer."""
+mean = jnp.mean(x, axis=axis, keepdims=True)
+mean_of_squares = jnp.mean(jnp.square(x), axis=axis, keepdims=True)
+var = mean_of_squares - jnp.square(mean)
+inv = jax.lax.rsqrt(var + eps)
+y = (x - mean) * inv
+return y
+def block0(x, params):
+"""Initial block with only channel mixing."""
+N, P, _ = x.shape
+G = num_groups
+x = normalize(x)
+x = linear(x, params[0][0], params[0][1])
+x = normalize(x)
+x = jax.nn.relu(x)
+x = jnp.reshape(x, [N, P, G, -1])
+x = normalize(x)
+x = group_linear(x, params[1][0], params[1][1])
+x = normalize(x)
+x = jax.nn.relu(x)
+return x
+def mlp_block(x, params):
+"""Regular MLP block with token & channel mixing."""
+N, P, G, _ = x.shape
+inputs = x
+# Token mixing.
+x = jnp.reshape(x, [N, P, -1])
+x = normalize(x)
+x = jnp.swapaxes(x, 1, 2)
+x = linear(x, params[0][0], params[0][1])
+x = jnp.swapaxes(x, 1, 2)
+x = normalize(x)
+x = jax.nn.relu(x)
+# Channel mixing.
+x = normalize(x)
+x = linear(x, params[1][0], params[1][1])
+x = normalize_layer(x)
+x = jax.nn.relu(x)
+x = jnp.reshape(x, [N, P, G, -1])
+x = normalize(x)
+x = group_linear(x, params[2][0], params[2][1])
+x = normalize(x)
+x = x + inputs
+x = jax.nn.relu(x)
+return x
+def local_mixer(x, params):
+"""LocalMixer."""
+x = preprocess(x, image_mean, image_std, num_patches)
+pred_local = [] # Local predictions.
+# Build network blocks.
+for blk in range(num_blocks):
+if blk == 0:
+x = block0(x, params[f’block_{blk}’])
+else:
+x = mlp_block(x, params[f’block_{blk}’])
+# Projector connects to local losses.
+x_proj = normalize(x)
+pred_local.append(linear(x_proj, params[f’proj_{blk}’][0], params[f’proj_{blk}’][1]))
+# Disconnect gradients.
+x = jax.lax.stop_gradient(x)
+x = jnp.reshape(x, [x.shape[0], x.shape[1], -1])
+x = jnp.mean(x, axis=1) # [N,C]
+x = normalize(x)
+pred = linear(x, params[’classifier’][0], params[’classifier’][1])
+return pred, pred_local
+30
+
+Published as a conference paper at ICLR 2023
+Supervised M/8/16
+Contrastive M/8/16
+BP
+LG-BP
+LG-FG-A
+LG-FG-A (NG)
+BP
+LG-BP
+LG-FG-A
+LG-FG-A (NG)
+BN
+30.38 / 0.00
+33.41 / 5.41
+32.84 / 23.09
+33.48 / 20.80
+27.56 / 24.39
+30.27 / 28.03
+35.47 / 32.71
+37.41 / 31.52
+LN
+30.55 / 0.00
+33.17 / 7.09
+29.03 / 17.63
+29.33 / 19.26
+23.52 / 20.71
+27.41 / 24.73
+34.21 / 31.38
+36.24 / 34.12
+Local LN
+32.89 / 0.00
+33.84 / 0.05
+30.68 / 19.39
+30.44 / 17.12
+23.24 / 21.03
+28.42 / 25.20
+32.89 / 31.01
+32.25 / 30.17
+Table 5: Comparing different normalization schemes. NG=No normalization gradient. CIFAR-10
+test / train error (%)
+Supervised M/8/16
+Contrastive M/8/16
+LN
+BP
+LG-BP
+LG-FG-A
+BP
+LG-BP
+LG-FG-A
+Begin Block
+31.43 / 0.00
+34.73 / 1.45
+34.89 / 31.11
+23.27 / 20.69
+25.82 / 22.96
+89.93 / 90.71
+Before Linear
+32.50 / 0.00
+34.15 / 0.05
+33.88 / 27.94
+22.62 / 20.38
+NaN / NaN
+35.01 / 32.91
+After Linear
+30.38 / 0.00
+29.83 / 0.44
+29.35 / 23.19
+26.50 / 23.98
+28.97 / 26.67
+34.10 / 33.18
+Before + After Linear
+33.62 / 0.00
+33.84 / 0.05
+30.68 / 19.39
+23.24 / 21.03
+28.42 / 25.20
+32.89 / 31.01
+Table 6: Place of LayerNorm on CIFAR-10, test / train error. (%)
+Number of Groups
+Error Rate (%)
+0
+10
+20
+30
+40
+1
+2
+4
+8
+16
+32
+64
+BP Train
+LG-BP Train
+LG-FG-A Train
+BP Test
+LG-BP Test
+LG-FG-A Test
+(a) CIFAR-10 Supervised M/8/*
+Number of Groups
+Error Rate (%)
+15
+25
+35
+45
+1
+2
+4
+8
+16
+32
+64
+BP Train
+LG-BP Train
+LG-FG-A Train
+BP Test
+LG-BP Test
+LG-FG-A Test
+(b) CIFAR-10 Contrastive M/8/*
+Figure 9: Effect of groups. For BP algorithms, groups has a minor effect on the ﬁnal performance,
+but for local forward gradient, it signiﬁcantly reduces the variance and achieves lower error rate on
+both training and test sets.
+Effect of groups. We provide additional results summarizing the training and test performance of
+adding more groups in Figure 9. Backprop and local greedy backprop always achieve zero training
+error with increasing number of groups on CIFAR-10 supervised, but adding groups has a signiﬁcant
+beneﬁt lowering training errors for forward gradient. This suggests that the main opponent here is still
+the gradient estimation variance, and lowering training errors can generally make test errors lower
+too; on the other hand adding groups have negligible effect on backprop. For contrastive learning,
+here the task requires higher model capacity, and adding groups effectively reduce the model capacity
+by introducing sparsity in the weight matrix. As a result, we observe a slight drop of less than 5%
+performance on both backprop and local greedy backprop. By contrast, forward gradient gains over
+10% of performance by adding 16 groups.
+31
+

@@ -1,0 +1,1228 @@
+Speculative RAG: Enhancing Retrieval Augmented
+Generation through Drafting
+Zilong Wang1∗
+Zifeng Wang2
+Long Le2
+Huaixiu Steven Zheng3
+Swaroop Mishra3
+Vincent Perot3
+Yuwei Zhang1
+Anush Mattapalli4
+Ankur Taly4
+Jingbo Shang1
+Chen-Yu Lee2
+Tomas Pfister2
+1University of California, San Diego
+2Google Cloud AI Research
+3Google DeepMind
+4Google Cloud AI
+Abstract
+Retrieval augmented generation (RAG) combines the generative abilities of large
+language models (LLMs) with external knowledge sources to provide more ac-
+curate and up-to-date responses. Recent RAG advancements focus on improving
+retrieval outcomes through iterative LLM refinement or self-critique capabilities
+acquired through additional instruction tuning of LLMs. In this work, we intro-
+duce SPECULATIVE RAG – a framework that leverages a larger generalist LM
+to efficiently verify multiple RAG drafts produced in parallel by a smaller, dis-
+tilled specialist LM. Each draft is generated from a distinct subset of retrieved
+documents, offering diverse perspectives on the evidence while reducing input
+token counts per draft. This approach enhances comprehension of each subset
+and mitigates potential position bias over long context. Our method accelerates
+RAG by delegating drafting to the smaller specialist LM, with the larger generalist
+LM performing a single verification pass over the drafts. Extensive experiments
+demonstrate that SPECULATIVE RAG achieves state-of-the-art performance
+with reduced latency on TriviaQA, MuSiQue, PubHealth, and ARC-Challenge
+benchmarks. It notably enhances accuracy by up to 12.97% while reducing latency
+by 51% compared to conventional RAG systems on PubHealth.
+1
+Introduction
+Large language models (LLMs) have demonstrated remarkable success in question answering
+tasks (Brown et al., 2020; Achiam et al., 2023; Team et al., 2023). Trained on massive datasets,
+LLMs leverage their extensive parametric memory to generate seemingly plausible responses to user
+queries (Kojima et al., 2022; Kamalloo et al., 2023). However, when faced with knowledge-intensive
+questions demanding up-to-date information or obscure facts (Petroni et al., 2021), LLMs can struggle
+with factual inaccuracies and produce hallucinated content (Huang et al., 2023; Xu et al., 2024).
+Retrieval Augmented Generation (RAG) has emerged as a promising solution to mitigate these
+issues. By incorporating information retrieved from an external database into the context (Gao
+et al., 2023b), RAG effectively reduces factual errors in knowledge-intensive tasks. This approach
+not only enables easy and efficient access to vast databases but also facilitates timely and accurate
+knowledge integration Due to the inherent limitations in the precision of current dense retrievers and
+the vastness of knowledge required to answer complex questions (Chen et al., 2022), RAG systems
+typically retrieve multiple documents to ensure the inclusion of all necessary information in the
+context (Petroni et al., 2021). This practice inevitably increases the length of the input to the LLMs,
+∗Work done while the author was a student researcher at Google Cloud AI Research. Correspondence to:
+Zilong Wang <zlwang@ucsd.edu>, Chen-Yu Lee <chenyulee@google.com>
+Preprint. Under review.
+arXiv:2407.08223v1  [cs.CL]  11 Jul 2024
+
+(a) Standard RAG
+Prompt
+Q
+Query
+1
+2
+3
+(Incorporate 
+All docs into 
+the prompt)
+Generalist
+LM
+A
+Final 
+Answer
+(b) Self-Reﬂective RAG
+Q
+1
+2
+3
+4
+Need 
+Retrieval
+Relevant
+Irrelevant
+Generalist
+LM
+A
+Supported
+Relevant
+Generate special tags 
+to reﬂect over the 
+retrieved docs and the 
+generated answers
+Special tags 
+learned during 
+instruction-tuning
+(c) Corrective RAG
+1
+2
+3
+Correct
+Amiguous
+Incorrect
+NLI Model
+Q
+1
+2
+Query
+Relevant 
+Docs
+Web Search
+Generalist
+LM
+A
+Use an NLI model to 
+classify retrieval docs
+Incorporate relevant docs and the 
+docs from web search into prompt.
+(d) Ours: Speculative Retrieval-Augmented Generation (Speculative RAG)
+Q
+End generation or Continue querying 
+Generalist LM for other tasks
+1
+2
+Specialist
+RAG Drafter
+Q +
+Q +
+Q +
+Eﬃciently generate drafts α and rationale β
+4
+5
+3
+6
+Understand multiple perspectives of the docs
+(Docs of the same color are from the same topic cluster)
+α1 β1
+α2 β2
+α3 β3
+No need to instruction-
+tune the Generalist LM
+       When Generalist LM 
+encounters knowledge-
+intensive queries?
+        Evaluate each answer draft based 
+on the question and the rationale in 
+parallel using Generalist LM and Accept 
+the Best Draft.
+Query Generalist LM
+Call Specialist RAG Drafter
+Evaluate & Accept Drafts into Generalist LM
+Understand documents 
+in parallel with the RAG Drafter
+A = argmax Score( αi | Q, βi )
+αi
+Evaluate drafts by Generalist
+LM & Accept the best draft
+βi
+A=αi
+…
+1
+2
+Retrieved Documents
+A
+Evidence-supported Answers
+A Knowledge-intensive Query
+Q
+A Generalist LM
+A Specialist LM
+Figure 1: Illustration of different RAG approaches. Given a knowledge-intensive query Q and
+retrieved documents, (a) Standard RAG incorporates all documents into the prompt, increasing
+input length and slowing inference; (b) Self-Reflective RAG (Asai et al., 2023) requires specialized
+instruction-tuning of the general-purpose language model (LM) to generate specific tags for self-
+reflection; (c) Corrective RAG (Yan et al., 2024) employs an external retrieval evaluator to refine
+document quality, focusing solely on contextual information without enhancing reasoning capabilities;
+(d) In contrast, our proposed SPECULATIVE RAG leverages a larger generalist LM to efficiently
+verify multiple RAG drafts produced in parallel by a smaller, specialized LM. Each draft is generated
+from a distinct subset of retrieved documents, providing diverse perspectives on the evidence while
+minimizing the number of input tokens per draft.
+presenting significant challenges, particularly since encoding lengthy retrieved documents incurs
+additional latency and require more complex reasoning. Recent studies have explored ways to extend
+the context length limit of LLMs (Ding et al., 2023; Reid et al., 2024; Ma et al., 2024), yet achieving
+well-grounded reasoning over extended contexts remains an open question (Liu et al., 2024; Li et al.,
+2024). Consequently, striking a balance between efficiency and effectiveness in RAG has become a
+central research question in the literature. Existing work on RAG systems primarily concentrates
+on improving the quality of contextual information in retrieval outcomes, but often neglecting the
+latency issues associated with these systems (Ma et al., 2023; Baek et al., 2023; Yan et al., 2024; Xie
+et al., 2023; Asai et al., 2023; Feng et al., 2023). These methods typically rely on multiple refinement
+iterations or customized instruction-tuning for self-critique abilities. Integrating such enhancements
+into generic LMs requires additional training or increased latency, posing practical challenges in
+real-world applications.
+To this end, we introduce SPECULATIVE RAG, a RAG framework designed to offload computational
+burden to a smaller, specialist LM that serves as an efficient and robust RAG module for existing
+generalist LMs. Inspired by Speculative Decoding (Leviathan et al., 2023; Chen et al., 2023a; Xia
+et al., 2024), which accelerates auto-regressive LM inference by concurrently generating multiple
+draft tokens with a smaller model and verifying them in parallel with the base model, our approach
+adapts this concept to RAG.
+In SPECULATIVE RAG, we partition retrieved documents into subsets for drafting answer candidates.
+We cluster the retrieved documents by content similarity and sample one document from each cluster
+to form a subset, minimizing redundancy and maximizing diversity. These document subsets are
+then fed to multiple instances of the RAG module, which generate draft answers with corresponding
+rationales in parallel. This smaller, specialized RAG module, excels at reasoning over retrieved
+documents and can rapidly produce accurate responses. Subsequently, the generalist LM bypasses
+the detailed review of potentially repetitive documents, focusing instead on validating the drafts
+2
+
+against the rationales to determine the most accurate answer. We utilize the strong language modeling
+capabilities of generalist LMs, calculating the conditional generation probability of the answer drafts
+and rationales as a confidence score. Our key contributions are:
+• We introduce a novel RAG framework that employs a smaller specialist RAG drafter to generate
+high-quality draft answers. Each draft is derived from a distinct subset of retrieved documents,
+offering diverse perspectives while reducing input token counts per draft.
+• The generalist LM, operating with the RAG drafter, requires no additional tuning. It simply verifies
+and integrates the most promising draft into the final answer. This approach enhances comprehen-
+sion of each subset and mitigates potential lost-in-the-middle (Liu et al., 2024) phenomenon.
+• Our method significantly accelerates RAG by delegating drafting to the smaller specialist LM, with
+the larger generalist LM performing a single, unbiased verification pass over the drafts in parallel.
+Extensive experiments on 4 free-form question-answering and closed-set generation benchmarks
+demonstrate the superior effectiveness and efficiency of the method.
+2
+Related Works
+Retrieval Augmented Generation Retrieval Augmented Generation (RAG) enhances LLMs by
+retrieving relevant documents from external databases and incorporating them into the generation
+process (Gao et al., 2023b; Lewis et al., 2020; Khandelwal et al., 2020; Izacard & Grave, 2021;
+Luo et al., 2023a). Recent work has primarily focused on enabling LLMs to understand when and
+what to retrieve (Ma et al., 2023; Chen et al., 2023b; Jiang et al., 2023b; Schick et al., 2024), or
+designing approaches to better utilize contexts (Yu et al., 2023; Yoran et al., 2023; Wang et al., 2023b;
+Sarthi et al., 2024; Baek et al., 2023; Xu et al., 2023; Kim et al., 2024). Among them, SAIL (Luo
+et al., 2023a) fine-tunes a pre-trained LLM on web search data to filter irrelevant contents. Self-
+Reflective RAG (Asai et al., 2023) introduces reflection tokens to guide retrieval and annotation in
+instruction-tuning datasets. However, both approaches require additional instruction-tuning of generic
+LLMs, which is resource-intensive and may lead to forgetting or over-fitting (Luo et al., 2023b).
+Furthermore, long context with retrieved documents can suffer from computational inefficiency and
+position bias (Liu et al., 2024). Corrective RAG (Yan et al., 2024) on the other hand proposes a
+lightweight retrieval evaluator, but it lacks the capability for high-level reasoning. In contrast, our
+proposed SPECULATIVE RAG addresses these limitations by leveraging a smaller RAG drafter model
+to efficiently understand diverse perspectives in retrieval results and generate drafts for the generalist
+LMs to verify and integrate.
+Speculative Decoding Speculative decoding (Stern et al., 2018; Xia et al., 2023; Chen et al., 2023a;
+Leviathan et al., 2023; Xia et al., 2024) aims to reduce auto-regressive decoding latency through a
+draft-then-verify paradigm. This involves drafting multiple future tokens with a small model and
+verifying them in parallel with the target model (Xia et al., 2024). The draft model is typically
+either an independent model from the same series (Leviathan et al., 2023; Chen et al., 2023a) or the
+target model itself (Zhang et al., 2023a; Cai et al., 2024). Our approach extends this concept from
+token-level drafting to answer-level drafting. In contrast to traditional verification criteria (Stern et al.,
+2018; Xia et al., 2023; Leviathan et al., 2023; Chen et al., 2023a; Miao et al., 2024), which accept or
+reject tokens based on their generation probabilities, we leverage language modeling objectives to
+directly assess the confidence of entire answer drafts.
+3
+Speculative Retrieval Augmented Generation through Drafting
+Problem Formulation In knowledge intensive tasks, each entry can be represented as (Q, D, A),
+where Q is a question or statement that requires additional knowledge; D = {d1, ..., dn} is a set
+of n documents retrieved from the database; A is the expected answer. Particularly, in question
+answering tasks, Q and A are the question and the expected answer in natural language form; in the
+statement verification tasks, Q is a statement and A ∈{True, False} is a Boolean value indicating
+the statement’s correctness; in the multiple choice tasks, Q is a question with a few options and
+A ∈{A, B, C, ...} is the index of the correct answer. The objective of a RAG system is to generate
+a fluent response containing the expected answer or select the expected answer from the provided
+options based on the context provided by the retrieved supporting documents.
+3
+
+3.1
+Overview
+We introduce Speculative Retrieval Augmented Generation (SPECULATIVE RAG), as illustrated in
+Figure 1. We aim at enhancing the reasoning ability of LLMs over retrieved documents without
+compromising processing speed. Instead of relying on brute-force parameter scaling or instruction-
+tuning an entire LM to handle knowledge-intensive tasks, we propose a divide-and-conquer approach.
+We utilize a smaller specialist LM, the RAG drafter, to rapidly generate multiple answer drafts
+based on retrieved results. Then, a larger generalist LM, the RAG verifier, assesses these drafts,
+selects the best one based on its rationale, and integrates it into the generation results.
+Algorithm 1: SPECULATIVE RAG
+Data: (Q, D = {di}n
+i ) is the question and n retrieved documents; m subsets, each containing k
+documents, are sampled from D; k also corresponds to the number of clusters during clustering.
+Result: ˆA is the predicted answer to the question.
+1 Function Speculative RAG (Q, D, m, k):
+2
+{c1, c2, ..., ck}
+K-Means
+←−−−−C(d1, ..., dn|Q)
+▷Cluster the documents into k groups using an embedding model C.
+3
+∆←{}
+4
+repeat
+5
+δj ←{}
+▷Construct a subset of the retrieved documents δj
+6
+for ci ∈{c1, ..., ck} do
+7
+δj = δj ∪{random.sample(ci)}
+▷Sample one document from each cluster ci into subset δj.
+8
+end
+9
+∆= ∆∪{δj}
+10
+until |∆| = m
+▷Repeat the sampling until there are m unique subsets in total.
+11
+for δj ∈∆do in parallel
+▷Process m subsets in parallel.
+12
+αj, βj ←MDrafter.generate(Q, δj)
+▷Generate the draft α and rationale β with MDrafter.
+13
+ρj ←MVerifier.score(αj|Q, βj)
+▷Compute the confidence score ρ with MVerifier.
+14
+end
+15
+ˆA ←arg maxαj ρj
+▷Select the one with the highest score as the final answer.
+16 return ˆA
+Specifically, as shown in Algorithm 1, we first cluster the retrieved documents with regard to their
+relation to the posed question, where each cluster represents one perspective in the retrieval results
+(Line 2). Then we sample one document from each cluster into a subset so the documents in this
+subset covers the multiple perspectives in the retrieval results. We aim at minimizing redundancy and
+increase the diversity of the documents (Line 5 to 8). We denote one subset as δ ⊂D that contains
+retrieved documents with diverse contents and multiple perspectives in the retrieval results. Then, we
+distribute each subset δ to a RAG drafter endpoint MDrafter with the posed question Q to generate the
+answer draft α and the rationale β in parallel (Line 12). The RAG drafter is instruction-tuned to be
+a specialist in understanding the retrieved documents and produce rationales that are faithful to the
+input documents. It is smaller than generalist LMs, and its parallel processing further ensures high
+efficiency. For each draft-rationale pair (α, β) from MDrafter, we compute a confidence score with
+the generalist LM MVerifier based on the question Q and corresponding rationale β (Line 13). It is
+worth mentioning that MVerifier does not need to be instruction-tuned since we leverage its language
+modeling ability already learned during pre-training. Meanwhile, MVerifier can verify the drafts based
+on the informative rationale provided by MDrafter instead of processing tedious or possibly redundant
+retrieved documents. Finally, we select the answer draft with the highest confidence score as the final
+answer and integrate it into the generation results of the generalist LM (Line 15).
+3.2
+Specialist RAG Drafter
+Instead of tuning a large generalist LM for the RAG scenario, we leverage a smaller specialist LM,
+MDrafter, to understand retrieved documents. MDrafter is specialized in answering the given question
+based on the supporting documents and not expected to cope with general problems. It serves as a
+RAG module for the generalist LMs when solving knowledge-intensive tasks. We train MDrafter to
+generate both the answer draft and the rationale to better understand the contextual documents.
+Instruction Tuning Given a triplet (Q, A, D), where Q is a general query, A is the response, and D
+is a retrieved supporting document, we augment it with the rationale of the response A based on the
+document D. We denote the rationale as E which extracts essential information from the document
+and explains why the response is reasonable to the query concisely (Hsieh et al., 2023) so it is of
+4
+
+shorter length and delivers information coherent with the original document. We leverage relatively
+strong LMs to automatically synthesize the rationale E for each triplet. Specifically, we directly query
+the strong LM to understand the knowledge from the document and provide the intermediate rationale
+between the instruction and response. Refer to Appendix A for detailed prompts. After generating the
+rationale, we finetune a pre-trained LM using the standard language modeling objective, maximizing
+the likelihood: E(Q,A,D,E) log PMDrafter(A, E | Q, D), where (Q, A, D, E) is an augmented entry in
+the dataset; PMDrafter(A, E | Q, D) is the probability of generating the response and rationale based
+on the query and document. We use this instruction-tuned model as the specialist RAG drafter which
+learns to generate a well-grounded response and rationale given the query and relevant documents.
+Multi-Perspective Sampling For each knowledge-intensive question, we retrieve a set of documents
+from the database using the posed question as the retrieval query. These documents may contain
+diverse content due to the ambiguity inherent in the query. To minimize redundancy and enhance
+diversity of the document subsets used for generating answer drafts, we employ a multi-perspective
+sampling strategy. We first cluster the documents into a few topics using an instruction-aware
+embedding model (Peng et al., 2024) and the K-Means clustering algorithm (Jin & Han, 2011).
+emb(d1), ..., emb(dn) = E(d1, ..., dn|Q)
+{c1, ..., ck} = K-Means(emb(d1), ..., emb(dn))
+δ =
+
+random.sample(c) for c ∈{ci}k
+1
+	
+where E is an instruction-aware embedding model which embeds a string with regard to a provided
+instruction (the posed question Q); emb(di) is the embedding for the retrieved document di; cj is a
+cluster of retrieved documents with similar topics and contents; k is a hyper-parameter that controls
+the number of clusters. We sample one document from each cluster into a document subset δ so
+each subset contains k documents of diverse contents. In total, we construct m subsets for parallel
+inference with the RAG drafter.
+RAG Drafting We run MDrafter over the m document subsets and produce corresponding answer
+drafts. Refer to Appendix B for detailed prompt. We incorporate each document subset into the
+prompt and query MDrafter for responses. We obtain m drafts as the answer candidates and each draft
+is grounded based on the multiple perspectives in the retrieval results. Specifically, given a document
+subset δj = {dj1, .., djk}, we query MDrafter in parallel with the following prompt for the answer draft
+and rationale: Q, dj1, ..., djk →αj, βj, where the prompt contains the posed question Q along with
+the document subset; the generation result contains the answer draft α and the rationale β. We denote
+the conditional generation probability as ρDraft,j = P(βj|Q, dj1, ..., djk) + P(αj|Q, dj1, ..., djk, βj),
+which measures the reliability of generating rationales and the confidence in producing answer drafts.
+3.3
+Generalist RAG Verifier
+After generating drafts and the rationale from the RAG drafter MDrafter, we evaluate them by a
+generalist LM MVerifier to filter out the less reliable drafts and select the best answer. The generalist
+LM can be any off-the-shelf pre-trained LM. We only consider the draft-rationale pair (α, β) and
+skip the tedious and redundant retrieval results. We resort to the language modeling ability of the
+generalist LM to rank and select the draft-rationale pairs.
+Evaluation Scores First, we calculate the self-consistency score by determining the conditional
+probability of generating a draft-rationale pair given the question, ρSelf-contain = P(α, β|Q). This
+score helps assess whether the draft and rationale are self-consistent in the context of the question.
+Given the characteristics of language modeling, a self-consistent draft-rationale pair is expected to
+yield a higher probability. Furthermore, we incorporate a self-reflection statement R that prompts
+MVerifier to assess the reliability of an answer draft (e.g. “Do you think the rationale supports the
+answer, yes or no?”). We define the self-reflection score as ρSelf-reflect = P("Yes"|Q, α, β, R)
+where we compute the conditional probability of the positive answer ("Yes") to the self-reflection
+statement.
+Computation Method We can efficiently compute the self-consistency and self-reflection scores
+within one forward pass of MVerifier. Given a question Q and a draft-rationale pair (α, β), we
+construct a prompt [Q, α, β, R, "Yes"], where R is the self-reflection statement. We encode the
+prompt with MVerifier, and acquire the probability of each token conditioned on the previous tokens
+P(ti|t<i). We leverage this auto-regressive feature and aggregate the probability of the relevant
+5
+
+tokens to compute the self-consistent score ρSelf-contain and self-reflection score ρSelf-reflect.
+Q,
+ρSC
+z}|{
+α, β, R,
+ρSR
+z }| {
+"Yes"
+−−−−−−−−−−−−−→⇒
+(
+ρSC = Q
+ti∈α P(ti|t<i) · Q
+ti∈β P(ti|t<i)
+ρSR = Q
+ti∈"Yes" P(ti|t<i)
+Finally, we produce the final score, ρj = ρDraft,j · ρSC,j · ρSR,j, and then select the most reliable
+answer as the final answer to the question ˆA = arg maxαj ρj.
+4
+Experiments
+We evaluate our proposed SPECULATIVE RAG on four public retrieval augmented generation bench-
+marks: TriviaQA (unfiltered) (Joshi et al., 2017), MuSiQue (Trivedi et al., 2022), PubHealth (Zhang
+et al., 2023b), and ARC-Challenge (Clark et al., 2018). TriviaQA and MuSiQue are challenging
+open-domain question answering datasets where RAG systems are required to answer questions on
+factual knowledge. TriviaQA typically requires one accurate piece of evidence from the documents,
+whereas MuSiQue demands multiple documents to construct a multi-hop reasoning chain. Following
+previous works (Guu et al., 2020; Asai et al., 2023; Yan et al., 2024), we evaluate performance of the
+free-form generation based on whether gold answers are contained within the generated response
+or not. PubHealth and ARC-Challenge are closed-set generation datasets. PubHealth is a dataset of
+medical claims spanning a variety of biomedical subjects and it requires the RAG system to verify a
+given claim based on the retrieved documents. ARC-Challenge introduces a multi-choice question
+answering dataset, composed of science exam questions from grade 3 to grade 9. For closed-set
+generation tasks, we use accuracy metrics to evaluate whether the generated answers match the
+ground truth.
+4.1
+Baselines
+Standard RAG For standard RAG, we incorporate all the retrieved documents into the prompt
+as contextual information. Refer to Appendix C for detailed prompts. We run standard RAG
+experiments on off-the-shelf LLMs including Mistral7B, Mistral-Instruct7B (Jiang et al., 2023a),
+Mixtral8x7B, Mixtral-Instruct8x7B (Jiang et al., 2024), and Alpaca7B (Dubois et al., 2024). We also
+include the performance of Toolformer (Schick et al., 2024) and SAIL (Luo et al., 2023a) which are
+originally reported from Asai et al. (2023). Toolformer7B is an LM instruction-tuned to use tools
+including a search engine, and SAIL7B is an LM instruction-tuned on the Alpaca instruction tuning
+set augmented with search results from different sources such as DuckDuckGo and Wikipedia.
+Self-Reflective RAG and Corrective RAG Self-Reflective RAG (Self-RAG) (Asai et al., 2023)
+and Corrective RAG (CRAG) (Yan et al., 2024) are more advanced RAG systems that enhances
+the quality of contextual information in the retrieval results. CRAG introduces an external evaluator
+to assess the quality of retrieved documents, and to refine them before the response generation.
+Self-RAG instruction-tunes an LM to generate special self-refection tags. These tags guides the LM
+to dynamically retrieve documents when necessary, critique the retrieved documents relevance before
+generating responses. Self-CRAG is to apply the Self-RAG approach on the refined documents of
+CRAG. We adopt the same backbone LLMs across all methods as our proposed SPECULATIVE RAG
+for fair comparisons.
+4.2
+Experiment Settings
+In our experiments, we utilize Mistral7B (v0.1) as our base LM for the RAG drafter. For RAG
+verifier, we employ either Mistral7B (v0.1) or Mixtral8x7B (v0.1) without any fine-tuning, denoted as
+MVerifier-7B or MVerifier-8x7B. We pre-compute embeddings of retrieved documents using a lightweight
+instruction-aware embedding model InBedderRoberta (Peng et al., 2024) as part of the retrieval process.
+Inference is conducted using the vLLM framework (Kwon et al., 2023) with greedy decoding
+(temperature = 0). We adopt the same experiment settings from Asai et al. (2023) and include a more
+challenging benchmark, MuSiQue (Trivedi et al., 2022). Our focus is on RAG reasoning rather than
+evidence citation, so we omit the other two long-form generation benchmarks, Biography (Min et al.,
+2023) and ALCE-ASQA (Gao et al., 2023a). On TriviaQA, PubHealth, and ARC-Challenge, we
+retrieve top 10 documents and generate 5 drafts per query (m = 5), with each draft based on a subset
+of 2 documents (k = 2). For the MuSiQue dataset, we retrieve top 15 documents and generate 10
+6
+
+Table 1: Retrieval augmentation generation results on TriviaQA, MuSiQue, PubHealth, and ARC-
+Challenge (ARC-C). (∗We use the RAG drafter’s generation probability ρDraft as the confidence score
+for selecting drafts when we use it alone; † indicates numbers reported in Asai et al. (2023); −
+denotes numbers that are not reported by the original papers or are not applicable; ‡we use Mistral7B
+or Mixtral8x7B as the RAG verifier, and denote them as MVerifier-7B or MVerifier-8x7B.)
+RAG Method
+Free-form
+Closed-set
+TriviaQA
+MuSiQue
+PubHealth
+ARC-C
+Standard RAG
+Mistral7B (Jiang et al., 2023a)
+54.15
+16.71
+34.85
+42.75
+Mixtral8x7B (Jiang et al., 2024)
+59.85
+19.16
+37.08
+48.72
+Mistral-Instruct7B (Jiang et al., 2023a)
+67.11
+17.99
+42.15
+47.70
+Mixtral-Instruct8x7B (Jiang et al., 2024)
+73.91
+29.42
+63.63
+78.41
+Alpaca7B (Dubois et al., 2024)†
+64.1
+-
+40.2
+48.1
+Toolformer6B (Schick et al., 2024)†
+48.8
+-
+-
+-
+SAIL7B (Luo et al., 2023a)†
+-
+-
+69.2
+48.4
+Self-Reflective RAG & Corrective RAG
+CRAGMistral-7B (Yan et al., 2024)
+-
+-
+59.04
+74.87
+Self-RAGMistral-7B (Asai et al., 2023)
+64.84
+21.72
+72.44
+74.91
+Self-CRAGMistral-7B (Yan et al., 2024)
+-
+-
+72.85
+75.26
+Our Speculative RAG
+MDrafter-7B
+∗
+71.11
+27.89
+75.58
+74.49
+MVerifier-7B
+‡ + MDrafter-7B
+73.91
+31.03
+75.79
+76.19
+MVerifier-8x7B
+‡ + MDrafter-7B
+74.24
+31.57
+76.60
+80.55
+drafts for each query (m = 10), each using a subset of 6 documents due to more complex reasoning.
+Further details regarding instruction-tuning can be found in Appendix E.
+4.3
+Main Results
+We compare SPECULATIVE RAG with standard RAG approaches, as well as the more advanced
+Self-Reflective RAG and Corrective RAG on four datasets: TriviaQA, MuSiQue, PubHealth, and
+ARC-Challenge. We report the performance of MDrafter-7B when used alone or paired with the RAG
+verifier (e.g. MVerifier-7B, MVerifier-8x7B). Following prior work (Asai et al., 2023; Yan et al., 2024),
+we report accuracy as the performance metric.
+Superior Performance over Baselines Table 1 demonstrates that SPECULATIVE RAG consis-
+tently outperforms all baselines across all four benchmarks. Particularly, MVerifier-8x7B + MDrafter-7B
+surpasses the most competitive standard RAG model, Mixtral-Instruct8x7B, by 0.33% on TriviaQA,
+2.15% on MuSiQue, 12.97% on PubHealth, and 2.14% on ARC-Challenge. With a comparable
+number of instruction-tuned parameters, MVerifier-7B + MDrafter-7B outperforms all Self-Reflective and
+Corrective RAG methods, and MDrafter alone can surpass these baselines in most settings.
+Effective Instruction Tuning for RAG Drafter Our instruction tuning is effective in enhancing
+the reasoning ability of the drafter model (Hsieh et al., 2023), as we observe a remarkable perfor-
+mance improvement comparing Mistral7B and MDrafter-7B. Moreover, the performance of Mixtral8x7B
+significantly improves when paired with the instruction-tuned RAG drafter MDrafter-7B, showing
+gains of 14.39% on TriviaQA, 12.41% on MuSiQue, 39.52% on PubHealth, and 31.83% on ARC-
+Challenge. Similar improvements are observed with Mistral7B as well. For Mistral7B, we observed
+improvements of 19.76% on TriviaQA, 14.32% on MuSiQue, 40.94% on PubHealth, and 33.44%
+on ARC-Challenge. We attribute these improvements to the superior reasoning capabilities of the
+RAG drafter over the retrieved documents in SPECULATIVE RAG. By minimizing the redundancy
+in the sampled documents, the RAG drafter generates higher quality answer drafts based on diverse
+perspectives from the retrieval results.
+Reliable Scoring by RAG Verifier The reliable draft verification by the generalist LM also con-
+tributes to the enhanced performance. The performance improves remarkably comparing MDrafter-7B
+and MVerifier-7B + MDrafter-7B. The instruction-tuned RAG drafter is specialized in generating answer
+drafts based on the retrieved documents while the language modeling capabilities of generic LMs are
+leveraged to validate each draft in light of its rationale. This method is both effective and easy to
+implement, showcasing the effectiveness of this verification approach.
+7
+
+TriviaQA
+MuSiQue
+PubHealth
+ARC-Challenge
+Dataset
+0.5
+1.0
+1.5
+2.0
+2.5
+3.0
+Latency (s)
++31%
++21%
++105%
++36%
+2.52
+2.72
+2.40
+2.02
++34%
++30%
++129%
++31%
+2.59
+2.93
+2.68
+1.94
++50%
++33%
++134%
++48%
+2.90
+2.99
+2.74
+2.19
+1.93
+2.25
+1.17
+1.48
+Standard RAG: Mixtral-Instruct-8x7B (TP=4)
+(TP=8)
+(TP=16)
+Speculative RAG: Mixtral-8x7B w/ RAG Drafter (7B)
+Figure 2: Latency analysis of Standard RAG: Mixtral-Instruct8x7B with tensor parallelism and
+SPECULATIVE RAG: MVerifier-8x7B + MDrafter-7B on TriviaQA, MuSiQue, PubHealth, and ARC-
+Challenge. The latency difference between Standard RAG and SPECULATIVE RAG is highlighted in
+red (+x%). TP indicates the tensor parallelism size when running Mixtral-Instruct8x7B for Standard
+RAG. The latency varies across different datasets due to different retrieved document lengths.
+SPECULATIVE RAG encodes the retrieved documents in parallel and generates answer drafts with a
+smaller RAG drafter. This significantly improves the efficiency over Standard RAG.
+4.4
+Latency Analysis
+We analyze the latency of Standard RAG and our SPECULATIVE RAG on TriviaQA, MuSiQue,
+PubHealth, and ARC-Challenge. We randomly sample 100 cases from each dataset and report
+the average time cost for each case, as shown in Figure 2. To simulate real-world application
+scenarios, we process cases individually without batching. As representative example, we run
+MVerifier-8x7B + MDrafter-7B for SPECULATIVE RAG and Mixtral-Instruct8x7B for Standard RAG, as
+these demonstrate the highest performance among competitive baselines (see Table 1). We launch 5
+endpoints of MDrafter-7B for parallel drafting on TriviaQA, PubHealth, and ARC-Challenge. We launch
+10 endpoints for MuSiQue due to more drafts. We use tensor parallelism to fit Mixtral-Instruct8x7B
+into the GPU memory. We report the latency of Mixtral-Instruct8x7B under tensor parallelism sizes
+of 4, 8, 16. Increasing tensor parallelism does not improve efficiency due to overheads in tensor
+aggregation and communication. In contrast, SPECULATIVE RAG, with its smaller RAG drafter and
+parallel draft generation, consistently achieves the lowest latency across all datasets. Particularly, it
+reduces latency by up to 23.41% on TriviaQA, 17.28% on MuSiQue, 51.25% on PubHealth, and
+26.73% on ARC-Challenge. This highlights the advantage of our approach in reducing processing
+time while maintaining high performance.
+4.5
+Ablation Studies
+We conduct ablation studies on the key components of SPECULATIVE RAG during both drafting and
+verification stages on TriviaQA and PubHealth in Table 2. We use MVerifier-8x7B + MDrafter-7B as a
+running configuration. Same as the main results, we report the accuracy as performance metrics.
+Diversity and reduced redundancy in retrieval improves draft quality significantly.
+In the
+first set of experiments, we evaluate the impact of multi-perspective sampling during the drafting.
+Recall that SPECULATIVE RAG clusters retrieved documents into distinct perspectives and sample
+one document from each cluster to reduce redundancy for the draft generation. We compare this
+against two alternative sampling strategies: (1) Random sampling without clustering, where we
+randomly select a document subset as context, and (2) Sampling from the same cluster, where we
+select all documents from a single cluster. Our results indicate that our proposed sampling method
+yields the best performance thanks to its ability to leverage diverse context. Particularly, it improves
+the accuracy up to 1.88% on TriviaQA and 2.23% on PubHealth. While random sampling without
+clustering introduces diversity, it is prone to including redundant documents, degrading draft quality.
+Sampling from the same cluster significantly underperforms due to a lack of diverse perspectives.
+Scoring method on self-consistency and self-reflection refines draft quality effectively. In the
+second set of experiments, we examine the scoring method during verification. We remove each of
+the specific confidence scores, ρDraft, ρSelf-contain, or ρSelf-reflect in turn. Performance drops are observed
+when any score is removed. Particularly, removing ρDraft leads to a minimal decline, 0.19% on
+TriviaQA and 1.12% on PubHealth, likely due to the limited verification capability of the smaller
+RAG drafter. Removing either ρSelf-contain or ρSelf-reflect results in similar performance decreases,
+around 2.0% on TriviaQA and around 0.8% on PubHealth, indicating that both self-containment and
+self-reflection capture different key aspects of reasoning and are crucial during verification. Random
+8
+
+selection without verification leads to substantial underperformance, resulting in a performance
+decline of 5.69% on TriviaQA and 5.37% on PubHealth.
+Table 2: Ablation study of SPECULATIVE RAG in the drafting and verification stages on TriviaQA
+and PubHealth.
+TriviaQA
+PubHealth
+MVerifier-8x7B + MDrafter-7B
+74.24
+76.60
+Drafting Stage
+Random sampling w/o clustering
+73.02 (-1.22)
+75.38 (-1.22)
+Sampling from the same cluster
+72.36 (-1.88)
+74.37 (-2.23)
+Verification Stage
+w/o ρDraft (ρ = ρSelf-contain · ρSelf-reflect)
+74.05 (-0.19)
+75.48 (-1.12)
+w/o ρSelf-contain (ρ = ρDraft · ρSelf-reflect)
+72.04 (-2.20)
+75.89 (-0.71)
+w/o ρSelf-reflect (ρ = ρDraft · ρSelf-contain)
+72.36 (-1.88)
+75.68 (-0.92)
+Random selection w/o verification
+68.55 (-5.69)
+71.23 (-5.37)
+5
+10
+15
+20
+TriviaQA: # Drafts
+73.5
+74.0
+74.5
+75.0
+Accuracy (%)
+73.91 73.96
+74.37
+74.72
+5
+10
+15
+20
+PubHealth: # Drafts
+75.5
+76.0
+76.5
+77.0
+77.5
+78.0
+75.79
+76.39
+77.0
+77.51
+(a) We include 5, 10, 15, 20 drafts and sample 2 sup-
+porting documents for each draft.
+1
+2
+3
+4
+5
+6
+TriviaQA: Doc subset size
+71
+72
+73
+74
+75
+76
+Accuracy (%)
+71.11
+73.96
+75.48
+75.76
+1
+2
+3
+4
+5
+6
+PubHealth: Doc subset size
+69.5
+71.5
+73.5
+75.5
+77.5
+74.57
+76.39
+73.25
+70.11
+(b) We sample 1, 2, 4, 6 supporting documents for
+each draft and we generate 10 answer drafts.
+Figure 3: Performance analysis of SPECULATIVE RAG with (a) different numbers of drafts, and (b)
+different supporting document subset size on TriviaQA and PubHealth.
+4.6
+Effects of Generated Rationale for Verification
+In SPECULATIVE RAG, we utilize the generated rationale β from the RAG drafter as an indicator
+of the trustworthiness of answer drafts α. The rationales highlight relevant points, omit redundant
+information, and bridge logical gaps between drafts and their supporting documents. To evaluate the
+effectiveness of the rationales, we create two alternative scoring methods: (a) replacing rationale
+with retrieved documents (ρ = Score(α|Q, δ)), or (b) adding retrieved documents to rationale (ρ =
+Score(α|Q, β, δ)). We compare these alternatives to the scoring method used in SPECULATIVE
+RAG (ρ = Score(α|Q, β)) in Table 3. The results show that incorporating longer retrieved
+documents does not consistently improve performance and tends to increase latency. This suggest
+that the generated rationale is already of high quality and serves as an effective bridge between
+the supporting documents and the generated answer drafts. By leveraging this rationale, we can
+efficiently verify drafts using a generic LM, leading to accurate final results.
+4.7
+Effects of Draft Number and Document Subset Size
+We investigate the performance of SPECULATIVE RAG under varying numbers of drafts. Using
+MVerifier-7B + MDrafter-7B with 5, 10, 15, 20 drafts on TriviaQA and PubHealth. We sample two
+documents as context per draft. The results are illustrated in Figure 3(a). Since we retrieve top
+10 documents in total, we sample up to 20 drafts in these experiments. The results indicate that
+incorporating more drafts can further improve performance, likely thanks to higher coverage of
+diverse perspective of documents. Importantly, in SPECULATIVE RAG, we can launch multiple RAG
+drafter instances to generate drafts in parallel without additional latency.
+We also examine the effect of document subset size. By varying the number of documents (1,
+2, 4, or 6) sampled for draft generation on TriviaQA and PubHealth (Figure 3(b)), we find that
+including more documents in the context does not always lead to consistent performance improvement.
+While TriviaQA queries may benefit from more supporting documents due to their complexity,
+MVerifier-7B + MDrafter-7B can surpass Mistral-Instruct7B even with a single supporting document per
+draft. Furthermore, with two or more documents per draft, MVerifier-7B + MDrafter-7B can even surpass
+Mixtral-Instruct8x7B. This further demonstrates the effectiveness of our drafting design.
+9
+
+Table 3: Performance and latency analysis of SPECULATIVE RAG on TriviaQA and PubHealth using
+MVerifier-8x7B + MDrafter-7B. We add the original document subset δ to the context or replace the gener-
+ated rationale β with the original retrieved document subset δ during verification, i.e. we compute the
+self-containment score as ρSelf-contain = P(α, δ|Q) or ρSelf-contain = P(α, δ, β|Q), and compute the
+self-reflection score as ρSelf-reflect = P("Yes"|Q, α, δ, R) or ρSelf-reflect = P("Yes"|Q, α, δ, β, R),
+where Q is the query; α is the answer draft; R is the self-reflection statement.
+TriviaQA
+PubHealth
+Accuracy (%)
+Latency (s)
+Accuracy (%)
+Latency (s)
+MVerifier-8x7B + MDrafter-7B
+ρ = Score(α|Q, β)
+74.24
+1.93
+76.60
+1.17
+ρ = Score(α|Q, δ)
+74.08 (-0.16)
+2.13 (+10.36%)
+76.09 (-0.51)
+1.31 (+11.97%)
+ρ = Score(α|Q, β, δ)
+74.32 (+0.08)
+2.17 (+12.44%)
+76.29 (-0.31)
+1.33 (+13.68%)
+5
+Conclusion
+Our proposed SPECULATIVE RAG decomposes RAG tasks into two separate steps of drafting
+followed by verification. SPECULATIVE RAG delegates the heavy lifting of drafting to a small
+specialized RAG drafter, while verification is done using a large generalist LM. The parallel generation
+of multiple drafts from diverse document subsets provides high quality answer candidates while
+reducing input token counts and the potential risk of position-bias-over-long-context, resulting in
+substantial improvements in both the quality and speed of the final output generation. We demonstrate
+the effectiveness of SPECULATIVE RAG with accuracy gains up to 12.97% while reducing latency by
+51% compared to conventional RAG systems. SPECULATIVE RAG sheds new light on the potential
+of collaborative architectures for enhancing RAG performance through task decomposition.
+Limitations
+In this paper, we demonstrate that a smaller, specialized RAG drafter can effectively augment a
+larger, general-purpose LM for knowledge-intensive tasks. While SPECULATIVE RAG enhances
+both accuracy and efficiency, it does require training an additional drafter model. Although this
+step is computationally inexpensive, it adds a layer of complexity compared to using a vanilla
+instruction-tuned RAG model.
+References
+Achiam, J., Adler, S., Agarwal, S., Ahmad, L., Akkaya, I., Aleman, F. L., Almeida, D., Altenschmidt, J., Altman,
+S., Anadkat, S., et al. Gpt-4 technical report. arXiv preprint arXiv:2303.08774, 2023. 1
+Asai, A., Wu, Z., Wang, Y., Sil, A., and Hajishirzi, H. Self-rag: Learning to retrieve, generate, and critique
+through self-reflection. arXiv preprint arXiv:2310.11511, 2023. 2, 3, 6, 7, 17
+Baek, J., Jeong, S., Kang, M., Park, J. C., and Hwang, S. Knowledge-augmented language model verification. In
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pp. 1720–1736,
+2023. 2, 3
+Brown, T., Mann, B., Ryder, N., Subbiah, M., Kaplan, J. D., Dhariwal, P., Neelakantan, A., Shyam, P., Sastry,
+G., Askell, A., et al. Language models are few-shot learners. Advances in neural information processing
+systems, 33:1877–1901, 2020. 1
+Cai, T., Li, Y., Geng, Z., Peng, H., Lee, J. D., Chen, D., and Dao, T. Medusa: Simple llm inference acceleration
+framework with multiple decoding heads. arXiv preprint arXiv:2401.10774, 2024. 3
+Chen, C., Borgeaud, S., Irving, G., Lespiau, J.-B., Sifre, L., and Jumper, J. Accelerating large language model
+decoding with speculative sampling. arXiv preprint arXiv:2302.01318, 2023a. 2, 3
+Chen, T., Wang, H., Chen, S., Yu, W., Ma, K., Zhao, X., Zhang, H., and Yu, D. Dense x retrieval: What retrieval
+granularity should we use? arXiv preprint arXiv:2312.06648, 2023b. 3
+Chen, W., Liu, Y., Wang, W., Bakker, E. M., Georgiou, T., Fieguth, P., Liu, L., and Lew, M. S. Deep learning for
+instance retrieval: A survey. IEEE Transactions on Pattern Analysis and Machine Intelligence, 2022. 1
+Clark, P., Cowhey, I., Etzioni, O., Khot, T., Sabharwal, A., Schoenick, C., and Tafjord, O. Think you have solved
+question answering? try arc, the ai2 reasoning challenge. arXiv preprint arXiv:1803.05457, 2018. 6
+10
+
+Ding, J., Ma, S., Dong, L., Zhang, X., Huang, S., Wang, W., Zheng, N., and Wei, F. Longnet: Scaling
+transformers to 1,000,000,000 tokens. arXiv preprint arXiv:2307.02486, 2023. 2
+Dubois, Y., Li, C. X., Taori, R., Zhang, T., Gulrajani, I., Ba, J., Guestrin, C., Liang, P. S., and Hashimoto, T. B.
+Alpacafarm: A simulation framework for methods that learn from human feedback. Advances in Neural
+Information Processing Systems, 36, 2024. 6, 7
+Feng, S., Shi, W., Bai, Y., Balachandran, V., He, T., and Tsvetkov, Y. Knowledge card: Filling llms’ knowledge
+gaps with plug-in specialized language models. In The Twelfth International Conference on Learning
+Representations, 2023. 2
+Gao, T., Yen, H., Yu, J., and Chen, D. Enabling large language models to generate text with citations. In
+Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pp. 6465–6488,
+2023a. 6
+Gao, Y., Xiong, Y., Gao, X., Jia, K., Pan, J., Bi, Y., Dai, Y., Sun, J., and Wang, H. Retrieval-augmented generation
+for large language models: A survey. arXiv preprint arXiv:2312.10997, 2023b. 1, 3
+Guu, K., Lee, K., Tung, Z., Pasupat, P., and Chang, M. Retrieval augmented language model pre-training. In
+International conference on machine learning, pp. 3929–3938. PMLR, 2020. 6
+Hsieh, C.-Y., Li, C.-L., Yeh, C.-K., Nakhost, H., Fujii, Y., Ratner, A., Krishna, R., Lee, C.-Y., and Pfister, T.
+Distilling step-by-step! outperforming larger language models with less training data and smaller model sizes.
+In ACL, 2023. 4, 7
+Huang, L., Yu, W., Ma, W., Zhong, W., Feng, Z., Wang, H., Chen, Q., Peng, W., Feng, X., Qin, B., et al. A
+survey on hallucination in large language models: Principles, taxonomy, challenges, and open questions.
+arXiv preprint arXiv:2311.05232, 2023. 1
+Izacard, G. and Grave, E. Leveraging passage retrieval with generative models for open domain question
+answering.
+In Merlo, P., Tiedemann, J., and Tsarfaty, R. (eds.), Proceedings of the 16th Conference
+of the European Chapter of the Association for Computational Linguistics: Main Volume, pp. 874–880,
+Online, April 2021. Association for Computational Linguistics. doi: 10.18653/v1/2021.eacl-main.74. URL
+https://aclanthology.org/2021.eacl-main.74. 3
+Izacard, G., Caron, M., Hosseini, L., Riedel, S., Bojanowski, P., Joulin, A., and Grave, E. Unsupervised dense
+information retrieval with contrastive learning. arXiv preprint arXiv:2112.09118, 2021. 17
+Jiang, A. Q., Sablayrolles, A., Mensch, A., Bamford, C., Chaplot, D. S., Casas, D. d. l., Bressand, F., Lengyel,
+G., Lample, G., Saulnier, L., et al. Mistral 7b. arXiv preprint arXiv:2310.06825, 2023a. 6, 7
+Jiang, A. Q., Sablayrolles, A., Roux, A., Mensch, A., Savary, B., Bamford, C., Chaplot, D. S., Casas, D. d. l.,
+Hanna, E. B., Bressand, F., et al. Mixtral of experts. arXiv preprint arXiv:2401.04088, 2024. 6, 7
+Jiang, Z., Xu, F., Gao, L., Sun, Z., Liu, Q., Dwivedi-Yu, J., Yang, Y., Callan, J., and Neubig, G. Active
+retrieval augmented generation. In Bouamor, H., Pino, J., and Bali, K. (eds.), Proceedings of the 2023
+Conference on Empirical Methods in Natural Language Processing, pp. 7969–7992, Singapore, December
+2023b. Association for Computational Linguistics. doi: 10.18653/v1/2023.emnlp-main.495. URL https:
+//aclanthology.org/2023.emnlp-main.495. 3
+Jin, X. and Han, J. K-means clustering. Encyclopedia of machine learning, pp. 563–564, 2011. 5
+Joshi, M., Choi, E., Weld, D. S., and Zettlemoyer, L. Triviaqa: A large scale distantly supervised challenge
+dataset for reading comprehension. In Proceedings of the 55th Annual Meeting of the Association for
+Computational Linguistics (Volume 1: Long Papers), pp. 1601–1611, 2017. 6
+Kamalloo, E., Dziri, N., Clarke, C., and Rafiei, D. Evaluating open-domain question answering in the era of
+large language models. In Proceedings of the 61st Annual Meeting of the Association for Computational
+Linguistics (Volume 1: Long Papers), pp. 5591–5606, 2023. 1
+Khandelwal, U., Levy, O., Jurafsky, D., Zettlemoyer, L., and Lewis, M. Generalization through Memorization:
+Nearest Neighbor Language Models. In International Conference on Learning Representations (ICLR), 2020.
+3
+Kim, J., Nam, J., Mo, S., Park, J., Lee, S.-W., Seo, M., Ha, J.-W., and Shin, J. Sure: Summarizing retrievals
+using answer candidates for open-domain qa of llms. arXiv preprint arXiv:2404.13081, 2024. 3
+Kojima, T., Gu, S. S., Reid, M., Matsuo, Y., and Iwasawa, Y. Large language models are zero-shot reasoners. In
+Advances in Neural Information Processing Systems, 2022. 1
+11
+
+Kwon, W., Li, Z., Zhuang, S., Sheng, Y., Zheng, L., Yu, C. H., Gonzalez, J. E., Zhang, H., and Stoica, I. Efficient
+memory management for large language model serving with pagedattention. In Proceedings of the ACM
+SIGOPS 29th Symposium on Operating Systems Principles, 2023. 6
+Leviathan, Y., Kalman, M., and Matias, Y. Fast inference from transformers via speculative decoding. In
+International Conference on Machine Learning, pp. 19274–19286. PMLR, 2023. 2, 3
+Lewis, P., Perez, E., Piktus, A., Petroni, F., Karpukhin, V., Goyal, N., Küttler, H., Lewis, M., Yih, W.-t.,
+Rocktäschel, T., et al. Retrieval-augmented generation for knowledge-intensive nlp tasks. Advances in Neural
+Information Processing Systems, 33:9459–9474, 2020. 3
+Li, T., Zhang, G., Do, Q. D., Yue, X., and Chen, W. Long-context llms struggle with long in-context learning.
+arXiv preprint arXiv:2404.02060, 2024. 2
+Liu, N. F., Lin, K., Hewitt, J., Paranjape, A., Bevilacqua, M., Petroni, F., and Liang, P. Lost in the middle: How
+language models use long contexts. Transactions of the Association for Computational Linguistics, 12, 2024.
+2, 3
+Luo, H., Chuang, Y.-S., Gong, Y., Zhang, T., Kim, Y., Wu, X., Fox, D., Meng, H., and Glass, J. Sail:
+Search-augmented instruction learning. arXiv preprint arXiv:2305.15225, 2023a. 3, 6, 7
+Luo, Y., Yang, Z., Meng, F., Li, Y., Zhou, J., and Zhang, Y. An empirical study of catastrophic forgetting in large
+language models during continual fine-tuning. arXiv preprint arXiv:2308.08747, 2023b. 3
+Ma, X., Gong, Y., He, P., Zhao, H., and Duan, N. Query rewriting in retrieval-augmented large language
+models. In Proceedings of the 2023 Conference on Empirical Methods in Natural Language Processing, pp.
+5303–5315, 2023. 2, 3
+Ma, X., Yang, X., Xiong, W., Chen, B., Yu, L., Zhang, H., May, J., Zettlemoyer, L., Levy, O., and Zhou,
+C. Megalodon: Efficient llm pretraining and inference with unlimited context length. arXiv preprint
+arXiv:2404.08801, 2024. 2
+Miao, X., Oliaro, G., Zhang, Z., Cheng, X., Wang, Z., Zhang, Z., Wong, R. Y. Y., Zhu, A., Yang, L., Shi,
+X., et al. Specinfer: Accelerating large language model serving with tree-based speculative inference
+and verification. In Proceedings of the 29th ACM International Conference on Architectural Support for
+Programming Languages and Operating Systems, Volume 3, pp. 932–949, 2024. 3
+Mihaylov, T., Clark, P., Khot, T., and Sabharwal, A. Can a suit of armor conduct electricity? a new dataset for
+open book question answering. In Proceedings of the 2018 Conference on Empirical Methods in Natural
+Language Processing, pp. 2381–2391, 2018. 17
+Min, S., Krishna, K., Lyu, X., Lewis, M., Yih, W.-t., Koh, P., Iyyer, M., Zettlemoyer, L., and Hajishirzi, H.
+Factscore: Fine-grained atomic evaluation of factual precision in long form text generation. In Proceedings of
+the 2023 Conference on Empirical Methods in Natural Language Processing, pp. 12076–12100, 2023. 6
+Peng, L., Zhang, Y., Wang, Z., Srinivasa, J., Liu, G., Wang, Z., and Shang, J. Answer is all you need:
+Instruction-following text embedding via answering the question. arXiv preprint arXiv:2402.09642, 2024. 5,
+6
+Petroni, F., Piktus, A., Fan, A., Lewis, P., Yazdani, M., De Cao, N., Thorne, J., Jernite, Y., Karpukhin, V.,
+Maillard, J., et al. Kilt: a benchmark for knowledge intensive language tasks. In Proceedings of the
+2021 Conference of the North American Chapter of the Association for Computational Linguistics: Human
+Language Technologies, pp. 2523–2544, 2021. 1, 17
+Rasley, J., Rajbhandari, S., Ruwase, O., and He, Y. Deepspeed: System optimizations enable training deep
+learning models with over 100 billion parameters. In Proceedings of the 26th ACM SIGKDD International
+Conference on Knowledge Discovery & Data Mining, pp. 3505–3506, 2020. 17
+Reid, M., Savinov, N., Teplyashin, D., Lepikhin, D., Lillicrap, T., Alayrac, J.-b., Soricut, R., Lazaridou, A., Firat,
+O., Schrittwieser, J., et al. Gemini 1.5: Unlocking multimodal understanding across millions of tokens of
+context. arXiv preprint arXiv:2403.05530, 2024. 2
+Sarthi, P., Abdullah, S., Tuli, A., Khanna, S., Goldie, A., and Manning, C. D. Raptor: Recursive abstractive
+processing for tree-organized retrieval. arXiv preprint arXiv:2401.18059, 2024. 3
+Schick, T., Dwivedi-Yu, J., Dessì, R., Raileanu, R., Lomeli, M., Hambro, E., Zettlemoyer, L., Cancedda, N., and
+Scialom, T. Toolformer: Language models can teach themselves to use tools. Advances in Neural Information
+Processing Systems, 36, 2024. 3, 6, 7
+12
+
+Stelmakh, I., Luan, Y., Dhingra, B., and Chang, M.-W. Asqa: Factoid questions meet long-form answers. In
+Proceedings of the 2022 Conference on Empirical Methods in Natural Language Processing, pp. 8273–8288,
+2022. 17
+Stern, M., Shazeer, N., and Uszkoreit, J. Blockwise parallel decoding for deep autoregressive models. Advances
+in Neural Information Processing Systems, 31, 2018. 3
+Team, G., Anil, R., Borgeaud, S., Wu, Y., Alayrac, J.-B., Yu, J., Soricut, R., Schalkwyk, J., Dai, A. M., Hauth,
+A., et al. Gemini: a family of highly capable multimodal models. arXiv preprint arXiv:2312.11805, 2023. 1,
+17
+Trivedi, H., Balasubramanian, N., Khot, T., and Sabharwal, A. Musique: Multihop questions via single-hop
+question composition. Transactions of the Association for Computational Linguistics, 10:539–554, 2022. 6
+Wang, Y., Ivison, H., Dasigi, P., Hessel, J., Khot, T., Chandu, K. R., Wadden, D., MacMillan, K., Smith, N. A.,
+Beltagy, I., et al. How far can camels go. Exploring the state of instruction tuning on open resources, 2023a.
+17
+Wang, Z., Araki, J., Jiang, Z., Parvez, M. R., and Neubig, G. Learning to filter context for retrieval-augmented
+generation. arXiv preprint arXiv:2311.08377, 2023b. 3
+Wolf, T., Debut, L., Sanh, V., Chaumond, J., Delangue, C., Moi, A., Cistac, P., Rault, T., Louf, R., Funtow-
+icz, M., et al. Huggingface’s transformers: State-of-the-art natural language processing. arXiv preprint
+arXiv:1910.03771, 2019. 17
+Xia, H., Ge, T., Wang, P., Chen, S.-Q., Wei, F., and Sui, Z. Speculative decoding: Exploiting speculative
+execution for accelerating seq2seq generation. In Findings of the Association for Computational Linguistics:
+EMNLP 2023, pp. 3909–3925, 2023. 3
+Xia, H., Yang, Z., Dong, Q., Wang, P., Li, Y., Ge, T., Liu, T., Li, W., and Sui, Z. Unlocking efficiency in large
+language model inference: A comprehensive survey of speculative decoding. arXiv preprint arXiv:2401.07851,
+2024. 2, 3
+Xie, J., Zhang, K., Chen, J., Lou, R., and Su, Y. Adaptive chameleon or stubborn sloth: Revealing the behavior
+of large language models in knowledge conflicts. In The Twelfth International Conference on Learning
+Representations, 2023. 2
+Xu, F., Shi, W., and Choi, E. Recomp: Improving retrieval-augmented lms with compression and selective
+augmentation. arXiv preprint arXiv:2310.04408, 2023. 3
+Xu, Z., Jain, S., and Kankanhalli, M. Hallucination is inevitable: An innate limitation of large language models.
+arXiv preprint arXiv:2401.11817, 2024. 1
+Yan, S.-Q., Gu, J.-C., Zhu, Y., and Ling, Z.-H. Corrective retrieval augmented generation. arXiv preprint
+arXiv:2401.15884, 2024. 2, 3, 6, 7, 17
+Yoran, O., Wolfson, T., Ram, O., and Berant, J. Making retrieval-augmented language models robust to irrelevant
+context. arXiv preprint arXiv:2310.01558, 2023. 3
+Yu, W., Zhang, H., Pan, X., Ma, K., Wang, H., and Yu, D. Chain-of-note: Enhancing robustness in retrieval-
+augmented language models. arXiv preprint arXiv:2311.09210, 2023. 3
+Zhang, J., Wang, J., Li, H., Shou, L., Chen, K., Chen, G., and Mehrotra, S. Draft & verify: Lossless large
+language model acceleration via self-speculative decoding. arXiv preprint arXiv:2309.08168, 2023a. 3
+Zhang, T., Luo, H., Chuang, Y.-S., Fang, W., Gaitskell, L., Hartvigsen, T., Wu, X., Fox, D., Meng, H., and Glass,
+J. Interpretable unified language checking. arXiv preprint arXiv:2304.03728, 2023b. 6
+13
+
+Appendix
+A
+Prompt of Rationale Generation
+========================================= Prompt =========================================
+# Memorize this piece of evidence in mind and use it as if you already know it.
+# Evidence: State religion
+Despite enjoying considerable popular support, Christianity was still not the official
+state religion in Rome, although it was in some neighboring states such as Armenia, Iberia,
+and Aksum. Roman Religion (Neoplatonic Hellenism) was restored for a time by the Emperor
+Julian from 361 to 363. Julian does not appear to have reinstated the persecutions of the
+earlier Roman emperors. Catholic Christianity, as opposed to Arianism and other ideologies
+deemed heretical, was declared to be the state religion of the Roman Empire on 27 February
+380 by the decree "De fide catolica".
+# Instruction: When did christianity become official religion of Rome?
+# Response: 380 AD
+# Rationale: (complete the following sentence with details from the evidence; you can only
+use the information from the evidence)
+======================================= Completion =======================================
+Catholic Christianity was declared the official state religion of the Roman Empire on
+February 27th, 380, through the decree "De fide catolica".
+Figure 4: Prompt of Rationale Generation for Gemini-Ultra
+B
+Prompt of RAG Drafting
+========================================= Prompt =========================================
+Response to the instruction. Also provide rationale for your response.
+## Instruction: In Buddhism, what is the state of blissful repose or absolute existence by
+someone relieved of the necessity of rebirth?
+## Evidence:
+[1] Buddhism
+Nirvana literally means "blowing out, quenching, becoming extinguished". In early Buddhist
+texts, it is the state of restraint and self-control that leads to the "blowing out" and
+the ending of the cycles of sufferings associated with rebirths and redeaths. Many later
+Buddhist texts describe nirvana as identical with "anatta" with complete "emptiness,
+nothingness". In some texts, the state is described with greater detail, such as passing
+through the gate of emptiness ("sunyata") realizing that there"
+[2] Salvation
+It includes a variety of disciplines, such as yoga and meditation. Nirvana is the profound
+peace of mind that is acquired with moksha (liberation). In Buddhism and Jainism, it is the
+state of being free from suffering. In Hindu philosophy, it is union with the Brahman (
+Supreme Being). The word literally means "blown out" (as in a candle) and refers, in the
+Buddhist context, to the blowing out of the fires of desire, aversion, and delusion, and
+the imperturbable stillness of mind acquired thereafter. In Theravada Buddhism the emphasis
+is on one’s
+======================================= Completion =======================================
+## Rationale: Nirvana literally means ’blowing out, quenching, becoming extinguished’. It
+is described as a state of "restraint and self-control" that leads to the "blowing out" and
+the ending of the cycles of sufferings associated with rebirths and redeaths.
+## Response: In Buddhism, the state of blissful repose or absolute existence by someone
+relieved of the necessity of rebirth is called Nirvana.
+Figure 5: Prompt of RAG Drafting
+14
+
+C
+Prompt of Standard RAG
+========================================= Prompt =========================================
+Below is an instruction that describes a task. Write a response that appropriately
+completes the request.
+### Evidence:
+[1] Britain (place name)
+Britain, after which "Britain" became the more commonplace name for the island called Great
+Britain. After the Anglo-Saxon period, "Britain" was used as a historical term only.
+Geoffrey of Monmouth in his pseudohistorical "Historia Regum Britanniae" ...
+[2] Great Britain
+The peoples of these islands of "Prettanike" were called the "Priteni" or "Pretani". "
+Priteni" is the source of the Welsh language term Prydain, "Britain", which has the same
+source as the Goidelic term Cruithne used to refer to the early Brythonic-speaking
+inhabitants of Ireland. The latter were later called Picts or Caledonians ...
+...
+[10] Albion
+Albion is an alternative name for Great Britain. The oldest attestation of the toponym
+comes from the Greek language. It is sometimes used poetically and generally to refer to
+the island, but is less common than ’Britain’ today. The name for Scotland in most of the
+Celtic languages is related to Albion: "Alba" in Scottish Gaelic, "Albain" ...
+### Instruction: What was Britain called - before it was Britain?
+### Response:
+Figure 6: Prompt of Standard RAG for Non-instruction-tuned LM
+========================================= Prompt =========================================
+[INST] Below is an instruction that describes a task. Write a response for it and state
+your explanation supporting your response.
+### Instruction: What was Britain called - before it was Britain?
+### Evidence:
+[1] Britain (place name)
+Britain, after which "Britain" became the more commonplace name for the island called Great
+Britain. After the Anglo-Saxon period, "Britain" was used as a historical term only.
+Geoffrey of Monmouth in his pseudohistorical "Historia Regum Britanniae" ...
+[2] Great Britain
+The peoples of these islands of "Prettanike" were called the "Priteni" or "Pretani". "
+Priteni" is the source of the Welsh language term Prydain, "Britain", which has the same
+source as the Goidelic term Cruithne used to refer to the early Brythonic-speaking
+inhabitants of Ireland. The latter were later called Picts or Caledonians ...
+...
+[10] Albion
+Albion is an alternative name for Great Britain. The oldest attestation of the toponym
+comes from the Greek language. It is sometimes used poetically and generally to refer to
+the island, but is less common than ’Britain’ today. The name for Scotland in most of the
+Celtic languages is related to Albion: "Alba" in Scottish Gaelic, "Albain" ...
+[/INST] The response is:
+Figure 7: Prompt of Standard RAG for Instruction-tuned LM
+15
+
+D
+Case Study
+Figure 8 shows two drafts generated for the same question. We observe that our RAG drafter can
+well understand the multiple perspectives in the retrieval results and generate high-quality drafts. Our
+RAG verifier can also help filter out the unreliable drafts as we observe a relatively low scores in the
+first draft in Figure 8.
+=================================== Prompt of Drafter ====================================
+Response to the instruction. Also provide rationale for your response.
+## Instruction: Which actress/singer starred as Doralee Rhodes in the 1980 film, "Nine to
+Five"?
+## Evidence:
+[1] Diana DeGarmo
+Sheila until the show’s closure on June 27, 2010. DeGarmo played the role of Doralee Rhodes
+in the national tour of "9 to 5", which was launched in Nashville on September 21, 2010.
+She ended her run as Doralee after the July 2011 Minneapolis tour stop. DeGarmo appeared on
+musical theatre composer Scott Alan’s third album, ...
+[2] 9 to 5 (musical)
+Pippa Winslow as Violet Newstead, Louise Olley as Doralee Rhodes and Leo Sene as Franklin
+Hart Jr, with Samantha Giffard as Roz, Matthew Chase as Joe and Mark Houston, Rachel Ivy,
+and Blair Anderson. "9 to 5" will play in the West End at the Savoy Theatre from January 29
+to August 31, 2019. The production stars Amber Davies (Judy), ...
+====================================== Completion ========================================
+## Rationale: Diana DeGarmo played the role of Doralee Rhodes in the national tour of "9 to
+5", which began in September 2010.
+## Response: Diana DeGarmo
+====================================== Verification ======================================
+draft score: 0.6594
+self-containment score: 0.3417
+self-reflection score: 0.5238
+------------------------------------------------------------------------------------------
+=================================== Prompt of Drafter ====================================
+Response to the instruction. Also provide rationale for your response.
+## Instruction: Which actress/singer starred as Doralee Rhodes in the 1980 film, "Nine to
+Five"?
+## Evidence:
+[1] Cynthia Rhodes
+Rhodes garnered her first non-dance related role in Michael Crichton’s 1984 science fiction
+thriller "Runaway" with Tom Selleck, Kirstie Alley and Gene Simmons. Her most notable role
+was as dance instructor Penny Johnson in the hit 1987 motion picture "Dirty Dancing" with
+Jennifer Grey and Patrick Swayze. Rhodes’ final motion picture role was the character of
+Vickie Phillips opposite actor Jameson Parker in the sleeper action-adventure movie ...
+[2] Dolly Parton
+Parton’s feature film "9 to 5" (1980). The musical ran at the Ahmanson Theatre, Los Angeles
+in late 2008. It opened on Broadway at the Marquis Theatre in New York City, on April 30,
+2009, to mixed reviews. The title track of her 2008 "Backwoods Barbie" album was written
+for the musical’s character Doralee. Although her score (as well as the musical debut of
+actress Allison Janney) were praised, ...
+====================================== Completion ========================================
+## Rationale: Dolly Parton starred in the 1980 film "9 to 5" as Doralee Rhodes.
+Additionally, Parton’s 2008 musical "9 to 5" was based on the film, with Parton reprising
+her role as Doralee.
+## Response: Dolly Parton starred as Doralee Rhodes in the 1980 film, "Nine to Five".
+====================================== Verification ======================================
+draft score: 0.71
+self-containment score: 0.4346
+self-reflection score: 0.7449
+Figure 8: Case study of SPECULATIVE RAG from TriviaQA where Dolly Parton is the corrrect
+answer.
+16
+
+E
+Instruction-Tuning Settings
+We construct our training dataset for the RAG drafter from diverse instruction-following pairs. We
+sample instances from Open-Instruct processed data (Wang et al., 2023a) and knowledge-intensive
+datasets (Petroni et al., 2021; Stelmakh et al., 2022; Mihaylov et al., 2018). We augment the
+instruction-following pairs with retrieved documents and generated rationale. We use the off-the-shelf
+dense retriever Contriever-MS MARCO (Izacard et al., 2021) to retrieve up to 10 documents for each
+pair and use Gemini-Ultra (Team et al., 2023) to generate rationale. In total, we acquire a dataset
+of 40k instances. We use Mistral7B (v0.1) as our base LM for the RAG drafter. We reproduce the
+performance of Self-RAG (Asai et al., 2023) and CRAG (Yan et al., 2024) with Mistral7B (v0.1) for a
+fair comparison. We implement the training scripts using the Transformers library from Hugging Face
+(Wolf et al., 2019). We employ DeepSpeed (Rasley et al., 2020) to accelerate the training process. All
+experiments are conducted on a Linux server equipped with 16 Nvidia A100-SXM4-40GB GPUs.
+F
+Effects of Self-Reflection Statement
+We use “Do you think the explanation supports the answers? (Yes or No)” as the self-reflection
+statement in our main results. In this study, we replace it with other alternatives to see how the
+self-reflection statement affects the accuracy. The results are reported in Table 4. We observe that the
+performance does not change a lot given different self-reflection statements, which shows the stable
+verification capability of the generalist LMs by language modeling objective.
+Table 4: Performance analysis of SPECULATIVE RAG with different self-reflection statements R
+when computing the self-reflection score ρSelf-reflect = P("Yes"|Q, α, β, R), where Q is the query,
+α, β are the generated answer draft and rationale.
+Reflection Statement
+TriviaQA
+PubHealth
+Do you think the explanation supports the answers? (Yes or No)
+74.24
+76.60
+Does the rationale support the answer? (Yes or No)
+74.22
+76.09
+What do you think about the rationale? A good one? (Yes or No)
+74.25
+75.79
+Is the rationale good enough to support the answer? (Yes or No)
+74.39
+76.29
+17
+

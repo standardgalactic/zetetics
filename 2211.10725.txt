@@ -1,0 +1,1026 @@
+1
+Intelligence Processing Units Accelerate
+Neuromorphic Learning
+Pao-Sheng Vincent Sun, Alexander Titterton, Anjlee Gopiani, Tim Santos, Arindam Basu, Senior Member, IEEE,
+Wei D. Lu, Fellow, IEEE, and Jason K. Eshraghian, Member, IEEE
+Code: https://github.com/vinniesun/snntorch-ipu
+Abstract—Spiking neural networks (SNNs) have achieved or-
+ders of magnitude improvement in terms of energy consumption
+and latency when performing inference with deep learning
+workloads. Error backpropagation is presently regarded as the
+most effective method for training SNNs, but in a twist of
+irony, when training on modern graphics processing units (GPUs)
+this becomes more expensive than non-spiking networks. The
+emergence of Graphcore’s Intelligence Processing Units (IPUs)
+balances the parallelized nature of deep learning workloads with
+the sequential, reusable, and sparsiﬁed nature of operations
+prevalent when training SNNs. IPUs adopt multi-instruction
+multi-data (MIMD) parallelism by running individual processing
+threads on smaller data blocks, which is a natural ﬁt for the
+sequential, non-vectorized steps required to solve spiking neuron
+dynamical state equations. We present an IPU-optimized release
+of our custom SNN Python package, snnTorch, which exploits
+ﬁne-grained parallelism by utilizing low-level, pre-compiled cus-
+tom operations to accelerate irregular and sparse data access
+patterns that are characteristic of training SNN workloads. We
+provide a rigorous performance assessment across a suite of
+commonly used spiking neuron models, and propose methods
+to further reduce training run-time via half-precision training.
+By amortizing the cost of sequential processing into vectorizable
+population codes, we ultimately demonstrate the potential for
+integrating domain-speciﬁc accelerators with the next generation
+of neural networks.
+Index Terms—Accelerators, IPU, snnTorch, spiking neural
+networks
+I. INTRODUCTION
+R
+EPURPOSING GPUs from graphics rendering to train-
+ing deep neural networks has effectively shaped an
+entire decade of advances in artiﬁcial intelligence (AI) [1]–
+[5]. This can be attributed to the numerous processor cores in
+GPUs that enable high parallelization of easily decomposable
+instructions, which are essential for the large number of matrix
+operations that take place in neural networks.
+But a signiﬁcant discrepancy arises: the cost of training
+deep learning algorithms in data centers sits between 100s and
+100,000s of watts, whereas brain-driven cognition is bounded
+to approximately 10-20 W. This gap in performance has
+P. V. Sun and A. Basu are with the Department of Electrical Engineering,
+City University of Hong Kong, Hong Kong, SAR.
+A. Titterton, A. Gopiani and T. Santos are with Graphcore, Bristol, UK.
+W. D. Lu is with the Department of Electrical Engineering and Computer
+Science, University of Michigan, Ann Arbor, Michigan 48109, USA.
+J. K. Eshraghian is with the Department of Electrical and Computer
+Engineering, University of California, Santa Cruz, CA 95064, USA. He
+was previously with the Department of Electrical Engineering and Com-
+puter Science, University of Michigan, Ann Arbor, Michigan 48109, USA.
+(jeshragh@ucsc.edu)
+driven the neuromorphic engineering community to explore
+new algorithms, architectures, circuits, and devices that apply
+principles of neural processing to modern neural networks
+[6]–[11]. Spiking neurons transmit information in voltage
+bursts known as ‘action potentials’, which are characterized
+as discrete events in many neural coding studies. As such,
+SNNs distribute information over time, where most neurons
+are dormant at any instantaneous moment in time. This reduces
+memory access frequency, which is one of the dominant costs
+in deep learning workloads [12]–[16].
+When it comes to training via gradient descent, there
+are next to no accelerators optimized for SNN workloads.
+The most common uses for neuromorphic hardware are:
+1) inference using ﬁxed weights where training takes place
+‘ofﬂine’, or 2) online learning using simple plasticity rules,
+such as spike time-dependent plasticity (STDP). If SNNs
+are so efﬁcient, why are there no accelerators that can can
+perform backpropagation on SNN models? While feedfor-
+ward computation is cheap, in a twist of irony, gradient-
+based optimization of SNNs is less efﬁcient than its non-
+spiking counterpart. There are several reasons for this drop in
+efﬁciency: 1) the time complexity of backpropagation through
+time (BPTT) means each time step instantiates an additional
+neural network. Memory usage scales linearly with time; 2)
+biological neurons are more complex than artiﬁcial neurons,
+and 3) the non-differentiability of spikes means that a direct
+application of automatic differentiation is incompatible with
+SNNs. In effect, GPUs and many accelerators have not been
+optimized for sequential instruction sets that are required
+by spiking neurons: multiply-accumulate →state update →
+thresholding →surrogate gradient calculations.
+While the current market of accelerators are tailored to
+conventional DL workloads, this paper seeks to explore the
+use of accelerators that are better tailored for the types of
+operations that are characteristic of SNNs [17]–[19]. In par-
+ticular, Intelligence Processing Units (IPU, Graphcore) include
+a feature set that are a natural ﬁt for training SNNs via error
+backpropagation. By coupling highly-parallel multi-instruction
+multi-data (MIMD) processing to sparse, spike-based tensors,
+we take a stride towards extracting the beneﬁts from DL
+accelerators and porting them to neuromorphic algorithms.
+The contributions of this paper are as follows:
+• Our SNN Python framework, snnTorch, is released for
+IPU compatibility using low-level, pre-compiled custom
+operations;
+arXiv:2211.10725v1  [cs.LG]  19 Nov 2022
+
+2
+Fig. 1. Mapping neural networks to hardware. (a) Dynamics of a spiking neuron model. (b) The computational graph of the neuron is unrolled over time
+to enable compatibility with the BPTT training algorithm. (c) SIMD/SIMT is used to perform parallel computations for one layer at a time in GPUs. (d)
+MIMD is used to distribute layers and custom activations, such as spiking dynamics, across IPU cores to improve concurrency. Layer-to-memory maps are
+color-coded.
+• A variety of benchmarks are assessed to demonstrate up
+to 21.3× peak improvement in throughput over NVIDIA
+A100 GPUs when training SNNs;
+• A series of corner cases are identiﬁed where GPUs
+converge to accelerator performance in recurrent SNNs;
+• In much the way that brains distribute ﬁring rates across
+pools of neurons, we demonstrate how the use of pop-
+ulation codes can signiﬁcantly accelerate the training
+process.
+This paper presents the ﬁrst analysis of the suitability and
+performance of IPUs in handling neuromorphic workloads
+when trained using approaches prevalent in deep learning.
+II. BACKGROUND
+A. Spiking Neural Networks
+The adoption of deep learning-based techniques to training
+SNNs can be dated back to 2002, when Bohte et al. treated
+the ﬁring time of a spiking neuron as a trainable, regression
+problem [20]. Since the advent of CUDA-accelerated Python
+packages with built-in automatic differentiation (autodiffer-
+entiation) engines (e.g., PyTorch [21], Tensorﬂow [22], JAX
+[23]), the broader approach in recent years has been to
+apply a generalized backpropagation algorithm to an unrolled
+computational graph of spiking neurons (Figure 1(a-b)) [24]–
+[29]. BPTT adopts techniques used to train recurrent neural
+networks (RNNs), where sequences are instead interpreted as
+discrete time-steps of ﬁnite duration [30], [31].
+While a variety of detailed models are used to accu-
+rately emulate biological neurons, the simplest models are
+more commonly used in large-scale simulations. This can
+be attributed to several reasons: i) calculating the solution
+is computationally cheap, ii) simplifying an action potential
+to a single-bit event promotes sparse computations, and iii)
+applying gradient descent to stiff equations (e.g., with sharp
+bifurcations) can lead to instability when training a network.
+SNNs adopt the same topological structure as non-spiking
+networks. The main difference is that artiﬁcial neuron models
+are swapped out for time-varying spiking neurons. Time-
+evolution is modeled in a sequential structure. Speciﬁc details
+regarding the types of neuron models used are provided in the
+experimental results (Section IV).
+B. Neuromorphic Processors
+The neuromodulatory processes in the brain that leverage
+spikes to promote learning remain somewhat shrouded in mys-
+tery, which has inspired the development of several research-
+based neuromorphic processors. Two proliﬁc examples include
+Loihi developed by Intel Labs [32], [33], and SpiNNaker
+initiated at the University of Manchester [34], [35], both of
+which have roused neuromorphic research ecosystems where
+hardware access is offered both remotely and physically to
+the broader research community. While such neuromorphic
+processors remain to be optimized for gradient-based learning,
+they have incited much interest in how neurobiological pro-
+cesses can be modelled in-silico. These processors allow users
+to explore how programmable learning rules can modulate
+plastic synapses.
+The push towards data-driven benchmarks from deep learn-
+ing has led to the adoption of gradient-based learning rules to
+be used with SNNs, which is far better suited for non-convex
+optimization, but demand far more computational resources
+when compared to biophysically motivated learning rules.
+Training SNNs via gradient descent compounds upon several
+challenges:
+• Temporal Credit Assignment: The BPTT learning rule
+requires storage of all gradients over time, where memory
+complexity scales with O(nT) where n is the number of
+neurons and T is the duration of time.
+• Weight Credit Assignment: Routing gradients from the
+network’s output back to plastic synapses requires the
+data path of the forward operation to be stored. The
+
+3
+gradient of every synapse has an independent pathway,
+which scales the cost of communicating gradients to
+apply weight updates.
+• Non-differentiable operations: In leaky integrate-and-
+ﬁre neuron models, a hard threshold is often applied to
+the membrane potential to elicit a voltage spike at the
+axon. This is a non-differentiable operation, and thus,
+incompatible with gradient descent.
+1) Temporal Credit Assignment: The temporal credit as-
+signment problem can be addressed by adopting real-time
+recurrent learning (RTRL) techniques, to avoid having to
+store gradients in time [36]. The cost of doing so is that
+memory complexity now scales with O(n3), where the cu-
+bic term discourages broad adoption in large-scale networks.
+Approximations of RTRL recently inspired the development
+of a lightweight SNN training accelerator for ﬁxed, dense
+architectures [37], [38].
+2) Non-differentiable Operations: Surrogate gradient de-
+scent is used to bypass non-differentiable operators, where the
+ﬁnal calculated gradients are a sufﬁcient approximation [6],
+[39]. This adds to computational cost, as analytical methods
+to computing derivatives (e.g., dual numbers [40]) must be
+supplemented with manually-determined heuristics (surrogate
+gradients); i.e., training SNNs via surrogate gradients is not
+as modular as non-spiking networks.
+3) Low-cost Inference: The high cost of training SNNs
+using non-local learning algorithms can be partially offset by
+the incredibly cheap cost of using SNNs in solely feedforward
+operations. It has been shown that SNNs can offer 2–3× orders
+of magnitude improvement over non-spiking alternatives [13].
+In general, this motivates ofﬂine training of SNNs typically
+using GPUs, where deployment can take place on low-power
+SNN accelerators. Several recent studies have leveraged pro-
+grammable microcode of neuromorphic research processors to
+adopt BPTT variants on a single chip [41], [42]. At present,
+these methods are constrained to ﬁxed neuron models and
+network architectures, not yet generalized to convolutional
+networks. Despite these limitations, such methods offer a
+promising alternative for online deployment of BPTT-like
+training of SNNs to what we propose here. Rather than
+taking BPTT to processors optimized for SNNs, we use IPUs
+to compile and train SNNs using accelerators optimized for
+backpropagation.
+C. Intelligence Processing Units
+IPUs are designed to facilitate deep learning workloads by
+processing ﬁne-grained operations across a large number of
+parallel threads. The ability to process individual threads on
+sub-blocks offers a two-fold beneﬁt on SNN workloads over
+single-instruction-multiple-data/thread (SIMD/SIMT) GPUs:
+i) instructions from different network layers can be concur-
+rently processed, where the constraints of contiguous vec-
+torized data is no longer a performance bottleneck, and ii)
+MIMD processing can accelerate applications with irregular
+and sparse data access without incurring performance degrada-
+tion. This is optimal for spike-based workloads which include
+additional processing overhead in computing the state-driven
+dynamics of spiking neuron models (Figure 1(c-d)).
+Each IPU Mk2 core consists of 1,472 high performance pro-
+cessor cores, where each processor core and a locally accessi-
+ble in-processor memory unit form a tile. The IPU tile consists
+of one computing core and 624 KB of local memory. Each core
+contains six processor threads, totaling 8,832 processor threads
+when operating in parallel. This amounts to a total of roughly
+900 MB of memory and 250 TeraFLOPS of compute for the
+Mk2 GC200 IPU hardware which ran the experiments on this
+paper. Each core is connected directly to the IPU-Exchange,
+which is capable of transferring 8 TBps of data between IPU
+tiles. There is no global memory, and specialized hardware is
+incorporated for common neural network operations, such as
+convolutions and matrix multiplications.
+IPUs follow a graph processing pipeline where programs
+are compiled into a logical execution graph. This graph is
+composed of alternating state and computation vertices. Each
+vertex consists of machine instructions that can execute in
+parallel, provided they write to independent parts of a ten-
+sor. Upon completion of a compute step, data is exchanged
+between tiles as part of the exchange phase of the bulk
+synchronous parallel (BSP) execution model.
+Adopting this BSP execution model beneﬁts bandwidth-
+limited neural network, as overlapping memory-bound com-
+putation and communication can lead to bandwidth contention
+and data collision [43], [44]. BSP eliminates the need for
+message buffers and global memory, though as a result, all
+inter-core communication must be planned during model com-
+pilation [45]. In practice, once the model has been compiled
+once, it can be cached and subsequently reused.
+D. snnTorch
+A variety of gradient-based SNN libraries have been open-
+sourced, most of which are written in Python for syntactical
+ease, and several of which are built on top of commonplace
+deep learning packages [25], [46]–[50]. Most approaches com-
+pose primitive functions together wrapped as a spiking neuron
+node, where gradients are analytically calculated using reverse
+autodifferentiation in the backend. As spikes are represented as
+discontinuous voltage bursts, they are non-differentiable. Py-
+Torch allows users to override gradients with custom functions,
+and so has become a common backend for the implementation
+of surrogate gradient descent in SNNs [6], [39].
+snnTorch is adopted as the toolbox because it is: i) designed
+with PyTorch as its backbone, so pre-existing interfaces can be
+used to lower composable PyTorch functions into IPUs, ii) sev-
+eral features are unique to snnTorch in the context of gradient-
+based learning, such as using population-based embeddings
+to accelerate the training process, and iii) quantization-aware
+training has been integrated into the state-space of spiking
+neuron models, which can be used in mixed- and low-precision
+accelerators.
+Several alternative options are available for accelerating
+SNNs using CUDA-based libraries. SpikingJelly provides a
+CuPy backend [48], GeNN uses CUDA-generated code to
+implement an approximate form of BPTT [38], [51], and lava-
+dl incorporates the most commonly used functions/neurons as
+optimized CUDA code, while other libraries mostly depend
+on the deep learning package’s CUDA acceleration.
+
+4
+Fig. 2. Unrolled computational graph of (a) Leaky Integrate-and-Fire neuron,
+and (b) Current-based leaky integrate-and-ﬁre neuron.
+To summarize, prior approaches for faster gradient-based
+training of SNNs include:
+• Utilizing microcode to enable neuromorphic processors
+to track gradients,
+• Using custom CUDA backends to accelerate SNNs on
+GPUs, and
+• Using pre-existing interfaces to CUDA via pre-existing
+deep learning libraries (e.g., PyTorch).
+The ﬁrst option is burdened with instruction set-level deﬁni-
+tions that must be tailored for a given network architecture, and
+the latter two are limited by SIMD/SIMT processing. We take
+a wholly different approach by adapting Python-level SNN
+descriptions that leverage low-level, pre-compiled operations
+customized to an IPU accelerator harnessing MIMD archi-
+tectures. This approach to distributed memory amongst IPU
+cores can be used to reduce data movement, thus amortizing
+the costs of weight and temporal credit assignment.
+III. METHODS
+A. Neuron Models
+1) Leaky Integrate-and-Fire Neuron: The dynamics of a
+leaky integrator neuron are as follows [52], [53]:
+τ du
+dt = −u + ir,
+(1)
+where u is the membrane potential of the neuron, i is the
+current injection to the neuron, r is the equivalent resistance
+of the ion channels of the neuron, τ = rc is the time constant
+of the neuron, where c is the capacitance of the passive
+membrane. Equation (1) can be solved using the forward Euler
+method:
+ut = βut−1 + (1 −β)it,
+(2)
+where β = e−1/τ is the inverse time constant of the neuron
+membrane potential, and the subscript t refers to time. When
+the membrane potential exceeds the threshold uthr, an output
+spike is generated:
+zt =
+(
+1,
+if ut > uthr
+0,
+otherwise.
+(3)
+To introduce learnable parameters, the current injection term
+is replaced with a weighted input (1 −β)i ←wx. For
+Algorithm 1 Using Custom Operations with IPU
+Require: Custom operation deﬁned in C++
+Require: Makeﬁle used to generate the Shared Object
+Require: Custom operation’s shared object
+Deﬁne custom operation in a C++ ﬁle
+Use the Makeﬁle to generate the shared object
+Load the Custom Operation’s Shared Object.
+notational brevity, the contribution of a single weighted input
+is used:
+ut = βut−1 + wxt −zt−1uthr,
+(4)
+The ﬁnal term introduces a reset mechanism to the neuron.
+The unrolled computational graph depicting the operation of
+the neuron is shown in Figure 2(a).
+2) Current-based Leaky Integrate-and-Fire Neuron: If the
+leaky integrate and ﬁre can be thought of as a low-pass
+ﬁlter, the current-based method can be thought of as a pair
+of low-pass ﬁlters. The input synaptic current is modeled as
+an AMPA-receptor with a rapid rise time and gradual decay,
+which then modulates the membrane potential of the neuron:
+it = αit−1 + wxt,
+(5)
+ut = βut−1 + it −zt−1uthr,
+(6)
+where α = e−1/τsyn is the inverse time constant of the synaptic
+current, and τsyn is the equivalent time constant of the synaptic
+current in an analogous way to τ, with the computational graph
+illustrated in Figure 2(b).
+3) Recurrent Spiking Neurons: Both of the above neuron
+types can be adapted to include explicit recurrent connections.
+The output spikes are weighted and appended to the input.
+Formally, a recurrent leaky integrate-and-ﬁre neuron is repre-
+sented by:
+ut = βut−1 + wxt + zt−1(v −uthr),
+(7)
+where v is the recurrent weight.
+B. Custom Operations on IPUs
+The ‘Poplar SDK’ interfaces popular deep learning frame-
+works directly into IPU programming. The IPU uses an autod-
+ifferentiation engine independently of PyTorch’s backend, and
+as such, spiking neuron models that depend on surrogate gra-
+dient descent are not compilable by default. Custom operations
+must be written in C++ and pre-compiled into machine-level
+codelets that are accessible to users via Python.
+Our approach pre-compiles the surrogate gradient operator
+at the time snnTorch is imported. A custom operation is
+deﬁned for the threshold-shifted Heaviside function (see (3))
+implemented in C++, which is compiled thus generating a
+shared library object that can be dynamically linked in Python
+at runtime. This allows for the IPU-build of snnTorch to
+be syntactically near identical to CPU/CUDA-based usage,
+abstracting away machine-level complexities from the user.
+The surrogate gradient operator is co-located in the same
+
+5
+Fig. 3. Data path of input tensors on GPU and IPU. (a) GPU: One instruction is applied to all elements of an input tensor while spiking neuron state and
+surrogate gradient computations are stalled in the instruction pipeline. (b) IPU: Spiking neuron state and surrogate gradient computations are pre-compiled
+into machine-level codelets, and concurrently processed with the neural network (NN) matrix-vector-multiplication step.
+IPU core which reduces the impact of non-modular function
+calls that are needed when overriding the autograd module in
+PyTorch. This is sequenced via pseudo-code in Algorithm 1
+and illustrated in Figure 3.
+Speciﬁcally, (3) is a non-differentiable function. This func-
+tion is replaced in the backward pass with the user’s choice of
+approximation. For example, a straight-through-estimator sim-
+ply bypasses the non-differentiable operator [54]. Alternative
+approaches use functional approximations of the Heaviside
+operator by smoothing out the discontinuous step, e.g., the
+fast-sigmoid function:
+˜z =
+(u −uthr)
+(1 + |u −uthr|),
+(8)
+∂z
+∂u ←∂˜z
+∂u =
+1
+(1 + |uthr −u|)2 ,
+(9)
+where the left-arrow denotes substitution, and the tilde in ˜z
+represents an approximation.
+C. Network Architecture
+For this paper, two network types were tested on four
+different types of hardware. The hardware tested include: the
+NVIDIA A100, NVIDIA V100, NVIDIA GTX 1080, and the
+Graphcore IPU Mk2. The networks tested are designed to ﬁt a
+single processor to avoid comparisons that are I/O-limited. The
+architectures include: a 3-layer dense SNN (DSNN) and a 3-
+layer convolutional SNN (CSNN). Despite the small size of the
+networks, these were trained over multiple time steps which
+led to near-full memory utilization. Leaky integrate-and-ﬁre
+neurons are used for all experiments unless otherwise spec-
+iﬁed, and most spiking simulations are performed across 25
+time steps. For experiments measuring throughput, the MNIST
+dataset is used in the interest of speed [55]. For experiments
+that account for loss-based metrics (e.g., accuracy), CIFAR-10
+is used [56]. The various architectures used are speciﬁed in
+Table I. 5C12 refers to a 5 × 5 convolutional kernel with 12
+channels. MP2 refers to a 2 × 2 max-pooling operator. Unless
+otherwise speciﬁed (e.g., in experiments that sweep across
+different architecture parameters), these networks are used for
+the experiments that follow with the AdamW optimizer used
+in all cases [57]. Where relevant, experiments were repeated
+ﬁve times to generate error bars.
+TABLE I
+NETWORK ARCHITECTURE
+Network
+Architecture
+DSNN
+784–1000–10
+CSNN
+5C12–MP2–5C64–MP2–10
+IV. EXPERIMENTAL RESULTS
+The following experiments have been conducted to bench-
+mark IPU performance:
+• Baseline FLOPS (ﬂoating point operations per second)
+• Baseline Throughput
+• Throughput across batch sizes
+• Throughput across architectures
+• Throughput across neuron models
+• Compute time spent on spiking vs. static dynamics
+• Mixed precision throughput
+• Population coding: throughput and accuracy
+• Power usage per operation
+All experiments that follow account for the entire training
+process using BPTT, including the forward-pass, gradient
+calculation, and weight update.
+A. Baseline FLOPS
+Before performing IPU vs. GPU performance comparisons,
+we ﬁrst assess the performance of a spiking network against
+equivalent, non-spiking artiﬁcial neural networks (ANNs) on
+the IPU.One FLOP is deﬁned as one fused multiply-add
+ﬂoating point operation, calculated using the fvcore Python
+Library. The FLOPs comparison can be seen in Table II. On
+average, the IPU improves TFLOPS by 4.6× when compared
+to the A100, 6.4× over the V100, and 10× over the GTX1080.
+Interestingly, the performance of the spiking network is
+marginally better for the dense case than the non-spiking
+network. This may be because the IPU has been optimized
+for handling different types of concurrent operations, where
+processing neuron state-based computations are relatively sim-
+ple operators when compared to large-scale matrix-vector
+multiplication. On the other hand, the TFLOPS when running
+the convolutional SNN drops by approximately 57% from non-
+spiking to spiking networks on the IPUs.
+
+6
+TABLE II
+SNN VS ANN TFLOPS (TRAINING)
+Network Type
+IPU
+A100
+V100
+GTX1080
+DNN
+1.02
+0.22
+0.16
+0.10
+DSNN
+1.04
+0.22
+0.16
+0.10
+CNN
+3.24
+0.70
+0.51
+0.33
+CSNN
+1.85
+0.40
+0.29
+0.19
+TABLE III
+DSNN THROUGHPUT
+Metric
+IPU
+A100
+V100
+GTX1080
+Average Power
+92.12W
+60.51W
+55.71W
+49.29W
+Average Throughput
+46297.17
+9858.92
+7207.24
+4639.89
+(images/s)
+Throughput/Watt
+502.59
+162.93
+129.4
+94.4
+TABLE IV
+CSNN THROUGHPUT
+Metric
+IPU
+A100
+V100
+GTX1080
+Average Power Used
+92.57W
+68.86W
+61.99W
+55.44W
+Average Throughput
+15566.16
+5608.43
+3883.89
+2635.54
+(images/s)
+Throughput/Watt
+168.16
+81.44
+62.65
+47.54
+B. Baseline Throughput
+Throughput is measured in terms of 1000s of images per
+second, and accounts for the wallclock time commencing from
+the forward pass, the backward pass, and concludes once the
+weight update is completed. A batch size of 128 images is
+used by default. Each network is trained over 60 epochs. To
+obtain error bars, this is repeated 20 times on each hardware.
+The throughput is calculated by:
+• measuring the wallclock time to process one minibatch,
+• dividing the batch size by the wallclock time.
+1) DSNN Throughput: The results from the DSNN are
+tabulated in Table III. The IPU can train an average of 46,297
+images per second, which is 3.1× higher than the A100, 6.4×
+higher than the V100, and 9.9× higher than the GTX1080.
+Error bars across multiple trials are illustrated in Figure 4(a).
+The standard deviation for the IPU is approximately 3,623
+images.
+2) CSNN Throughput: With respect to the CSNN, there is a
+much larger number of computations being performed leading
+to a decrease in throughput for both IPUs and GPUs. The
+IPU training throughput is 15,566 images per second. This
+is 2.1× more than the A100, 4× higher than the V100, and
+5.9× greater than the GTX108. The standard deviation is 1,069
+images per second.
+The performance margin between the DSNN and CSNN
+indicates that the IPU has been optimized for high memory
+usage. This is useful for experiments that require traces of
+membrane potential to be stored as with BPTT, for pre-
+and post-synaptic current traces as with spike time-dependent
+plasticity [58], and also for dynamically varying synapses.
+C. Throughput Across Batch Size
+As networks increase in size, memory limits constrain the
+maximum possible batch size that is permissible. This problem
+(a)
+(b)
+Fig. 4. (a) Baseline throughput. (b) Throughput with varying batch size.
+(a)
+(b)
+Fig. 5.
+Throughput with varying network architectures. (a) DSNN with
+increasing network width. (b) CSNN with increasing convolutional kernel
+depth. For (N1, N2), N1 corresponds to depth of the ﬁrst layer kernel, and
+N2 is the depth of the second layer kernel.
+is exacerbated in SNNs which also consume memory for each
+additional simulated time step. To measure this effect, the
+batch size was swept from 8 to 128, with throughput results
+shown in Figure 4(b). On inspection, there is far less variance
+in performance for IPUs. This is especially important where
+a large number of time steps must be simulated, and the
+maximum batch size decreases. Close attention is given to
+the smallest tested batch size, as real-world batch sizes in
+continual learning workloads are ‘1’. For the smallest tested
+batch size (n = 8), the performance improvement of the IPU
+over the A100 for both CSNN and DSNN is more than one
+order of magnitude (14×).
+D. Throughput Across Architectures
+Network architecture is varied for both the DSNN and
+CSNN and throughput is measured. For the DSNN, the number
+of neurons in the hidden layer is increased, and for the CSNN,
+the kernel depths of the ﬁrst two convolutional ﬁlters are
+increased.
+1) DSNN Throughput: GPUs are completely insensitive to
+increasing the number of neurons, as shown in Figure 5(a).
+This indicates that for a small network, a large number of cores
+available are underutilized. On the other hand, the margin of
+improvement with the IPU increases with smaller networks.
+This is because different operations can be parallelized to
+improve utilization of the large number of IPU cores available.
+2) CSNN Throughput: The throughput of varying CSNN ar-
+chitectures is illustrated in Figure 5(b). In contrast to DSNNs,
+larger convolutional kernels decrease the throughput of GPUs.
+The larger number of computations involved in convolutions
+indicates that the GPU cores are now fully utilized.
+
+7
+(a)
+(b)
+Fig. 6. Throughput with alternative neuron models. (a) Recurrent SNN. (b)
+Current-based Neuron Model.
+E. Alternative Neuron Models
+Several other spiking neuron models are increasing in usage
+in the context of SNNs. Recurrent spiking neuron models, e.g.,
+(7), have been shown to achieve better performance on datasets
+with temporal complexity [59]. Current-based neuron models,
+e.g., see (5) and (6), are better suited for learning precise spike
+timing, as the membrane potential trace is differentiable with
+respect to time. Throughput for a recurrent SNN is shown in
+Figure 6(a), and that of an SNN composed of current-based
+neurons is shown in Figure 6.
+The performance of V100s remains relatively unaffected by
+more complex neuron models, which causes the performance
+gap with IPUs to narrow. This highlights a potential opportu-
+nity to improve resource allocation during compilation. There
+are more steps to process these more exotic neuron models,
+and so more cores are allocated to handling those operations.
+This comes at the cost of less resources available to process
+synaptic operations, where computational complexity scales
+with O(n2).
+F. Spiking vs. Static Dynamics
+To verify the above theory, the ratio of time spent calculating
+the dynamics of spiking neurons (i.e., solving (3) and (4)) is
+compared against the amount of time spent on matrix-vector
+multiplication. The results are shown in Figure 7(a), demon-
+strating that IPUs provide better balance between neuronal and
+synaptic operations. In the CSNN, the amount of compute time
+allocated to solving state-driven dynamics is exactly equivalent
+to the duration of time spent on synaptic operations. This is
+beneﬁcial for simple neuron models, but where more complex
+neurons are concerned, may require further optimization dur-
+ing compile time. Further improvements could be obtained by
+exploiting function outlining which merges repeatable code-
+blocks for execution on identical cores in IPUs. This can
+reduce the overhead allocated to solving state dynamics, and
+free up more cores to run synaptic operations.
+G. Mixed Precision Performance
+Mixed precision training reduces the bit-width needed for
+computation, which comes with an associated wallclock time
+reduction. This is often with minimal, if any, impact on
+network performance. The default full precision (32b) mode is
+compared to half precision (16b) training, with results shown
+(a)
+(b)
+Fig. 7.
+(a) Compute time ratio of spiking dynamics (red) and synaptic
+opertions/matrix-vector multiplications (blue). (b) Throughput with full pre-
+cision (32-bit: right) and half precision (16-bit: left).
+(a)
+(b)
+Fig. 8. Population code throughput. (a) DSNN with population coding. (b)
+CSNN with population coding.
+in Figure 7(b). The difference for all cases is marginal because
+gradients continue to be calculated in full precision.
+V. ACCELERATION USING POPULATION CODES
+A. Biological Plausibility
+At present, the most common approach to determining the
+predicted class is to select the neuron with the highest ﬁring
+count. This is equivalent to using a rate coded SNN. In
+neurophysiology, it is thought that rate codes alone cannot
+be the dominant encoding mechanism in the primary cortex.
+One of several reasons is because the background neuronal
+ﬁring rate is roughly 0.1 – 1 Hz, which is far slower than the
+reaction response time of animals and humans.
+But if multiple neurons are grouped with their collective
+spikes counted cumulatively, then it becomes possible to
+measure a ﬁring rate for a population of neurons in a very
+short window of time. Assigning a population of neurons to
+individual classes is also known as using a ‘population code’.
+Population coding adds credibility to the biological plausibility
+of rate-encoding mechanisms.
+B. Population Codes in Unsupervised Learning
+In the past, it has been common practice to increase the
+number of neurons at the output layer of a network, and cluster
+the response of various neurons together. This practice has
+been limited to networks trained using spike timing-dependent
+plasticity. Neurons would be assigned classes based on which
+assignments led to the highest accuracy. As such, using a
+
+8
+population code where multiple neurons were assigned per
+class typically led to a boost in classiﬁcation accuracy in
+unsupervised learning tasks. This is because more neurons
+means more permutations of neuron assignments that can
+increase accuracy. The shift from unsupervised learning to
+gradient-based supervised learning has made population codes
+a diminishing practice when training SNNs, as targets are
+pre-assigned before training commences. We ﬁnd that using
+population codes offers alternative beneﬁts when training
+SNNs.
+C. Population Codes in Gradient-based Learning
+These beneﬁts are grounded in the fact that accelerators
+are optimized for parallel operations rather than sequential
+operations. Using a population of neurons redistributes the
+time cost over space instead, i.e., larger dimension matrix-
+vector multiplications can be used instead of repeatedly apply-
+ing matrix-vector multiplications with smaller dimensions. We
+run a series of experiments to show population codes further
+accelerate throughput with a marginal impact on accuracy.
+Because accuracy is now of interest, we assess performance
+on the CIFAR-10 dataset as MNIST is broadly recognized as
+being too simple.
+1) Experimental Setup: Similar network architectures as
+described in Table I are used. For the DSNN, the number
+of input neurons is increased due to the larger dimensionality
+of the CIFAR-10 dataset (32×32×3) over that of the MNIST
+dataset (28 × 28 × 1). The same holds true for the terminal
+layer of the CSNN.
+2) Training Throughput:
+A comparison of throughput
+across various output neurons and with different precision (half
+and full) are shown in Figure 8. One single simulation time
+step is used. Performance follows a very similar trend to that
+of varying network architectures in Figure 5, where GPUs
+perform identically as the output population increases. At
+the IPU’s best, optimal throughput is approximately 145,000
+images per second. This is 37× better than the original
+baseline performance (despite using bigger images with 3
+channels), and approximately twice as fast as the best GPU.
+At its lowest throughput, performance of the IPU and A100
+converges in the DSNN experiment. When population codes
+are applied to CSNNs, the A100 skyrockets in performance
+and becomes invariant to architectural changes. The large num-
+ber of terminal synaptic operations dominates the total cost
+of the network, completely outweighing state-based neuronal
+operations. This places the A100 in the lead in population-
+based CSNN benchmarks.
+3) Accuracy: As a coarse-grain measure of accuracy, the
+DSNN model was used to provide an idea as to how population
+codes impact training performance. The DSNN is trained over
+5 epochs to determine whether it is possible to train networks
+in one single time-step, where each neuron is constrained
+to only ﬁring a maximum of once. Results are illustrated in
+Figure 9, where a baseline accuracy of 52.2% is obtained with-
+out using population codes (i.e., 10 output neurons simulated
+over 25 time steps). This accuracy is almost reached when
+500 output neurons are used, assigning 50 output neurons per
+Fig. 9. Accuracy Performance with Population Coding.
+class. As a matter of interest, indeﬁnitely increasing the output
+neuron count does not continue to increase performance. Based
+on prior approaches to constructing models, network depth
+should be increased commensurately to network width to avoid
+leaning towards either end of the bias-variance trade-off [60].
+We note that the target here is not state-of-the-art accuracy,
+but rather, to assess whether single time-step learning is
+possible at all. Our results indicate that equal performance
+to multiple time-steps can be met by using population codes,
+veriﬁed on a simple DSNN architecture.
+VI. OUTLOOK AND CONCLUSION
+SNNs and conventional neural networks have overlapping
+features that can be concurrently optimized, and IPUs have
+demonstrated promising suitability for most operations that
+are characteristic of training SNN workloads. We ﬂip the
+conventional approach to ASIC-driven SNN training by tailor-
+ing pre-compiled microcode to a domain-speciﬁc accelerator,
+rather than reconﬁguring neuromorphic chips to handle back-
+propagation approximations on ﬁxed network architectures.
+Our results show promising performance gains (throughput,
+TOPS/W, accuracy) can be made by porting the advances
+made in deep learning accelerators to SNNs. We also indicate
+the types of hardware optimizations that beneﬁt gradient-
+based learning in SNNs, such as MIMD processing, functional
+outlining, and balanced compilations of neuronal and synaptic
+operators, and how population encoding can be used to better
+utilize parallelism across both IPUs and GPUs. These fea-
+tures together enable high performance training and inference
+speeds with IPUs on SNNs.
+All code used to generate these results is made openly
+accessible to enable the research community to accelerate their
+own custom SNNs on IPUs, and can be installed via PyPi.
+Population encoding has been integrated into snnTorch, with a
+corresponding interactive notebook that enables users to train
+population encoded SNNs on both IPUs and GPUs alike.1
+CONFLICT OF INTEREST
+A. Titterton, A. Gopiani, and T. Santos are employees at
+Graphcore. The remaining authors have no conﬂicts of interest
+to declare.
+1URL: https://snntorch.readthedocs.io/en/latest/tutorials/tutorial pop.html
+
+9
+REFERENCES
+[1] K. Chellapilla, S. Puri, and P. Simard, “High performance convolutional
+neural networks for document processing,” in Tenth international work-
+shop on frontiers in handwriting recognition.
+Suvisoft, 2006.
+[2] K.-S. Oh and K. Jung, “GPU implementation of neural networks,”
+Pattern Recognition, vol. 37, no. 6, pp. 1311–1314, 2004.
+[3] K. Fatahalian, J. Sugerman, and P. Hanrahan, “Understanding the
+efﬁciency of GPU algorithms for matrix-matrix multiplication,” in
+Proceedings of the ACM SIGGRAPH/EUROGRAPHICS conference on
+Graphics hardware, 2004, pp. 133–137.
+[4] D. C. Ciresan, U. Meier, J. Masci, L. M. Gambardella, and J. Schmid-
+huber, “Flexible, high performance convolutional neural networks for
+image classiﬁcation,” in Twenty-second international joint conference
+on artiﬁcial intelligence, 2011.
+[5] A. Krizhevsky, I. Sutskever, and G. E. Hinton, “Imagenet classiﬁcation
+with deep convolutional neural networks,” Advances in neural informa-
+tion processing systems, vol. 25, pp. 1097–1105, 2012.
+[6] E. O. Neftci, H. Mostafa, and F. Zenke, “Surrogate gradient learning
+in spiking neural networks: Bringing the power of gradient-based opti-
+mization to spiking neural networks,” IEEE Signal Processing Magazine,
+vol. 36, no. 6, pp. 51–63, 2019.
+[7] D. Sussillo and L. F. Abbott, “Generating coherent patterns of activity
+from chaotic neural networks,” Neuron, vol. 63, no. 4, pp. 544–557,
+2009.
+[8] S. H. Jo, T. Chang, I. Ebong, B. B. Bhadviya, P. Mazumder, and W. Lu,
+“Nanoscale memristor device as synapse in neuromorphic systems,”
+Nano letters, vol. 10, no. 4, pp. 1297–1301, 2010.
+[9] J. Hochstetter, R. Zhu, A. Loefﬂer, A. Diaz-Alvarez, T. Nakayama, and
+Z. Kuncic, “Avalanches and edge-of-chaos learning in neuromorphic
+nanowire networks,” Nature Communications, vol. 12, no. 1, pp. 1–13,
+2021.
+[10] W. Maass, “Networks of spiking neurons: the third generation of neural
+network models,” Neural networks, vol. 10, no. 9, pp. 1659–1671, 1997.
+[11] P. U. Diehl and M. Cook, “Unsupervised learning of digit recognition
+using spike-timing-dependent plasticity,” Frontiers in computational
+neuroscience, vol. 9, p. 99, 2015.
+[12] R. Brette and D. F. Goodman, “Simulating spiking neural networks on
+GPU,” Network: Computation in Neural Systems, vol. 23, no. 4, pp.
+167–182, 2012.
+[13] M. R. Azghadi, C. Lammie, J. K. Eshraghian, M. Payvand, E. Donati,
+B. Linares-Barranco, and G. Indiveri, “Hardware implementation of deep
+network accelerators towards healthcare and biomedical applications,”
+IEEE Transactions on Biomedical Circuits and Systems, vol. 14, no. 6,
+pp. 1138–1159, 2020.
+[14] A. K. Fidjeland and M. P. Shanahan, “Accelerated simulation of spiking
+neural networks using gpus,” in The 2010 International Joint Conference
+on Neural Networks (IJCNN).
+IEEE, 2010, pp. 1–8.
+[15] J. K. Eshraghian, X. Wang, and W. D. Lu, “Memristor-based binarized
+spiking neural networks: Challenges and applications.” IEEE Nanotech-
+nology Magazine, 2022.
+[16] V. Sze, Y.-H. Chen, T.-J. Yang, and J. S. Emer, “Efﬁcient processing of
+deep neural networks: A tutorial and survey,” Proceedings of the IEEE,
+vol. 105, no. 12, pp. 2295–2329, 2017.
+[17] N. P. Jouppi, C. Young, N. Patil, D. Patterson, G. Agrawal, R. Bajwa,
+S. Bates, S. Bhatia, N. Boden, A. Borchers et al., “In-datacenter
+performance analysis of a tensor processing unit,” in Proceedings of the
+44th annual international symposium on computer architecture, 2017,
+pp. 1–12.
+[18] M. E. Elbtity, P. S. Chandarana, B. Reidy, J. K. Eshraghian, and
+R. Zand, “APTPU: Approximate Computing Based Tensor Processing
+Unit,” IEEE Transactions on Circuits and Systems I: Regular Papers,
+2022.
+[19] D. Abts, J. Ross, J. Sparling, M. Wong-VanHaren, M. Baker, T. Hawkins,
+A. Bell, J. Thompson, T. Kahsai, G. Kimmell et al., “Think fast: a tensor
+streaming processor (TSP) for accelerating deep learning workloads,” in
+2020 ACM/IEEE 47th Annual International Symposium on Computer
+Architecture (ISCA).
+IEEE, 2020, pp. 145–158.
+[20] S. M. Bohte, J. N. Kok, and H. La Poutre, “Error-backpropagation
+in temporally encoded networks of spiking neurons,” Neurocomputing,
+vol. 48, no. 1-4, pp. 17–37, 2002.
+[21] A. Paszke, S. Gross, F. Massa, A. Lerer, J. Bradbury, G. Chanan,
+T. Killeen, Z. Lin, N. Gimelshein, L. Antiga et al., “Pytorch: An
+imperative style, high-performance deep learning library,” Advances in
+neural information processing systems, vol. 32, 2019.
+[22] M. Abadi, P. Barham, J. Chen, Z. Chen, A. Davis, J. Dean, M. Devin,
+S. Ghemawat, G. Irving, M. Isard et al., “{TensorFlow}: a system
+for {Large-Scale} machine learning,” in 12th USENIX symposium on
+operating systems design and implementation (OSDI 16), 2016, pp. 265–
+283.
+[23] R. Frostig, M. J. Johnson, and C. Leary, “Compiling machine learning
+programs via high-level tracing,” Systems for Machine Learning, vol. 4,
+no. 9, 2018.
+[24] E. Hunsberger and C. Eliasmith, “Spiking deep networks with LIF
+neurons,” arXiv preprint arXiv:1510.08829, 2015.
+[25] S. B. Shrestha and G. Orchard, “SLAYER: Spike layer error reassign-
+ment in time,” in Proc. of the 32nd Int. Conf. on Neural Inf. Process.
+Syst., 2018, pp. 1419–1428.
+[26] G. Bellec, D. Salaj, A. Subramoney, R. Legenstein, and W. Maass,
+“Long short-term memory and learning-to-learn in networks of spiking
+neurons,” arXiv preprint arXiv:1803.09574, 2018.
+[27] A. Henkes, J. K. Eshraghian, and H. Wessels, “Spiking neural network
+for nonlinear regression,” arXiv preprint arXiv:2210.03515, 2022.
+[28] S. K. Esser, P. A. Merolla, J. V. Arthur, A. S. Cassidy, R. Appuswamy,
+A. Andreopoulos, D. J. Berg, J. L. McKinstry, T. Melano, D. R. Barch
+et al., “Convolutional networks for fast, energy-efﬁcient neuromorphic
+computing,” Proc. of the Nat. Acad. of Sci., vol. 113, no. 41, pp. 11 441–
+11 446, 2016.
+[29] D. Huh and T. J. Sejnowski, “Gradient descent for spiking neural
+networks,” arXiv preprint arXiv:1706.04698, 2017.
+[30] F. Pineda, “Generalization of back propagation to recurrent and higher
+order neural networks,” in Neural information processing systems, 1987.
+[31] P. J. Werbos, “Backpropagation through time: what it does and how to
+do it,” Proceedings of the IEEE, vol. 78, no. 10, pp. 1550–1560, 1990.
+[32] M. Davies, N. Srinivasa, T.-H. Lin, G. Chinya, Y. Cao, S. H. Choday,
+G. Dimou, P. Joshi, N. Imam, S. Jain et al., “Loihi: A neuromorphic
+manycore processor with on-chip learning,” Ieee Micro, vol. 38, no. 1,
+pp. 82–99, 2018.
+[33] G. Orchard, E. P. Frady, D. B. D. Rubin, S. Sanborn, S. B. Shrestha, F. T.
+Sommer, and M. Davies, “Efﬁcient neuromorphic signal processing with
+loihi 2,” in 2021 IEEE Workshop on Signal Processing Systems (SiPS).
+IEEE, 2021, pp. 254–259.
+[34] M. M. Khan, D. R. Lester, L. A. Plana, A. Rast, X. Jin, E. Painkras, and
+S. B. Furber, “Spinnaker: mapping neural networks onto a massively-
+parallel chip multiprocessor,” in 2008 IEEE International Joint Con-
+ference on Neural Networks (IEEE World Congress on Computational
+Intelligence).
+Ieee, 2008, pp. 2849–2856.
+[35] S. B. Furber, F. Galluppi, S. Temple, and L. A. Plana, “The spinnaker
+project,” Proceedings of the IEEE, vol. 102, no. 5, pp. 652–665, 2014.
+[36] R. J. Williams and D. Zipser, “A learning algorithm for continually
+running fully recurrent neural networks,” Neural Comput., vol. 1, no. 2,
+pp. 270–280, 1989.
+[37] C. Frenkel and G. Indiveri, “Reckon: A 28nm sub-mm2 task-agnostic
+spiking recurrent neural network processor enabling on-chip learning
+over second-long timescales,” in 2022 IEEE International Solid-State
+Circuits Conference (ISSCC), vol. 65.
+IEEE, 2022, pp. 1–3.
+[38] G. Bellec, F. Scherr, A. Subramoney, E. Hajek, D. Salaj, R. Legenstein,
+and W. Maass, “A solution to the learning dilemma for recurrent
+networks of spiking neurons,” Nature communications, vol. 11, no. 1,
+pp. 1–15, 2020.
+[39] F. Zenke and T. P. Vogels, “The remarkable robustness of surrogate
+gradient learning for instilling complex function in spiking neural
+networks,” Neural computation, vol. 33, no. 4, pp. 899–925, 2021.
+[40] A. Griewank and A. Walther, Evaluating derivatives: Principles and
+techniques of algorithmic differentiation.
+SIAM, 2008.
+[41] A. Renner, F. Sheldon, A. Zlotnik, L. Tao, and A. Sornborger, “The
+backpropagation algorithm implemented on spiking neuromorphic hard-
+ware,” arXiv preprint arXiv:2106.07030, 2021.
+[42] G. Tang, N. Kumar, I. Polykretis, and K. P. Michmizos, “Biograd: Bio-
+logically plausible gradient-based learning for spiking neural networks,”
+arXiv preprint arXiv:2110.14092, 2021.
+[43] T. H. Cormen and M. T. Goodrich, “A bridging model for parallel com-
+putation, communication, and i/o,” ACM Computing Surveys (CSUR),
+vol. 28, no. 4es, pp. 208–es, 1996.
+[44] J. Langguth, X. Cai, and M. Sourouri, “Memory bandwidth contention:
+Communication vs computation tradeoffs in supercomputers with mul-
+ticore architectures,” in 2018 IEEE 24th International Conference on
+Parallel and Distributed Systems (ICPADS).
+IEEE, 2018, pp. 497–506.
+[45] L. Burchard, J. Moe, D. T. Schroeder, K. Pogorelov, and J. Langguth,
+“ipug: Accelerating breadth-ﬁrst graph traversals using manycore graph-
+core ipus,” in International Conference on High Performance Comput-
+ing.
+Springer, 2021, pp. 291–309.
+
+10
+[46] J. C. Knight, A. Komissarov, and T. Nowotny, “PyGeNN: a Python
+library for GPU-enhanced neural networks,” Frontiers in Neuroinfor-
+matics, vol. 15, p. 659005, 2021.
+[47] J. K. Eshraghian, M. Ward, E. Neftci, X. Wang, G. Lenz, G. Dwivedi,
+M. Bennamoun, D. S. Jeong, and W. D. Lu, “Training spiking
+neural networks using lessons from deep learning,” arXiv preprint
+arXiv:2109.12894, 2021.
+[48] W. Fang, Y. Chen, J. Ding, D. Chen, Z. Yu, H. Zhou, Y. Tian, and
+other contributors, “Spikingjelly,” https://github.com/fangwei123456/
+spikingjelly, 2020, accessed: YYYY-MM-DD.
+[49] H. Hazan, D. J. Saunders, H. Khan, D. Patel, D. T. Sanghavi, H. T.
+Siegelmann, and R. Kozma, “Bindsnet: A machine learning-oriented
+spiking neural networks library in python,” Frontiers in neuroinformat-
+ics, vol. 12, p. 89, 2018.
+[50] C. Pehle and J. E. Pedersen, “Norse - A deep learning library for spiking
+neural networks,” Jan. 2021, documentation: https://norse.ai/docs/.
+[Online]. Available: https://doi.org/10.5281/zenodo.4422025
+[51] J. C. Knight and T. Nowotny, “Efﬁcient GPU training of LSNNs using
+eProp,” in Neuro-Inspired Computational Elements Conference, 2022,
+pp. 8–10.
+[52] P. Dayan and L. F. Abbott, Theoretical neuroscience: Computational
+and mathematical modeling of neural systems.
+MIT press, 2005.
+[53] L. Lapique, “Recherches quantitatives sur l’excitation electrique des
+nerfs traitee comme une polarization.” J. of Physiol. and Pathology,
+vol. 9, pp. 620–635, 1907.
+[54] G. Hinton, N. Srivastava, and K. Sewrsky, “Neural networks for machine
+learning. 2012,” Coursera, video lectures, 2012.
+[55] Y. LeCun, “The mnist database of handwritten digits,” http://yann. lecun.
+com/exdb/mnist/, 1998.
+[56] A. Krizhevsky, G. Hinton et al., “Learning multiple layers of features
+from tiny images,” Technical Reprt, 2009.
+[57] D. P. Kingma and J. Ba, “Adam: A method for stochastic optimization,”
+arXiv preprint arXiv:1412.6980, 2014.
+[58] G.-q. Bi and M.-m. Poo, “Synaptic modiﬁcations in cultured hip-
+pocampal neurons: dependence on spike timing, synaptic strength, and
+postsynaptic cell type,” Journal of neuroscience, vol. 18, no. 24, pp.
+10 464–10 472, 1998.
+[59] N. Perez-Nieves, V. C. Leung, P. L. Dragotti, and D. F. Goodman,
+“Neural heterogeneity promotes robust learning,” Nature communica-
+tions, vol. 12, no. 1, pp. 1–9, 2021.
+[60] S. Zagoruyko and N. Komodakis, “Wide residual networks,” arXiv
+preprint arXiv:1605.07146, 2016.
+

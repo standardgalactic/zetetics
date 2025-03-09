@@ -1,0 +1,1819 @@
+arXiv:1410.7455v8  [cs.NE]  22 Jun 2015
+Accepted as a workshop contribution at ICLR 2015
+PARALLEL TRAINING OF DNNS WITH NATURAL GRA-
+DIENT AND PARAMETER AVERAGING
+Daniel Povey, Xiaohui Zhang & Sanjeev Khudanpur
+Center for Language and Speech Processing & Human Language Technology Center of Excellence,
+The Johns Hopkins University, Baltimore, MD 21218, USA
+{dpovey@gmail.com}, {xiaohui,khudanpur@jhu.edu}
+ABSTRACT
+We describe the neural-network training framework used in the Kaldi speech
+recognition toolkit, which is geared towards training DNNs with large amounts
+of training data using multiple GPU-equipped or multi-core machines. In order to
+be as hardware-agnostic as possible, we needed a way to use multiple machines
+without generating excessive network trafﬁc. Our method is to average the neural
+network parameters periodically (typically every minute or two), and redistribute
+the averaged parameters to the machines for further training. Each machine sees
+different data. By itself, this method does not work very well. However, we have
+another method, an approximate and efﬁcient implementation of Natural Gradient
+for Stochastic Gradient Descent (NG-SGD), which seems to allow our periodic-
+averaging method to work well, as well as substantially improving the conver-
+gence of SGD on a single machine.
+1
+INTRODUCTION
+Parallel training of neural networks generally makes use of some combination of model parallelism
+and data parallelism (Dean et al., 2012), and the normal approach to data parallelism involves com-
+munication of model parameters for each minibatch. Here we describe our neural-net training frame-
+work which uses a different version of data parallelism: we have multiple SGD processes on separate
+machines, and only infrequently (every minute or so) average the model parameters and redistribute
+them to the individual machines. This is very effective for us for large-scale training of systems
+for speech recognition– but in our case it only works well when combined with an efﬁcient imple-
+mentation of natural gradient stochastic gradient descent (NG-SGD) that we have developed. We
+don’t attempt in this paper to develop a framework that explains why parameter averaging should
+work well despite non-convexity of DNNs, or why NG-SGD is so helpful. The point of this paper
+is to describe our methods and to establish that empirically they work well. The signiﬁcance of this
+work is that we show that it is possible to get a linear speedup when increasing the number of GPUs,
+without requiring frequent data transfer (however, this only holds up to about 4 or 8 GPUs).
+In Section 2 we describe our problem setting, which is Deep Neural Networks (DNNs) applied to
+speech recognition– although our ideas are more general than this. In Section 3 we introduce the
+parallel training method. In Section 4 we describe the general ideas behind our natural gradient
+method, although most of the technical details have been relegated to appendices. In this paper we
+don’t give any proofs, but we do discuss in Section 5 what we think we can and can’t be proven
+about our methods. Section 6 has experiments on the convergence of SGD with and without natural
+gradient and parallelism. We conclude in Section 7.
+There are two versions of our NG-SGD method: a “simple” version and an “online” one. Technical
+details for these are in Appendices A and B respectively. Appendix C has background information
+on our DNN implementation.
+2
+PROBLEM SETTING
+When training DNNs for speech recognition, the immediate problem is that of classifying vectors
+x ∈RD as corresponding to discrete labels y ∈Y. The dimension D is typically several hundred,
+1
+
+Accepted as a workshop contribution at ICLR 2015
+with x being derived from short-time spectral properties of the acoustic signal; and Y corresponds
+to clustered HMM states of context-dependent phones, |Y| ≃5000 being typical. Each (x, y)
+pair corresponds to a single frame of speech data; frames are typically extracted at the rate of 100
+per second, with a duration of 25 milliseconds, and x contains spectral information from several
+adjacent frames spliced together (Seide et al., 2011b). We are ultimately not just interested in the
+top y on each frame, but in the log-probabilities log p(y|x) for all y, since we will use them as
+costs in a Viterbi search for a path corresponding to the most likely word sequence. The objective
+function for training is the sum, over all frames of training data, of the log-probability of y given
+x: P
+i log p(yi|xi). Since we are maximizing this, our use of the term SGD is of course a slight
+misnomer; it is gradient ascent. The supervision labels y are derived from a Viterbi alignment of a
+Hidden Markov Model (HMM) derived from the reference word sequence of each training utterance.
+3
+SGD WITH PARAMETER AVERAGING
+3.1
+PARAMETER-AVERAGING OVERVIEW
+The parameter-averaging aspect of our training is quite simple. We have N machines (e.g. N = 4)
+each doing SGD separately with different randomized subsets of the training data, and we allow
+their parameters to gradually diverge. After each machine has processed a ﬁxed number of samples
+K (typically K = 400 000), we average the parameters across all the jobs and re-distribute the
+result to the machines. (In practice we do this by spawning new jobs in GridEngine or in whatever
+job management system we are using). This is repeated until we have processed all the data for a
+speciﬁed number of epochs, e.g. 10.
+We deﬁne an outer iteration of training as the time it takes for each job to process K training
+examples. The number of outer iterations per epoch depends on K and the quantity of training data.
+We ﬁnd it useful to deﬁne the effective learning rate of the parallel SGD procedure as the learning
+rate ηt being used by the individual jobs, divided by the number of jobs N. As we increase the
+number of jobs N, in order to get a linear speed up we need to increase the learning rate proportional
+to N so that the effective learning rate stays the same. The concept is that when we do the parameter
+averaging, the parameter update from any individual SGD job gets diluted N-fold.
+The reason why we set this up as parameter-averaging instead of summing the parameter changes
+from the respective jobs, is out of concern for stability. Imagine there is some direction in parameter
+space where the Hessian is large enough (and our learning rate large enough) that stochastic gradient
+descent nearly reaches equilibrium after processing K samples. If there are, say, 4 jobs, then after
+processing K examples and summing the parameter changes, the parameters end up not close to the
+equilibrium value but off in the opposite direction and 3 times farther away than at the start. It is
+clear that this would lead to divergence.
+3.2
+OTHER ASPECTS OF OUR SGD IMPLEMENTATION
+At this point we provide some more details of other relevant features of our SGD implementation,
+namely the learning rate schedule and the way we enforce a maximum parameter change to prevent
+divergence.
+There are some other, less directly relevant issues which we have relegated to Appendix C: namely,
+CPU versus GPU-based SGD (C.1); data randomization issues (C.2); generalized model averag-
+ing (C.4); mixture components a.k.a. sub-classes (C.5); input data normalization (C.6); parameter
+initialization (C.7); sequence training (C.8); and online decoding with i-vectors (C.9).
+3.2.1
+LEARNING RATE SCHEDULE
+It was found in (Senior et al., 2013) that when training DNNs for speech recognition, an exponen-
+tially decreasing learning rate works well, and we independently found the same thing. We generally
+use a learning rate that decreases by a factor of 10 during training, on an exponential schedule. Un-
+less mentioned otherwise, for experiments reported here the learning rate starts at 0.01 and ends at
+0.001. We specify the number of epochs in advance; it is typically a number in the range 4 to 20 (if
+we have more data, we train for fewer epochs).
+2
+
+Accepted as a workshop contribution at ICLR 2015
+Note that while in the experiments presented here we did not separately tune the learning rate sched-
+ule for SGD and NG-SGD (we just used values which had worked well in the past for NG-SGD), we
+have done extensive experiments in the past, on smaller setups, where the learning rate schedule was
+tuned independently; and in all circumstances we found NG-SGD to be helpful. It was not feasible
+to repeat those experiments on a large-scale setup.
+3.2.2
+MAXIMUM PARAMETER CHANGE
+A common pathology when doing SGD for deep learning is that during training, the parameters
+will suddenly start getting very large and the objective function will go to negative inﬁnity. This
+is known as parameter divergence. The normal solution is to decrease the learning rate and start
+the training again, but this is a very inconvenient. To avoid this pathology, we modiﬁed the SGD
+procedure to enforce a maximum parameter change per minibatch. This limit tends to be active only
+early in training, particularly for layers closer to the output. We have provided further details on this
+in Appendix C.3.
+4
+NATURAL GRADIENT FOR SGD
+In this section we describe our natural-gradient modiﬁcation to SGD, in which we scale the gradients
+by a symmetric positive deﬁnite matrix that is an approximation to the inverse of the Fisher matrix.
+Technically speaking, Natural Gradient means taking a step along the gradient of a Riemannian
+parameter surface, which follows a curving path in conventional parameter space and which is ex-
+tremely hard to compute. However, previous work (Yang & Amari, 1998; Roux et al., 2007) has used
+the term “Natural Gradient” to describe methods like ours which use an an approximated inverse-
+Fisher matrix as the learning rate matrix, so we follow their precedent in calling our method “Natural
+Gradient”.
+4.1
+WE CAN REPLACE THE SCALAR LEARNING RATE IN SGD WITH A MATRIX
+In SGD, the learning rate is often assumed to be a scalar ηt, decreasing with time, and the update
+equation is something like
+θt+1 = θt + ηtgt
+where gt is the objective-function gradient sampled on time t (e.g. computed from a training sample
+or a minibatch). However, it is possible to replace this scalar with a symmetric positive deﬁnite
+matrix, and we can write instead:
+θt+1 = θt + ηtEtgt
+(1)
+with Et the matrix component of learning-rate; it is more convenient for proofs to keep ηt separate
+rather than absorbing it into Et. It acceptable for Et to be random: if we can bound the eigenvalues
+of Et above and below, by positive constants known in advance, and Et and gt are independently
+sampled given the parameter θ, then we can prove convergence under the same kinds of conditions
+as if we were using a scalar learning rate (Bottou, 1998, Sec. 4.2.2)
+In general, the learning-rate matrix should not be a function of the data sample which we are cur-
+rently processing, or it may prevent convergence to a local optimum. As an example of this, a matrix
+that was systematically smaller for a particular type of training data would clearly bias the learning
+by downweighting that data.
+4.2
+THE INVERSE FISHER MATRIX IS A SUITABLE LEARNING-RATE MATRIX
+There are reasons from statistical learning theory, related to the Natural Gradient idea (Amari, 1998),
+why we may want to set the learning-rate matrix Et to the inverse of the Fisher information matrix.
+See for example, (Murata & Amari, 1999) and (Roux et al., 2007). The Fisher matrix is most directly
+deﬁned for situations where we are learning a distribution, as opposed to classiﬁcation problems
+such as the current one. Suppose x, which may be discrete or continuous, is the variable whose
+distribution we are modeling, and f(x; θ) is the probability or likelihood of x given parameters θ,
+then the Fisher information matrix I(θ) is deﬁned as the expected outer product (second moment)
+3
+
+Accepted as a workshop contribution at ICLR 2015
+of the derivative of the log-probability w.r.t. the parameters, i.e. of
+∂
+∂θ log f(x; θ).
+This derivative is called the “score” in information theory. Part of the justiﬁcation for this use of the
+Fisher matrix is that, under certain conditions, the Fisher matrix is identical to the Hessian; and it is
+obvious why the inverse Hessian would be a good gradient descent direction. These conditions are
+quite stringent, and include that the model is correct and θ is at the value corresponding to the true
+data distribution; but even if these conditions do not apply, the Fisher information matrix is in some
+sense “dimensionally” the same as the Hessian– that is, it transforms the same way under changes
+of parameterization– so its inverse may still be a good choice of learning-rate matrix.
+It is quite easy to generalize the notion of the Fisher matrix to a prediction task p(y; x, θ). We write
+p(y, x; θ) = q(x)p(y; x, θ) for a data distribution q(x) that we assume to be independently known
+(and not a function of θ). It is not hard to see that the score equals just
+∂
+∂θ log f(x; y, θ); since
+q(x) does not depend on θ, there is no additional term involving q(x). The expectation that we take
+when computing the Fisher matrix is taken over the joint distribution of x and y. This argument also
+appears in (Roux et al., 2007, Section 3).
+Still more generally, we can compute a quantity that is analogous to Fisher matrix for any objective
+function, even one that does not represent a log-probability or log-likelihood; and we will still have
+a matrix that transforms in the same way as the Hessian under changes of variables - i.e. its inverse
+may still be a reasonable choice for a learning-rate matrix.
+4.3
+WE NEED TO APPROXIMATE THE FISHER MATRIX IN PRACTICE
+For large-scale problems, such as DNNs for speech recognition with millions of parameters, even
+one inversion of the Fisher matrix is impractical because it would take time O(n3) in the parameter
+dimension. However, it may be practical to deal with factored forms of it. There has been previous
+literature on this. In (Roux et al., 2007), the Fisher matrix was divided into diagonal blocks and
+each block was approximated by a low-rank matrix. The idea of diagonal blocks was also explored
+in (Bastian et al., 2011), with one block per weight matrix; our approach uses the same idea. In the
+unpublished manuscript (Yang & Amari, 1997) (some of the material in which was later published
+in (Yang & Amari, 1998)), the authors attempted to show analytically that under certain quite strong
+assumptions, the Fisher matrix for a single-hidden-layer neural network has the form of a Kronecker
+product. Although we are interested in more general networks than they considered, the Kronecker
+product does also appear in our factorization of the Fisher matrix.
+We should note that there are ways to use Natural Gradient without factorizing the Fisher information
+matrix, if one is willing to accept a signiﬁcantly increased time per iteration. See for example (Pas-
+canu & Bengio, 2013), which uses a truncated Newton method to approximate multiplication by the
+inverse of the Fisher matrix.
+4.4
+OUR FACTORIZATION OF THE FISHER MATRIX
+Our factored form of the Fisher matrix is as follows: given a neural network with I weight matrices,
+we divide the Fisher matrix into I diagonal blocks, one for each weight matrix. Consider the i’th
+diagonal block of the Fisher matrix, corresponding to the parameters of a weight matrix Wi, and
+assume that there is no separate bias term (we can append a 1 to the inputs and include the bias term
+in the weight matrix). The i’th block of the Fisher matrix is a Kronecker product of two symmetric
+positive deﬁnite matrices: Ai, whose dimension is the output (row) dimension of Wi, and Bi,
+whose dimension is the input (column) dimension of Wi. We further factorize the matrices Ai and
+Bi as a low-rank symmetric matrix plus a multiple of the identity matrix. We write the approximated
+Fisher matrix in the form
+F = diag (A1 ⊗B1, A2 ⊗B2, . . . , AI ⊗BI)
+(2)
+where Ai and Bi are each factorized in the form λI+XXT . The order in which Ai and Bi appear in
+the Kronecker product depends on the way in which we vectorize the weight matrices– row-wise or
+column-wise. In practice we don’t ever deal explicitly with these Kronecker products or vectorized
+weight matrices in the algorithm, so this choice doesn’t matter. It is not hard to show that if the
+Fisher matrix can be factored this way, then its inverse can be factored the same way.
+4
+
+Accepted as a workshop contribution at ICLR 2015
+4.5
+HOW WE ESTIMATE THE FISHER MATRIX
+We have two different methods for estimating the factorized Fisher matrix:
+• Simple method: We estimate the Fisher matrix from the other samples in the minibatch we
+are currently training on, holding out the current sample to avoid bias. This can be done
+surprisingly efﬁciently. Details are in Appendix A.
+• Online method: We estimate the Fisher matrix from all previous minibatches, using a
+forgetting factor to downweight minibatches that are distant in time. Details are in Ap-
+pendix B.
+We generally use the online method as it is signiﬁcantly faster on GPUs and usually seems to lead to
+faster learning, probably due to the less noisy estimate of the Fisher matrix. We describe the simple
+method because it is easier to understand and helps to motivate the online method.
+4.6
+OPERATION ON VECTORS
+Although we describe our Fisher matrix as as a Kronecker product, we do not have to explicitly
+construct this product in our code.
+Suppose that we process the training examples one at a time. The SGD update for the i’th weight
+matrix is:
+Wti = Wt−1,i + ηtxtiyT
+ti
+where xti is the derivative of the objective function w.r.t. output of the i’th weight matrix computed
+at the current sample, and yti is the input that the weight matrix acts on. These quantities naturally
+occur in backpropagation.
+In our natural gradient method, this is modiﬁed as follows:
+Wti = Wt−1,i + ηtA−1
+ti xtiyT
+tiB−1
+ti ,
+where Ati and Bti are factors of the Fisher matrix. It is easy to show that this is equivalent to mul-
+tiplying the parameter step by the inverse of the Fisher matrix formed from the A and B quantities
+as in Equation (2).
+4.7
+OPERATION ON MINIBATCHES
+Rather than processing training examples one at a time, we process them in minibatches (e.g. 512 at
+a time). Instead of vector-valued derivatives xti and inputs yti, we now have matrices Xti and Yti,
+each row of which corresponds to one of the x or y quantities (t is now the index for the minibatch).
+The update is now as follows:
+Wti = Wt−1,i + ηtXT
+tiYti
+(3)
+and note that unlike some authors, we don’t divide the gradients by the minibatch size– this makes
+it easier to tune the minibatch size and learning rate independently. The update now has the form
+Wti = Wt−1,i + ηt ¯XT
+ti ¯Yti,
+(4)
+with the bar indicating modiﬁed X and Y quantities. In the online version of our natural gradient
+method, we can write these as:
+¯Xti = XtiA−1
+ti
+(5)
+¯Yti = YtiB−1
+ti ,
+(6)
+but in the simple method, because the A and B matrices are estimated from the other elements in
+the minibatch, we can’t write it this way– it is a separate matrix multiplication for each row of X
+and Y– but it can still be computed efﬁciently; see Appendix A.
+In programming terms, we can describe the interface of the core natural-gradient code as follows:
+• Simple method: Given a minibatch of vectors Xti with each row being one element of the
+minibatch, estimate the Fisher-matrix factors by holding out each sample, do the multipli-
+cation by their inverses, and return the modiﬁed vectors ¯Xti.
+5
+
+Accepted as a workshop contribution at ICLR 2015
+• Online method: Given a minibatch of vectors Xti and a previous Fisher-matrix factor
+At−1,i, compute ¯Xti = XtiA−1
+t−1,i and the updated Fisher-matrix factor Ati.
+The interface of the natural gradient code works the same with the Y and B quantities, as with X
+and A. We call the interface above 2I times for each minibatch: twice for each weight matrix in the
+network.
+4.8
+SCALING THE FACTORS
+In both natural gradient methods, we want to prevent the Fisher-matrix multiplication from affecting
+the overall magnitude of the update very much, compared with the step-sizes in standard SGD. There
+are several reasons for this:
+• Early in training, the x and y quantities may be very small or zero, leading to huge or
+inﬁnite inverse-Fisher matrices.
+• The conventional convergence-proof techniques require that the matrix component of the
+learning rate matrix should have eigenvalues bounded above and below by constants known
+in advance, which we cannot guarantee if we use an unmodiﬁed Fisher matrix.
+• Empirically, we have found that it is hard to prevent parameter divergence if we use the
+real, un-scaled Fisher matrix.
+Our method is to scale the ¯Xti and ¯Yti quantities so that they have the same Frobenius norm as the
+corresponding inputs Xti and Yti. We will introduce notation for this in the Appendices.
+This scaling introduces a slight problem for convergence proofs. The issue is that each sample can
+now affect the value of its own learning-rate matrix (via the scalar factor that we use to rescale the
+matrices). As we mentioned before, it is not permissible in general to use a per-sample learning rate
+that is a function of the sample itself. However, we don’t view this as a practical problem because
+we never use a minibatch size less than 100, so the resulting bias is tiny.
+4.9
+SMOOTHING THE FISHER MATRIX FACTORS WITH THE IDENTITY
+In both versions of NG-SGD, we smooth our estimates of the factors of the Fisher matrix by adding a
+multiple of the identity matrix before inverting them. In the simple method this is necessary because
+in general the Fisher matrix estimated from the minibatch will not be full rank. In the online method
+it is not strictly necessary because we deal with a factorization of the Fisher matrix that already
+contains a multiple of the unit matrix, but we found that by adding an additional multiple of the unit
+matrix, as for the simple method, we can improve the convergence of the SGD training. In both
+cases the smoothing is of the following form. If S ∈RD×D is a Fisher matrix factor estimated
+directly from data as the uncentered covariance of the x or y quantities, then instead of using S as
+the Fisher-matrix factor A or B, we use instead S + βI, where
+β = α
+D max(tr (S), ǫ)
+(7)
+where ǫ = 10−20 is used to stop the smoothed S from ever being exactly zero. That is, we smooth
+the Fisher with the identity matrix scaled by α times the average diagonal element of S. We found
+in tuning experiments that the relatively large value α = 4 is suitable under a wide range of circum-
+stances, for both the simple and online methods, and even for settings where the noise in S should
+not be a big problem– e.g. for large minibatch sizes. Our interpretation is that when α is fairly large,
+we are using a smaller than normal learning rate only in a few directions where the x or y quantities
+have quite high covariance, and a relatively constant learning rate in all the remaining directions.
+5
+COMMENTS ON THE THEORY
+Although this is not a theoretical paper, we would like to say what we think is, and is not, possible
+to prove about our methods.
+6
+
+Accepted as a workshop contribution at ICLR 2015
+5.1
+OUR FACTORIZATION OF THE FISHER MATRIX
+If we assume that the distribution of the x and y quantities is Gaussian and independent (between
+x and y for a single layer, and between layers), then it should not be hard to show that the Fisher
+matrix has the form of (2), where the Ai and Bi quantities correspond to the uncentered covariances
+of the x and y quantities, and that the inverse-Fisher has the same form, with the A−1
+i
+replacing Ai
+and B−1
+i
+replacing Bi.
+Of course these conditions won’t hold in practical deep learning applications, but we do believe
+that it’s a reasonable factorization. One could try to show this experimentally as follows, given a
+task. One could make a linear change of variables to make our approximated Fisher matrix equal the
+unit matrix, and then try to measure the eigenvalue distribution of the full Fisher matrix in the new
+co-ordinates. We believe that the eigenvalue distribution of the transformed Fisher matrix would
+probably be much more closerly centered around 1 than before the change of variables. Since our
+motivation for the work published here is a practical one, so we have not allocated effort towards
+this type of experiment.
+5.2
+THE CONVERGENCE OF OUR NG-SGD PROCEDURE
+Regarding the convergence of SGD using our factored-Fisher learning rate matrices, the most we
+think is easily provable is that a slightly modiﬁed form of this method would converge under similar
+conditions to unmodiﬁed SGD.
+The smoothing with constant α > 0 can give us a bound on the ratio of the largest to smallest
+eigenvalues of the A and B factors; using this together with the rescaling of Section 4.8, we can
+bound from above and below the eigenvalues of the rescaled A and B factors. By multiplying these
+together, we can get lower and upper bounds on the eigenvalues of the overall inverse-Fisher matrix
+that we use as the learning-rate matrix Et.
+It is necessary for the Fisher matrix to be randomly chosen independent of the identity of the current
+sample. Unfortunately this is not quite true due to the rescaling being done at the minibatch level;
+we mentioned in Section 4.8 that this would be a problem for proofs. As mentioned, it would be easy
+to use the rescaling factor from the previous minibatch; this gives us back the independence, but at
+the cost of no longer having such easy bounds on the upper and lower eigenvalues of the rescaled
+A and B factors. Alternately, one could keep the algorithm as it is and try to prove instead that the
+parameter value we converge to will not differ very much in some sense from an optimum of the
+true objective function, as the minibatch size gets large.
+5.3
+ONLINE UPDATE OF A LOW-RANK COVARIANCE MATRIX
+There might be some interesting things to say about our online natural gradient method, described
+in Appendix B, in which estimate the uncentered covariance matrices A and B in a factored form as
+λI + XXT . Our online estimation of the covariance matrices involves multiplying X by a weighted
+combination of (a) the observed covariance matrix from the current minibatch, and (b) the previous
+value of our factored approximation to it; it is like a matrix version of the power method (Del Corso,
+1997).
+Probably the analysis would have to be done initially in the steady state (i.e. assuming the parameter
+vector θ is constant). If in addition we assume inﬁnite minibatch size so that the covariance matrix
+equals its expected value, we are conﬁdent that we could show that the only stable ﬁxed point of our
+update equations gives us in some suitable sense the closest approximation to the covariance; and,
+with a little more effort, that our updates will converge with probability 1 to that best approximation.
+The analysis for ﬁnite minibatch size would have to involve different methods. Because of the noise
+and the ﬁnite forgetting factor, we would never converge to the true value; but it might be possible
+to deﬁne some objective function that measures some kind of goodness of approximation, and then
+say something about the convergence of the distribution of that objective function.
+7
+
+Accepted as a workshop contribution at ICLR 2015
+5.4
+INTERACTION WITH OTHER METHODS
+We would like to touch on the subject of some other popular modiﬁcations of SGD, to explain why
+we do not use them in our experiments.
+One frequently used modiﬁcation to SGD is momentum (Polyak, 1964). This can be helpful in pre-
+venting parameter divergence, as momentum allows SGD to use a higher effective learning rate be-
+fore parameter divergence is encountered. The original reason why none of our experiments involve
+momentum is that we found it quite hard to successfully incorporate momentum into multi-threaded
+parameter updates, needed for the CPU version of our training method; this is likely to be the reason
+why Downpour (Dean et al., 2012) does not use momentum. We developed other methods to prevent
+instability– namely, the limit on parameter change per layer per minibatch (Appendix C.3); and the
+natural gradient method itself.
+Another popular modiﬁcation of SGD is Adagrad (Hazan et al., 2007). This method divides the
+learning rate for each parameter by the standard deviation of the sum of gradients for that parameter,
+averaged over time (from the beginning of optimization until the present). This naturally gives the
+1/t learning rate schedule that is believed from theory to be optimal (Kushner & Yin, 2003), as well
+as giving separate learning rates for each diagonal element. There are two reasons why we felt that
+Adagrad was very unlikely to be helpful for large-scale speech recognition. Firstly, a 1/t learning
+rate has been found empirically be inferior to an exponentially decaying learning rate (Senior et al.,
+2013). Secondly, because our p-norm nonlinearities (Zhang et al., 2014) are non-saturating we don’t
+believe that our networks are susceptible to the kind of pathologies that would make some neurons
+in a layer require higher learning rates than others. This is also true between different hidden layers,
+due to special properties of the p-norm networks that we use here1. Essentially, we have reason to
+believe that as far as some directions requiring higher learning rates than others is concerned, all
+the interesting action for our particular type of network is “off the diagonal”– that is, it cannot be
+captured by a diagonal matrix. That is why we have not investigated Adagrad and why we smooth
+our estimates of the factors of the Fisher matrix to the identity and not to a diagonal matrix2.
+6
+EXPERIMENTS
+We show experiments on a speech recognition setup called Fisher English3, which is English-
+language conversational telephone speech, sampled at 8kHz, and transcribed in a quick but rela-
+tively low-quality way. The total amount of training data is 1600 hours (only including transcribed
+segments, i.e. not the silent other half of the telephone conversation). We test on a held-out subset
+of the data, about 3.3 hours long, that we deﬁned ourselves.
+6.1
+SYSTEM DETAILS AND WORD ERROR RATE PERFORMANCE
+Table 1: Word Error Rates (Fisher dev set)
+Model
+%WER
+GMM
+31.07
+DNN1
+23.66
+DNN2
+23.79
+Our main results are convergence plots, but to give the reader some idea of the ultimate results in
+Word Error Rate, we show some results in Table 1. The Word Error Rates may seem on the high
+1The detailed argument in involves scale invariance of the network output w.r.t. the parameters for each
+layer; an invariance of the learning procedure with respect to scaling up the parameters for a layer and scaling
+up the learning rate at the same time; and the notion that parameters in a layer will tend to grow in size due to
+parameter noise, if the learning rate is too high
+2Actually, there is another reason for this. We have previously derived an efﬁcient online update of a
+factored Fisher matrix that had a low-rank plus diagonal form (work with Oriol Vinyals, not published), and
+the diagonal term caused the math to become very signiﬁcantly more complicated.
+3Linguistic Data Consortium (LDC) catalog numbers LDC2004S13, LDC2005S13, LDC2004T19 and
+LDC2005T19
+8
+
+Accepted as a workshop contribution at ICLR 2015
+side, but this is mainly due to the difﬁculty of the data and the quick transcription method used on
+this data.
+The GMM system is based on MFCC features, spliced across ±3 frames and processed with
+LDA+MLLT to 40-dimensional features, then adapted with feature-space MLLR (fMLLR) in both
+training and test time. See (Povey et al., 2011) for an explanation of these terms and the normal
+system build steps. All these systems used the same phonetic context decision tree with 7 880
+context-dependent states; the GMM system had 300 000 Gaussians in total.
+The DNN1 system uses speaker adapted features from the GMM system, so it requires a ﬁrst pass
+of GMM decoding and adaptation. The 40-dimensional features from GMM1 are spliced across ±4
+frames of context and used as input to the DNN. DNN1 is a p-norm DNN (Zhang et al., 2014) with 5
+hidden layers and p-norm (input, output) dimensions of (5000, 500) respectively, i.e. the nonlinearity
+reduces the dimension tenfold. We use 15 000 “sub-classes” (see Section C.5 for explanation), and
+the number of parameters is 19.3 million. It is trained for 12 epochs with learning rate varying from
+0.08 to 0.008, trained with 8 parallel jobs with online natural gradient SGD (NG-SGD). For both this
+and the DNN2 system, we trained with K = 400 000 samples per outer iteration for each machine.
+The DNN2 system is trained for our online decoding setup (see Appendix C.9), which is geared to-
+wards applications where reduced latency is important and audio data must be processed strictly
+in the order it is received.
+The input features are equivalent to unadapted, un-normalized 40-
+dimensional log-mel ﬁlterbank features, spliced for ±7 frames, plus a 100-dimensional i-vector
+representing speaker characteristics, extracted from only the speaker’s audio up to and including
+the current time. For the results shown here, we include previous utterances of the same speaker in
+the same conversation when computing the i-vector. Because this system is intended for real-time
+decoding on a single CPU, we limit the number of parameters by using only 4 hidden layers, p-norm
+(input, output) dimensions of (350, 3500), and 12 000 sub-classes, for a total of 10.4 million param-
+eters. It was trained using online NG-SGD with 6 parallel jobs for 5 epochs, with the learning rate
+decreasing exponentially from 0.01 to 0.001. All our experiments below are based on this setup.
+Our server hardware is fairly typical: the majority of them are Dell PowerEdge R720 servers with
+two Intel Xeon E5-2680v2 CPUs having with 10 cores each, running at 2.8GHz; and with a single
+NVidia Tesla K10 GPU card, providing two GPUs– each GPU corresponds to a single machine in
+our notation, and it becomes incidental that they are co-located. We also have some similar machines
+with K20 GPU cards, and when reporting time taken, we report the slightly more optimistic ﬁgures
+obtained from running the same jobs on the faster K20 GPUs.
+6.2
+RESULTS
+Our main result is in Figure 1a (best viewed in color), where we plot the objective function versus
+amount of training data processed, for our parallel training method with and without natural gradient,
+and with 1, 2, 4, 8 and 16 jobs. In order to keep the effective learning rate (Section 3.1) constant,
+we make the initial/ﬁnal learning rates proportional to the number of jobs, with the default learning
+rates of 0.01 to 0.001 corresponding to the 6-job case.
+Our natural gradient method always helps– the NG-SGD curves are all above the plain-SGD curves.
+Also, when using online natural-gradient, the curves shown in Figure 1a are close to each other up
+to about 4 jobs– i.e. after processing the same amount of data with different numbers of jobs we get
+about the same objective function; however, the 8- and 16-job runs converge a little slower. Thus,
+for small N we are getting a linear speed up in the number N of machines, because the time taken
+per epoch is proportional to 1/N. As N gets larger than around 4 we need more epochs to get the
+same improvement, so the speedup becomes sub-linear. The plot also shows that the simple and
+online natural gradient converge about the same (only tested with one job). We show the ﬁnal Word
+Error Rates in Table 2; with NG-SGD, they are not very sensitive to the number of jobs.
+Figure 1b shows the same plots as Figure 1a but with time as the x-axis. This is a simulated clock
+time, obtained by multiplying the time taken for each “outer iteration” of training, by the number
+of outer iterations; the actual clock time depends on queue load. The time per outer iteration was
+88 seconds for plain SGD, 93 seconds for online NG-SGD, and 208 seconds for plain NG-SGD, all
+measured on a K20 GPU. The circles mark the end of training, after 5 epochs.
+9
+
+Accepted as a workshop contribution at ICLR 2015
+0
+1
+2
+3
+4
+5
+−3.6
+−3.4
+−3.2
+−3
+−2.8
+−2.6
+−2.4
+Epochs
+Training objective function
+ 
+ 
+Simple NG−SGD, 1 job
+Online NG−SGD, 1 job
+Online NG−SGD, 2 jobs
+Online NG−SGD, 4 jobs
+Online NG−SGD, 8 jobs
+Online NG−SGD, 16 jobs
+Plain SGD, 1 job
+Plain SGD, 2 jobs
+Plain SGD, 4 jobs
+(a) Objective function vs. epochs
+0
+50
+100
+150
+200
+250
+−3.6 
+−3.4 
+−3.2 
+−3   
+−2.8 
+−2.6 
+−2.4 
+Time (hours)
+Training objective function
+ 
+ 
+Online NG−SGD, 16 jobs
+Online NG−SGD, 8 jobs
+Online NG−SGD, 4 jobs
+Online NG−SGD, 2 jobs
+Online NG−SGD, 1 job
+Simple NG−SGD, 1 job
+Plain SGD, 1 job
+Plain SGD, 2 jobs
+Plain SGD, 4 jobs
+(b) Objective function vs. time
+Figure 1: Convergence of training objective function (log-probability)
+Table 2: Performance in %WER
+#jobs N
+1
+2
+4
+8
+16
+Plain SGD
+23.63 23.93 24.87
+Simple NG-SGD 23.16
+Online NG-SGD 23.19 23.00 22.84 23.12 23.35
+7
+CONCLUSIONS
+We have described an efﬁcient Natural Gradient version of SGD training (NG-SGD). We have shown
+experimentally that not only does the method improve the convergence versus plain SGD, it also
+10
+
+Accepted as a workshop contribution at ICLR 2015
+makes it possible for us to to use a data parallelization method where we periodically average and
+redistribute parameters across multiple SGD runs. This enables us to train in parallel even on ma-
+chines that lack fast interconnections. Although we only show results from one setup, we are conﬁ-
+dent based on past experience that it holds true for other types of neural network (e.g. ReLU Maas
+et al. (2013) or sigmoid activations) and improves our ﬁnal results (Word Error Rate) as well as
+convergence speed.
+We do not have a very good explanation why our parallel training method only works when using
+Natural Gradient, except to say that the statements in (Pascanu & Bengio, 2013) that NG prevents
+large parameter steps and is more robust to reorderings of the training set, may be relevant.
+ACKNOWLEDGEMENTS
+We would like to thank Karel Vesely, who wrote the original “nnet1” neural network training code
+upon which the work here is based; Ehsan Variani and Pegah Ghahremani for their work on CUDA
+kernels; Hagen Soltau, Oriol Vinyals and Steven Eliuk for fruitful discussions; and many others,
+too numerous to mention, who have contributed to some aspect of the neural net setup and to Kaldi
+more generally.
+The authors were supported by DARPA BOLT contract No HR0011-12-C-0015, and IARPA BA-
+BEL contract No W911NF-12-C-0015. We gratefully acknowledge the support of Cisco Systems,
+inc. (grant #574560) and Google, Inc. (Award 2012 R2 106, “Deep Neural Networks for Speech
+Recognition”), funds which were used to buy computer equipment and cloud computing time that
+were used in the development of these methods.
+The U.S. Government is authorized to reproduce and distribute reprints for Governmental purposes
+notwithstanding any copyright annotation thereon. The views and conclusions contained herein are
+those of the authors and should not be interpreted as necessarily representing the ofﬁcial policies or
+endorsements, either expressed or implied, of DARPA, IARPA, DoD/ARL or the U.S. Government.
+REFERENCES
+Amari, Shun-Ichi. Natural gradient works efﬁciently in learning. Neural Computation, 10:251–276,
+1998.
+Bacchiani, Michiel. Rapid adaptation for mobile speech applications. In Acoustics, Speech and
+Signal Processing (ICASSP), 2013 IEEE International Conference on, pp. 7903–7907. IEEE,
+2013.
+Bahl, L Brown, de Souza, P, and P Mercer, R. Maximum mutual information estimation of hidden
+markov model parameters for speech recognition. Acoustics, Speech, and Signal Processing,
+IEEE International Conference on ICASSP’86., 1986.
+Bastian, Michael R, Gunther, Jacob H, and Moon, Todd K. A simpliﬁed natural gradient learning
+algorithm. Advances in Artiﬁcial Neural Systems, 2011:3, 2011.
+Bengio, Y., Ducharme, R., Vincent, P., and Jauvin, C. A neural probabilistic language model. JMLR,
+3:1137–1155, 2003.
+Bottou, L´eon. Online learning and stochastic approximations. On-line learning in neural networks,
+17:9, 1998.
+Davis, Steven and Mermelstein, Paul. Comparison of parametric representations for monosyllabic
+word recognition in continuously spoken sentences. Acoustics, Speech and Signal Processing,
+IEEE Transactions on, 28(4):357–366, 1980.
+Dean, Jeffrey, Corrado, Greg S., Monga, Rajat, Chen, Kai, Devin, Matthieu, Le, Quoc V., Mao,
+Mark Z., Ranzato, Marc’Aurelio, Senior, Andrew, Tucker, Paul, Yang, Ke, and Ng, Andrew Y.
+Large Scale Distributed Deep Networks. In Neural Information Processing Systems (NIPS), 2012.
+Dehak, Najim, Kenny, Patrick, Dehak, R´eda, Dumouchel, Pierre, and Ouellet, Pierre. Front-end fac-
+tor analysis for speaker veriﬁcation. Audio, Speech, and Language Processing, IEEE Transactions
+on, 19(4):788–798, 2011.
+11
+
+Accepted as a workshop contribution at ICLR 2015
+Del Corso, Gianna M. Estimating an eigenvector by the power method with a random start. SIAM
+Journal on Matrix Analysis and Applications, 18(4):913–937, 1997.
+Gales, M. J. F. and Woodland, P. C. Mean and Variance Adaptation Within the MLLR Framework.
+Computer Speech and Language, 10:249–264, 1996.
+Glorot, Xavier and Bengio, Yoshua. Understanding the difﬁculty of training deep feedforward neural
+networks. In International Conference on Artiﬁcial Intelligence and Statistics, pp. 249–256, 2010.
+Goodfellow, Ian J, Warde-Farley, David, Mirza, Mehdi, Courville, Aaron, and Bengio, Yoshua.
+Maxout networks. arXiv preprint arXiv:1302.4389, 2013.
+Hazan, Elad, Rakhlin, Alexander, and Bartlett, Peter L. Adaptive online gradient descent. In Ad-
+vances in Neural Information Processing Systems (NIPS), pp. 65–72, 2007.
+Hinton, Geoffrey, Osindero, Simon, and Teh, Yee-Whye. A fast learning algorithm for deep belief
+nets. Neural computation, 18(7):1527–1554, 2006.
+Kushner, Harold J and Yin, George. Stochastic approximation and recursive algorithms and appli-
+cations, volume 35. Springer, 2003.
+LeCun, Yann A, Bottou, L´eon, Orr, Genevieve B, and M¨uller, Klaus-Robert. Efﬁcient backprop. In
+Neural networks: Tricks of the trade, pp. 9–48. Springer, 2012.
+M., Gibson and T., Hain. Hypothesis Spaces For Minimum Bayes Risk Training In Large Vocabulary
+Speech Recognition. In Interspeech, 2006.
+Maas, Andrew L, Hannun, Awni Y, and Ng, Andrew Y. Rectiﬁer nonlinearities improve neural
+network acoustic models. In ICML Workshop on Deep Learning for Audio, Speech, and Language
+Processing (WDLASL 2013), 2013.
+Mohamed, Abdel-rahman, Yu, Dong, and Deng, Li. Investigation of full-sequence training of deep
+belief networks for speech recognition. In INTERSPEECH, pp. 2846–2849, 2010.
+Murata, Noboru and Amari, Shun-ichi. Statistical analysis of learning dynamics. Signal Processing,
+74(1):3–28, 1999.
+Niu, Feng, Recht, Benjamin, R´e, Christopher, and Wright, Stephen J. Hogwild!: A lock-free ap-
+proach to parallelizing stochastic gradient descent. arXiv preprint arXiv:1106.5730, 2011.
+Pascanu, Razvan and Bengio, Yoshua. Natural gradient revisited. CoRR, abs/1301.3584, 2013. URL
+http://arxiv.org/abs/1301.3584.
+Polyak, B.T. Some methods of speeding up the convergence of iteration methods. USSR Computa-
+tional Mathematics and Mathematical Physics, 4(5):1–17, 1964.
+Povey, D. Discriminative Training for Large Voculabulary Speech Recognition. PhD thesis, Cam-
+bridge University, 2004.
+Povey., D. and Woodland, P. C. Minimum Phone Error and I-smoothing for Improved Discriminative
+Training. In ICASSP, 2002.
+Povey, D., Kanevsky, D., Kingsbury, B., Ramabhadran, B., Saon, G., and Visweswariah, K. Boosted
+MMI for Feature and Model Space Discriminative Training. In ICASSP, 2008.
+Povey, D., Ghoshal, A., et al. The Kaldi Speech Recognition Toolkit. In Proc. ASRU, 2011.
+Povey, Daniel and Kingsbury, Brian. Evaluation of proposed modiﬁcations to MPE for large scale
+discriminative training. In ICASSP, 2007.
+Roux, Nicolas Le, Bengio, Yoshua, and antoine Manzagol, Pierre. Topmoumoute online natural
+gradient algorithm. In NIPS, 2007.
+Saon, George, Soltau, Hagen, Nahamoo, David, and Picheny, Michael. Speaker adaptation of neural
+network acoustic models using i-vectors. In Automatic Speech Recognition and Understanding
+(ASRU), 2013 IEEE Workshop on, pp. 55–59. IEEE, 2013.
+12
+
+Accepted as a workshop contribution at ICLR 2015
+Seide, Frank, Li, Gang, Chen, Xie, and Yu, Dong. Feature engineering in context-dependent deep
+neural networks for conversational speech transcription. In Automatic Speech Recognition and
+Understanding (ASRU), 2011 IEEE Workshop on, pp. 24–29. IEEE, 2011a.
+Seide, Frank, Li, Gang, and Yu, Dong. Conversational speech transcription using context-dependent
+deep neural networks. In INTERSPEECH, pp. 437–440, 2011b.
+Senior, Andrew and Lopez-Moreno, Ignacio. Improving dnn speaker independence with i-vector
+inputs. In Proc. ICASSP, 2014.
+Senior, Andrew, Heigold, Georg, Ranzato, Marc’Aurelio, and Yang, Ke. An empirical study of
+learning rates in deep neural networks for speech recognition. In Acoustics, Speech and Signal
+Processing (ICASSP), 2013.
+Vesel`y, Karel, Ghoshal, Arnab, Burget, Luk´aˇs, and Povey, Daniel. Sequence-discriminative training
+of deep neural networks. In Proc. Interspeech, 2013.
+Yang, Howard Hua and Amari, Shun-ichi. Natural gradient descent for training multi-layer percep-
+trons. Unpublished (submitted to IEEE Tr. on Neural Networks), 1997.
+Yang, Howard Hua and Amari, Shun-ichi. Complexity issues in natural gradient descent method for
+training multilayer perceptrons. Neural Computation, 10(8):2137–2157, 1998.
+Zhang, Xiaohui, Trmal, Jan, Povey, Daniel, and Khudanpur, Sanjeev. Improving deep neural net-
+work acoustic models using generalized maxout networks. In Proc. ICASSP, 2014.
+13
+
+Accepted as a workshop contribution at ICLR 2015
+A
+FURTHER DETAILS ON SIMPLE NATURAL GRADIENT METHOD
+A.1
+OVERVIEW OF SIMPLE NATURAL GRADIENT METHOD
+In this section we describe the natural gradient method that uses the other elements of the minibatch
+to estimate the factors of the Fisher matrix.
+As mentioned in Section 4.7, the interface can be described as follows. Given a matrix X, each row
+of which represents one element of the minibatch (and with a number of columns corresponding to
+either the row or column dimension of one of the weight matrices in the network), do the inverse-
+Fisher multiplication for each row xi of X and return the modiﬁed matrix ¯X.
+The core of the inverse-Fisher multiplication is this: let ¯xi = F−1
+i xi, where Fi is the Fisher matrix
+estimated from the other rows of X, i.e. if N is the minibatch size, then Fi =
+1
+N−1
+P
+j̸=i xjxT
+j . We
+extend this basic idea by adding smoothing of Fi with the identity matrix, and by scaling the output
+¯X to have the same Frobenius norm as the input.
+A.2
+DETAILS OF METHOD (NOT CONSIDERING EFFICIENCY)
+In this section we describe what we compute in our “simple” natural gradient method, without
+considering how to compute it efﬁciently. As described in Section 4.9, we smooth the Fisher matrix
+with the identity. Deﬁning
+β = α max(tr (XT X), ǫ)/(ND)
+(8)
+where our normal settings are α = 4 and ǫ = 10−20, and N and D are the number of rows and
+columns respectively of X, we deﬁne smoothed Fisher matrices as follows, to be applied to each
+row xi of X:
+Gi =
+
+βI +
+1
+N −1
+X
+j̸=i
+xjxT
+j
+
+
+−1
+(9)
+For each row i we will then deﬁne
+ˆxi = G−1
+i xi
+(10)
+and then the result of our computation will be
+¯X = γ ˆX
+(11)
+where the rescaling factor γ, intended to make sure that ¯X has the same Frobenius norm as the input
+X, is deﬁned as
+γ =
+q
+tr (XT X)/tr ( ˆXT ˆX).
+(12)
+If the denominator of the above is zero, we take γ to be one.
+We should note that by computing the scalars β and γ without “holding out” the current sample,
+we are violating the rule that the randomly sampled learning rate matrix should be independent of
+the current sample. However, since we always use a fairly large minibatch size (at least 100) and
+these are only scalar quantities, we don’t believe the small amount of “contamination” that takes
+place here will signiﬁcantly bias the training. In fact, it might not turn out to be very difﬁcult to
+modify the equations to properly hold out the current sample for these purposes, but because we
+don’t believe it would perceptibly affect the results, we haven’t gone to the trouble of doing this.
+A.3
+EFFICIENT COMPUTATION IN SIMPLE METHOD
+We now describe how we efﬁciently compute what we described above. Deﬁne the smoothed Fisher
+matrix
+G =
+
+β I +
+1
+N−1XT X
+
+,
+(13)
+which is like the Gi quantities but without holding out the current sample. Next, compute
+Q = XG−1,
+(14)
+where Q only differs from ˆX by xi not being held out from the corresonding Gi. There are two
+equivalent methods to compute Q:
+14
+
+Accepted as a workshop contribution at ICLR 2015
+(i) In column space:
+Q = X
+
+βI +
+1
+(N−1)XT X
+−1
+(ii) In row space:
+Q =
+
+βI +
+1
+(N−1)XXT −1
+X
+We derived the rather surprising row-space version of the formulation by expanding the inverted
+expression on the right of the column-space expression using the Morrison-Woodbury formula, and
+simplifying the resulting expression.
+For efﬁciency, we choose method (i) above if the minibatch size is greater than the dimension (N >
+D), and method (ii) otherwise. Our formula below for ˆX is derived by expressing each G−1
+i
+as
+a rank-one correction to G−1, and computing the corresponding correction by which each row ˆxi
+differs from the corresponding row qi of Q. It turns out that the correction is in the same direction
+as qi itself, so ˆxi just becomes a scalar multiple of qi. Deﬁning, for each row-index i,
+ai = xT
+i qi,
+(15)
+and deﬁning the scalar factor
+bi = 1 + ai/(N−1−ai),
+(16)
+then we can use the following efﬁcient formula: for each row ˆxi of ˆX,
+ˆxi = biqi.
+(17)
+We then get the output ¯X by scaling ˆX by γ, as described above.
+When working on CPUs with small minibatch sizes (e.g. N = 128) and large hidden-layer dimen-
+sions (e.g. D = 1000), the computation above is very efﬁcient, and does not comprise more than
+about 20% of the time of the overall backprop computation. However, when using GPUs with larger
+minibatch sizes (e.g. N = 512) it can take the majority of the time. Even though it typically takes
+considerably less than half of the total ﬂoating point operations of the overall computation, it con-
+tains a matrix inversion, and matrix inversions are not very easy to compute on a GPU. Our “online”
+method which we will describe below is designed to solve this efﬁciency problem.
+B
+FURTHER DETAILS ON ONLINE NATURAL GRADIENT METHOD
+B.1
+OVERVIEW OF ONLINE NATURAL GRADIENT METHOD
+The interface of the online natural-gradient method is essentially the same as the simple method:
+the user provides a matrix X, and we return a matrix ¯X that’s been multiplied by the inverse-Fisher
+and then rescaled to have the same Frobenius norm as X. Again, each row of X corresponds to an
+element of the minibatch and the column dimension corresponds to the row or column dimension
+of one of the weight matrices. A difference from the simple method is that the online method is
+“stateful”, because we maintain a running estimate of the Fisher matrix. Each time we process a
+minibatch, we use the Fisher matrix estimated from the previous minibatches; and we then update
+that estimate using the current minibatch. For a single neural net, the number of separate copies of
+this “state” that we need to maintain corresponds to twice the number of trainable weight matrices
+in the neural net: one for each of the Ai and Bi quantities in Equation (2).
+Let the input be X ∈RN×D, where N is the minibatch size (e.g. 512) and D is the row or column
+size of the weight matrix we’re updating (e.g. 2000). We introduce a user-speciﬁed parameter
+R < D which is the rank of the non-identity part of the Fisher matrix. Let the subscript t = 0, 1, . . .
+correspond to the minibatch. Deﬁne
+Ft
+def
+= RT
+t DtRt + ρtI
+(18)
+where Rt ∈RR×D, Dt ∈RR×R and ρt > 0 will be estimated online from data; Rt has orthonormal
+rows and Dt is diagonal and nonnegative. We’ll estimate these quantities online from the data with
+the aim being that Ft should be a good estimate of the covariance of the rows of the Xt quantities.
+15
+
+Accepted as a workshop contribution at ICLR 2015
+We deﬁne Gt to be a kind of “smoothed” version of Ft where we add in more of the unit matrix,
+controlled by the α parameter we’ve previously discussed (normally α = 4):
+Gt
+def
+= Ft + αtr (Ft)
+D
+I.
+(19)
+and then the output will be:
+¯Xt = γtXtG−1
+t
+(20)
+where γt is computed so as to ensure that the Frobenius norm of ¯Xt equals that of Xt:
+γt =
+q
+tr (XtXT
+t )/tr (XtG−1
+t G−1
+t XT
+t ),
+(21)
+or γt = 1 if the denominator of the above equation is 0.
+B.2
+UPDATING OUR LOW-RANK APPROXIMATION TO THE VARIANCE
+Next we discuss the method we use to estimate our low-rank approximation Ft of the uncentered
+covariance of the rows of the inputs Xt. Deﬁne
+St
+def
+=
+1
+N XT
+t Xt
+(22)
+as the uncentered covariance of the rows of Xt. We introduce a user-speciﬁed “forgetting factor”
+0 < η < 1 (we describe how this is set in Section B.4), and we deﬁne
+Tt
+def
+= ηSt + (1 −η)Ft.
+(23)
+We will try to set Ft+1 to be a good low-rank approximation to Tt. The obvious way would be to
+make Dt+1 correspond to the top eigenvalues of Tt and Rt+1 to the corresponding eigenvectors,
+but this would be too slow. Instead we use a method inspired by the power method for ﬁnding the
+top eigenvalue of a matrix. On each iteration we compute
+Yt
+def
+= RtTt,
+(24)
+with Yt ∈RR×D. It is useful to think of Yt as containing each eigenvector scaled by its corre-
+sponding eigenvalue in Tt (of course, this is true in a precise sense only at convergence). Our update
+uses symmetric eigenvalue decomposition of YtYT
+t to ﬁnd these scaling factors (they are actually
+the square roots of the eigenvalues of YtYT
+t ), puts them on the diagonal of Dt+1, and puts the
+corresponding eigenvectors in the rows of Rt+1. We then have to work out the correct amount of
+the unit-matrix to add into our factorization of the covariance matrix (i.e. set ρt+1) and subtract that
+amount from the diagonals of Dt+1. We will give equations for this below.
+Observant readers might have noted that it would seem more straightforward do do a Singular Value
+Decomposition (SVD) on Yt instead of a symmetric eigenvalue decomposition on YtYT
+t . We do it
+this way for speed.
+The details of our update are as follows:
+Zt
+def
+= YtYT
+t ,
+(25)
+so Zt ∈RR×R. Then do the symmetric eigenvalue decomposition
+Zt = UtCtUT
+t ,
+(26)
+with U orthogonal and Ct diagonal. The diagonal elements of Ct are positive; we can prove this
+using ρt > 0 (which makes Tt positive deﬁnite) and using the fact that Rt has full row rank. We
+deﬁne Rt+1 as:
+Rt+1
+def
+= C−0.5
+t
+UT
+t Yt
+(27)
+If we expand out Rt+1RT
+t+1 using (27), it is easy to see that it reduces to the identity, hence Rt+1
+has orthonormal rows. In order to make sure that Ft+1 has the desired covariance in the directions
+corresponding to the rows of Rt+1, we will set
+Dt+1
+def
+= C0.5
+t
+−ρt+1I,
+(28)
+16
+
+Accepted as a workshop contribution at ICLR 2015
+but note that at this point, ρt+1 is still unknown. When we say the “desired covariance”, we are
+ensuring that for each dimension r corresponding to a row of Rt+1, the value of the inner product
+rT Ft+1r equals that of rT Ttr, but this is only precisely true at convergence.
+We choose ρt+1 in order to ensure that tr (Ft+1) = tr(Tt). This value can be worked out as:
+ρ′
+t+1 =
+1
+D−R
+ ηtr (St)+(1−η)(Dρt+tr (Dt))−tr (C0.5
+t )
+
+(29)
+We then let
+ρt+1 = max(ǫ, ρ′
+t+1)
+(30)
+for ǫ = 10−10; this is is to ensure that if we get a sequence of zero inputs, ρt will not become exactly
+zero in its machine representation.
+B.3
+EFFICIENT COMPUTATION
+The previous section described what we are computing in the online natural gradient method; here
+we describe how to compute it efﬁciently. The essential idea here is to reduce the multiplication
+by G−1 to two multiplications by a “fat” matrix (of dimension R × D). Since typically R is much
+smaller than D, this is quite efﬁcient. We also address how to efﬁciently keep these matrices updated,
+at the level of optimizing the matrix expressions. This section is mostly derivation, and will likely
+only be of interest to someone who is considering implementing this method. In Section B.5 below,
+we will summarize the algorithm we derive here.
+We can write Gt as:
+Gt
+def
+= Ft + αtr (Ft)
+D
+I
+(31)
+= RT
+t DtRt + βtI
+(32)
+where
+βt
+def
+= ρt + α
+Dtr (Ft)
+(33)
+= ρt(1 + α) + α
+Dtr (Dt)
+(34)
+Deﬁne
+ˆXt
+def
+= βtXtG−1
+t ,
+(35)
+where the factor of βt is inserted arbitrarily to simplify the update equations; a scalar factor on ˆX
+doesn’t matter because we will later rescale it to have the same norm as X. The output of this whole
+process is
+¯Xt
+def
+= γt ˆXt, where
+(36)
+γt
+def
+=
+q
+tr (XtXT
+t )/tr ( ˆXT
+t ˆXt),
+(37)
+where, in the expression for γt, if the denominator is zero we take γt = 1. Note: γt is not the
+same as in (21) because of the arbitrary factor of βt, so consider (21) to be superseded by (37). To
+efﬁciently compute (35), we apply the Woodbury matrix identity to (31), giving us
+G−1
+t
+= 1
+βt
+ I −RT
+t EtRt
+
+(38)
+where
+Et
+def
+=
+1
+βt
+
+D−1
+t
++ 1
+βt
+I
+−1
+(39)
+with elements
+etii =
+1
+βt/dtii + 1
+(40)
+In order to reduce the number of matrix multiplies, it is useful to break the expression RT
+t EtRt into
+two equal parts, so we deﬁne
+Wt
+def
+= E0.5
+t Rt,
+(41)
+17
+
+Accepted as a workshop contribution at ICLR 2015
+and we will never store Rt; instead, we will work with Wt and the small diagonal factors Dt and
+Et. We can now write the following, which is where most of our computation will take place:
+ˆXt = Xt −XtWT
+t Wt
+(42)
+You may recall the symmetric matrix Zt ∈RR×R deﬁned in (25), which is involved in the update
+of our factorization. The following expressions are going to be useful when computing it, and the
+ﬁrst of them appears as a sub-expression of (42). For convenience we state the dimensions of these
+quantities below:
+Ht
+def
+= XtWT
+t ∈RN×R
+(43)
+Jt
+def
+= HT
+t Xt ∈RR×D
+(44)
+= WtXT
+t Xt
+(45)
+Kt
+def
+= JtJT
+t ∈RR×R(symmetric)
+(46)
+Lt
+def
+= HT
+t Ht ∈RR×R(symmetric)
+(47)
+= WtXT
+t XtWT
+t
+(48)
+= JtWT
+t
+(49)
+After we have Ht, we can compute ˆXt using a single matrix multiply as:
+ˆXt = Xt −HtWt.
+(50)
+We can expand Yt = RtTt, deﬁned in (24), into quantities that will be computed, as:
+Yt = η
+N RtXT
+t Xt + (1−η)(Dt + ρtI)Rt
+(51)
+= η
+N E−0.5
+t
+Jt + (1−η)(Dt + ρtI)E−0.5
+t
+Wt
+(52)
+Using (52) we can expand Zt = YtYT
+t , as:
+Zt = η2
+N 2 E−0.5
+t
+JtJT
+t E−0.5
+t
++ (1−η)2 (Dt + ρtI)2
++ η(1−η)
+N
+E−0.5
+t
+JtWT
+t E−0.5
+t
+(Dt + ρtI)
++ η(1−η)
+N
+(Dt + ρtI)E−0.5
+t
+WtJT
+t E−0.5
+t
+(53)
+and we can substitute some of the sub-expressions we deﬁned above into this, to give:
+Zt = η2
+N 2 E−0.5
+t
+KtE−0.5
+t
++ (1−η)2 (Dt + ρtI)2
++ η(1−η)
+N
+E−0.5
+t
+LtE−0.5
+t
+(Dt + ρtI)
++ η(1−η)
+N
+(Dt + ρtI)E−0.5
+t
+LtE−0.5
+t
+(54)
+Our strategy will be to compute the symmetric quantities Lt and Kt on the GPU, and transfer them
+to the CPU where we can then compute Zt using the expression above – this can be done in O(R2) –
+and then do the symmetric eigenvalue decomposition as in (26), on the CPU. We repeat the equation
+here for convenience:
+Zt = UtCtUT
+t .
+(55)
+Here, Ut will be orthogonal, and mathematically, no element of the diagonal matrix Ct can be less
+than (1−η)2ρ2
+t, so we ﬂoor its diagonal to that value to prevent problems later if, due to roundoff,
+any element is smaller than that.
+Below, we’ll say how we efﬁciently compute tr (XXT ) and tr ( ˆX ˆXT ); for now, just assume those
+quantities have been computed.
+We compute ρt+1 as follows, expanding St in (29):
+ρ′
+t+1 =
+1
+D−R
+ η
+N tr (XXT )+
+(1−η)(Dρt+tr (Dt)) −tr (C0.5
+t )
+
+.
+(56)
+18
+
+Accepted as a workshop contribution at ICLR 2015
+We can now compute Dt+1 and ρt+1; we ﬂoor both to ǫ to ensure they never go to exactly zero
+which could cause problems for our algorithm.
+Dt+1 = max(C0.5
+t
+−ρ′
+t+1I, ǫI)
+(57)
+ρt+1 = max(ǫ, ρ′
+t+1)
+(58)
+for a small constant ǫ = 10−10 (the ﬁrst max is taken per element). We can now compute the scalar
+βt+1 and the diagonal matrix Et+1 (we show the formula for its diagonal elements):
+βt+1 = ρt+1(1+α) + α
+Dtr (Dt+1)
+(59)
+etii =
+1
+βt+1/dt+1,ii + 1
+(60)
+We never construct Rt+1 in memory, but instead we directly compute Wt+1. We can factor it as
+follows:
+Wt+1
+def
+= E0.5
+t+1Rt+1
+(61)
+= E0.5
+t+1C−0.5
+t
+UT
+t Yt
+(62)
+= E0.5
+t+1C−0.5
+t
+UT
+t
+  η
+N E−0.5
+t
+Jt + (1−η)(Dt+ρtI)Rt
+
+(63)
+= AtBt
+(64)
+where
+At
+def
+=
+η
+N E0.5
+t+1C−0.5
+t
+UT
+t E−0.5
+t
+(65)
+Bt
+def
+= Jt + N(1−η)
+η
+(Dt + ρtI) Wt,
+(66)
+and note that while it might seem like a factor of E−0.5
+t
+is missing from the second term in Bt, in
+fact we use the fact that it commutes with (Dt + ρtI) to move it to the left, into At. If we’re using a
+GPU, At will be computed in time O(R2) on the CPU and transferred to the GPU; we then compute
+Bt on the GPU efﬁciently by scaling the rows of Wt and adding Jt; then we multiply At and Bt
+on the GPU.
+B.3.1
+MAINTAINING ORTHOGONALITY
+We have noticed that the invariance RtRT
+t = I can sometimes be lost due to roundoff. A proper
+analysis of roundoff in our algorithm is not something we have time to do, but we will describe
+how we detect and ﬁx this problem in practice. For speed, we only do the following operations if
+the diagonal matrix Ct, has condition number greater than 106, or if any elements were ﬂoored as
+mentioned just after (55). Note: all the computations we describe in this paper were done in single
+precision.
+We compute the symmetric matrix
+Ot
+def
+= RtRT
+t
+(67)
+= E−0.5
+t
+ WtWT
+t
+
+E−0.5
+t
+,
+(68)
+where the part in parentheses is computed on the GPU and transferred to the CPU. If no element of
+Ot differs by more than 10−3 from the corresponding element of the unit matrix, we consider that
+Rt is sufﬁciently orthogonal and we do nothing more. Otherwise, we do a Cholesky decomposition
+Ot = CCT , compute the reorthogonalizing factor M = E0.5
+t C−1E−0.5
+t
+on the CPU and copy to
+the GPU, and do Wt+1 ←MWt+1 to reorthogonalize. Re-orthogonalization happens extremely
+rarely, and usually only if something bad has already happened such as parameter divergence.
+B.3.2
+INITIALIZATION
+In our implementation we don’t bother dumping the “state’ of the computation to disk so each new
+process reinitializes them for the ﬁrst minibatch it processes. We initialize them so as to most closely
+approximate the covariance of the ﬁrst minibatch of features. This is done by taking
+S0
+def
+=
+1
+N XT
+0 X0
+(69)
+19
+
+Accepted as a workshop contribution at ICLR 2015
+and ﬁnding the top R eigenvalues and eigenvectors; the rows of R0 contain the top eigenvectors.
+Let λi be the corresponding eigenvalues, for 1 ≤i ≤R, and we set
+ρ0 = max
+ 
+tr (S0) −PR
+i=1 λi
+D −R
+, ǫ
+!
+(70)
+for ǫ = 10−10, and for 1 ≤i ≤R, we let d0ii ←max(ǫ, λi −ρ0).
+B.3.3
+COMPUTING MATRIX TRACES
+We mentioned above that we have a fast way of computing the quantities tr (XXT ) and tr ( ˆX ˆXT ).
+These are needed to compute γt using (37), and to compute ρ′
+t+1 using (56). We compute these
+as a side effect of the fact that we need, for each row ¯xti of the output, its squared norm ¯xT
+ti¯xti.
+This will be required to enforce the “maximum parameter change” per minibatch, as described in
+Section 3.2.2. Suppose we’ve already computed ˆXt using (50). We compute the inner products for
+all rows 1 ≤i ≤N of ˆXt as
+pi = ˆxT
+tiˆxT
+ti,
+(71)
+using a single GPU kernel invocation. If we are updating the parameters of the Fisher-matrix factor-
+ization, then we can most efﬁciently obtain our desired traces as follows:
+tr ( ˆX ˆXT ) = P
+ipi
+(72)
+tr (XXT ) = tr ( ˆX ˆXT ) −tr (LtEt) + 2tr (Lt).
+(73)
+The expression for tr (XXT ) was obtained by expanding tr ( ˆX ˆXT ) using (50), moving tr (XXT )
+to the left, and recognizing sub-expressions that we have already computed. In case we are not
+updating the parameters of the Fisher-matrix factorization, we have no other need for Lt so it will be
+more efﬁcient to compute tr (XXT ) directly; this can of course be done in O(ND) operations and
+does not require a matrix multiply. Once we have the scaling factor γt we can scale the pi quantities
+by its square, and they will equal the quantities ¯xT
+ti¯xti that we’ll need for enforcing the maximum
+parameter change.
+B.3.4
+MULTITHREADING AND OTHER ISSUES
+Most of what we have written above is geared towards operation using a GPU, but we also support
+operation with CPUs, where our SGD implementation is multithreaded. In this case, we have to
+consider the interaction with multithreaded code because of the “stateful” nature of the computation.
+We wanted to avoid a bottleneck where different threads wait to update the parameters sequentially.
+Our solution is that before doing the part of the computation where we update the parameters, we try
+to get a lock, and if this fails, we simply apply the ﬁxed inverse-Fisher matrix but don’t update the
+Fisher-matrix parameters Rt and so on. Since the model parameters don’t move very fast, we don’t
+expect that this will make any noticeable difference to the SGD convergence, and we have seen no
+evidence that it does.
+B.4
+TYPICAL CONFIGURATION
+The most important user-speciﬁed parameters for our algorithm are the rank R and the constant α
+that controls smoothing with the unit matrix. The value α = 4 seems to work well over a wide va-
+riety of conditions, so we normally leave it at that value. The rank R should generally increase with
+the dimension of the vectors we are multiplying. Our experiments here are with “p-norm” networks
+where the nonlinearity is dimension reducing, like maxout (Goodfellow et al., 2013), typically re-
+ducing the dimension from something like 3000 to 300. So a typical parameter matrix will increase
+the dimension from something like 301 to 3000 (it’s 301 instead of 300 because of the bias term).
+Our normal rule for ranks is to use R = 20 on the input side of each matrix and R = 80 on the
+output side. Part of the way we originally tuned this is to look at the diagonal matrices Et. These
+matrices have diagonal values 0 < etii < 1, sorted on i from greatest to least, and 1 −etii can be
+interpreted as the amount by which the input is scaled in a certain direction in the space. A value of
+etii close to 1 means we are strongly scaling down the input, and a value close to 0 means we are
+leaving it unchanged. If the last etii has a value of, say, 0.1, then reducing R by one will be like
+20
+
+Accepted as a workshop contribution at ICLR 2015
+taking a scaling factor of 0.9 applied to a gradient, and setting to 1 instead; this seems unlikely to
+make any difference to the SGD, as it’s like changing the learning rate in some direction from 0.9 to
+1. Our ﬁnal etii values are normally in the range 0.05 to 0.2.
+Another conﬁgurable constant is the “forgetting factor” 0 < η < 1: the closer η is to 1, the more
+rapidly we track changes in the Fisher matrix due to changes in parameters, but the more noise we
+will have in our estimates. Because we don’t want to have to tune η when we change the minibatch
+size, we set it as follows. The user speciﬁes a parameter S (interpreted as an approximate number
+of samples to include in our estimate of the Fisher matrix), and we set
+η = 1 −exp(−N/S),
+(74)
+where N is the minibatch size. We normally set S = 2000; we have no reason to believe that this is
+a very important parameter.
+In order to increase the speed of the algorithm, we normally conﬁgure it so that we only actually
+update the parameters of the Fisher matrix every 4 minibatches, except on the ﬁrst 10 minibatches
+in a process, when we always update them.
+B.5
+SUMMARY OF THE ONLINE NATURAL GRADIENT METHOD
+Here we summarize the online natural-gradient SGD method– that is, we summarize the core part
+of the algorithm that takes a matrix X ∈RN×D, and outputs a matrix ¯X ∈RN×D. To understand
+how this ﬁts into the bigger picture of back-propagation and SGD, see Section 4.
+For this summary we will ignore issues of multithreading. Our explanation here is just for one
+instance of the algorithm, corresponding to the row or column dimension of one of the weight
+matrices; if there are I weight matrices, there are 2I separate copies of the variables we describe
+here.
+Typical conﬁguration variables are as follows: α = 4, S = 2000 (this will determine η), rank
+R = 20 (or 80), ǫ = 10−10; and let’s deﬁne a variable J = 4 that dictates the period with which we
+update the Fisher-matrix factors. Minibatch size N is normally 128 (on CPU), or 512 (on GPU).
+On t = 0, before running the steps below we have to initialize the parameters as described in
+Section B.3.2. Note: while in Section B.3.2 we describe how to set ρ0, R0 and D0, the variables
+which we actually store are ρ0, D0, and W0; to compute W0 we need Equations (34), (40) and (41).
+We have an input X ∈RN×D, and despite the notation, we do not require that N be the same for
+all t– sometimes the last minibatch we process has a smaller than normal size.
+If t < 10 or J divides t exactly, then we will be updating the factored Fisher matrix; otherwise we
+just apply it and don’t update. There are two slightly versions of the algorithm, depending whether
+we will be updating the Fisher matrix.
+In either case, we ﬁrst compute η from N and S using (74), and then compute
+Ht = XtWT
+t .
+(75)
+From here the two cases begin to differ.
+Without updating the Fisher matrix.
+If we won’t be updating the Fisher matrix, then it’s simpler.
+The input is Xt. We ﬁrst compute tr (XT
+t X). Then we compute
+ˆXt = Xt −HtWt,
+(76)
+overwriting the input Xt. Next, for each 1 ≤i ≤N we compute the row-products pi using (71),
+and compute tr ( ˆXT ˆX) as the sum of pi. Now we can compute γt using (37). Next we scale ˆXt by
+γt to produce ¯Xt. We also output for each i the quantity γ2
+t pi = ¯xT
+ti¯xti, which is needed to enforce
+the “maximum parameter change per minibatch” constraint.
+With updating the Fisher matrix.
+If we’re updating the Fisher matrix, which we usually do every
+four steps, there are some more operations to do. First we compute
+Jt = HT
+t Xt ∈RR×D.
+(77)
+21
+
+Accepted as a workshop contribution at ICLR 2015
+Next we want to compute Lt and Kt. We actually have two separate strategies for this. If N > D
+(the minibatch size exceeds the vector dimension), we do:
+Lt = WtJT
+t ∈RR×R
+(78)
+Kt = JtJT
+t ∈RR×R
+(79)
+and in our implementation we combine these into one matrix operation by placing L and K, and W
+and J, next to each other in memory. Otherwise, we compute Kt as above but Lt using:
+Lt = HT
+t Ht ∈RR×R.
+(80)
+At this point, if we’re using a GPU, we transfer the symmetric matrices Kt and Lt to the CPU. We
+now compute some small derived quantities on the CPU: βt using (34) and Et using (40), as well as
+E0.5
+t
+and E−0.5
+t
+; Et is diagonal so this is not hard. At this point we compute the symmetric R × R
+matrix Zt using (54); the expression looks scary but it can be computed in O(R2) time.
+We do the symmetric eigenvalue decomposition as in (55), on the CPU, to get the orthogonal matrix
+Ut and the diagonal matrix Ct, and we ﬂoor the diagonal elements of Ct to (1−η)2ρ2
+t.
+Next we compute
+ˆXt = Xt −HtWt,
+(81)
+then compute the row-products pi using (71), compute tr ( ˆXT
+t ˆX) = P
+i pi, and compute tr (XT
+t X)
+using (73). We can now obtain the scaling factor γt using (37), and use it to compute the main
+output ¯Xt = γt ˆXt and the per-row inner products of the output which equal γ2
+t pi (although in our
+implementation, to save time we actually output γt and let the user do the scaling later on).
+We next compute ρ′
+t+1 using (56), Dt+1 using (57) and ρt+1 using (58). Wt+1 is computed using
+a matrix multiply on the GPU as in (64), after working out the factors At and Bt.
+At this point, if we had ﬂoored any diagonal elements of Ct above or if its condition number af-
+ter ﬂooring exceeds 106, we do the orthogonality check and possible reorthogonalization that we
+described in Section B.3.1 above.
+C
+OTHER ASPECTS OF OUR DNN IMPLEMENTATION
+Here we describe some aspects of our neural net training implementation that are of less direct
+relevance to our parallel training and natural gradient methods, so were not included in the main text
+of the paper.
+In Section C.1 we discuss the CPU-based and GPU-based versions of our SGD implementation
+and how they differ; in Section C.2 we discuss how we randomize the training examples and store
+them on disk. In Section C.3 we explain how we enforce a maximum parameter-change per mini-
+batch; in C.4 we explain our generalized model-averaging procedure; in C.5 we explain how we
+use “mixture components” (a.k.a. sub-classes) for DNNs; in C.6 we introduce our method of input
+data normalization; in C.7 we give details on how we initialize the DNN parameters; in C.8 we give
+an overview of how we implemented sequence training for DNNs; and in C.9 we discuss online
+(real-time) decoding using i-vectors for speaker adaptation.
+C.1
+CPU VERSUS GPU-BASED SGD
+Each machine in our parallel computation implements SGD. We have two versions of this, one for
+GPU and one for CPU. The GPU-based computation is standard minibatch-based SGD, typically
+with 512 examples per minibatch.
+In the CPU-based computation, each job uses typically 16 threads in order to take advantage of
+multi-core processors. The threads share parameters without any locks; this is known as Hog-
+wild! (Niu et al., 2011) and was referred to in (Bengio et al., 2003) as asynchronous. In order to
+prevent divergence, each thread processes relatively small minibatches - typically, of size 128.
+We should mention at this point that in our formulation, we sum the gradients over the elements
+of the minibatch, rather than averaging: this ensures that we make the same amount of progress
+per sample, regardless of minibatch size, and so gives more consistent results when changing the
+22
+
+Accepted as a workshop contribution at ICLR 2015
+minibatch size. The need to limit the minibatch size in the multithreaded case can be understood
+as follows: think of the effective minibatch size as being the minibatch size times the number of
+threads. The product of the learning rate η with the effective minibatch size is relevant for stability
+of the SGD update: if it becomes too large, there is increased danger of divergence.
+We normally use the GPU-based method, because in our experience a GPU can process data many
+times faster than a CPU with multiple threads. Aside from speed, the two methods give very similar
+results.
+C.2
+DATA RANDOMIZATION AND SEQUENTIAL DATA ACCESS
+On spinning hard disks, sequential data access can be orders of magnitude more efﬁcient than ran-
+dom data access or access to small ﬁles. In the Kaldi toolkit (Povey et al., 2011), we try very hard to
+ensure that any high-volume data access takes the form of sequential reads or writes on large ﬁles.
+For neural network training, we keep data access sequential by dumping pre-randomized “training
+examples” to disk. Each training example corresponds to a class label together with the correspond-
+ing input features, including left and right temporal context as needed by the network. The random-
+ization is done just once for the entire data, and the data is accessed in the same order on each epoch.
+This is probably not ideal from the point of view of the convergence of SGD, but our expectation is
+that for large amounts of data the same-order access will not affect the results noticeably.
+We break up the training data into N by M rougly equal-sized blocks, where N is the number of
+parallel jobs, speciﬁed by the user (typically 4 ≤N ≤8), and M ≥1 is the number of “outer
+iterations per epoch”, which is chosen to ensure that the number of samples processed per iteration
+is close to a user-speciﬁed value K (e.g. K = 400 000). The process of randomly distributing the
+data into N by M blocks, and ensuring that the order is randomized within each block, is done
+in parallel; we won’t give further details here, because the problem is straightforward and there is
+nothing particularly special about our method. To reduce disk or network access we compress the
+features on disk to 1 byte per ﬂoat, using a lossy compression method.
+C.3
+ENFORCING THE MAXIMUM PARAMETER CHANGE PER MINIBATCH
+As mentioned in Section 3.2.2, in order to prevent instability and parameter divergence we enforce
+a maximum parameter-change per minibatch, which is applied for each layer of the network sepa-
+rately. Here we explain how this is done. We don’t claim that this is an exceptionally good method
+for preventing excessive parameter changes, but we describe it here anyway for the sake of com-
+pleteness.
+Suppose the update for a single weight matrix is formulated as follows (and to keep things simple,
+we don’t include an index for the layer of the network):
+Wt+1 = Wt + ∆t,
+(82)
+where ∆t is the change that standard SGD would give us, equal to the derivative of the objective
+function for this minibatch multiplied by the learning rate ηt. To enforce the maximum parameter
+chanbge, we scale the change by a scalar αt:
+Wt+1 = Wt + αt∆t,
+(83)
+where we would like to choose αt ≤1 to ensure that ||αt∆t||F does not exceed a speciﬁed limit,
+|| · ||F being the Frobenius norm. However, we don’t implement this scheme exactly as described
+above because it would involve creating a temporary matrix to store the product of matrices ∆t just
+in order to compute its norm, and we don’t want to incur this penalty.
+Instead we enforce it in a way that involves a sum over elements of the minibatch. If ∆t = ηXT Y,
+then ∆t can be written as a sum over an index i that ranges over the rows of X and Y. By properties
+of norms, the 2-norm of ∆t cannot exceed the sum of the 2-norms of the terms in this sum: if the
+rows of X and Y are written as xi and yi, then
+||∆t||F ≤
+X
+i
+η||xi||2||yi||2
+(84)
+23
+
+Accepted as a workshop contribution at ICLR 2015
+It does not take excessive time or memory to compute the vector norms ||xi||2 and ||yi||2, so we
+compute the right hand side of 84 and use it as a stand-in for ||∆t||F , giving us
+αt = min
+
+1, max-change-per-minibatch
+P
+i η||xi||2||yi||2
+
+(85)
+where max-change-per-minibatch is a user-speciﬁed maximum parameter-change per minibatch.
+Empirically we have found that it tends to be necessary to increase max-change-per-minibatch when
+using a larger minibatch size, so to simplify the conﬁguration process we deﬁne
+max-change-per-minibatch = Nmax-change-per-sample
+(86)
+where N is the minibatch size. We always set max-change-per-sample to 0.075 for experiments
+reported here. To clarify how this method interacts with the natural gradient methods described in
+Section 4: the natural gradient is implemented as a modiﬁcation to the X and Y matrices, so we
+simply apply this maximum-change logic on top of the modiﬁed X and Y quantitities.
+What we’ve found that this maximum-parameter-change limit is active only early in training for
+layers closer to the output.
+C.4
+GENERALIZED MODEL AVERAGING
+The convergence theory of Stochastic Gradient Descent (Kushner & Yin, 2003) suggests that, for
+convex problems, if we take not the last iteration’s model parameters but the average over all itera-
+tions, it can improve the convergence rate, particularly in ‘poorly-conditioned’ problems (i.e. where
+the condition number of the Hessian is very large). This is not applicable in non-convex problems
+such as ours, but it does suggest a related method. As mentioned above, we deﬁne an outer iter-
+ation as the length of time it takes for all jobs to process K samples (e.g. K = 400 000), and on
+each outer iteration each job dumps its ﬁnal model to disk and we average these to produce a single
+model. We store the models (averaged over all jobs) for each outer iteration. At the very end of
+training, instead of choosing the model from the ﬁnal outer iteration, we take the models from the
+last P outer iterations (e.g. P = 20), and search for a generalized weighted combination of these
+models that optimizes the objective function on a subset of training data– we tried using validation
+data here, but for our task we found it worked best to use training data. By generalized weighted
+combination, what we mean is that the parameters are a weighted combination of the parameters of
+the input models, but each layer can have different weighting factors. Thus, if there are P models
+and L layers, the number of parameters we learn on the data subdset is LP. A few more details:
+• The optimization method is L-BFGS.
+• To improve the convergence speed of L-BFGS, we optimize in a transformed (precondi-
+tioned) space where the preconditioner is related to the Fisher matrix.
+• The starting point for the optimization is the best of P + 1 choices, corresponding to each
+of the P ﬁnal iterations, and the average of all of them.
+• We add a very tiny regularizer (like 10−10 times the square of the vector of weights) to stop
+the weights going to inﬁnity in cases (like p-norm networks) where the objective function
+is invariant to the parameter scale.
+• We generally aim to optimize over the last P = 20 models (assuming they share the same
+parameter structure, e.g. we haven’t added layers).
+• In cases where P iterations would amount to less than one epoch, we optimize over P
+models where the individual models are simple averages of model parameters for a duration
+of about 1/P of the entire epoch.
+We have generally found that this model combination slightly improves results, but it is not a focus
+of the current paper so we don’t provide experimental results for this here.
+C.5
+MIXTURE COMPONENTS (SUB-CLASSES)
+When using Gaussians for speech recognition, the usual approach is to use a Gaussian mixture
+model (GMM) rather than a single Gaussian, to model each speech state. We have generalized
+24
+
+Accepted as a workshop contribution at ICLR 2015
+this idea to neural networks, by allowing the posterior of each speech state to be written as a sum
+over the posterior of “sub-classes” that are analogous to the Gaussians in a GMM. About halfway
+through training, we “mix up” the model by increasing the dimension of the softmax layer to a
+user-speciﬁed number that is greater than the number of classes (usually about double the number
+of classes). After the softmax layer we introduce a “sum-group” layer which sums its input over
+ﬁxed groups of indexes to produce a posterior for each class that is a sum over the posteriors of the
+hidden “sub-classes”. We also tried sharing the sub-classes across classes in groups, but did not ﬁnd
+this helpful.
+Rather than distributing the “sub-classes” evenly, we allocate more sub-classes to the more common
+classes. We allocate them proportional to the 1/3 power of the count of that class in the training
+data; this is based on the rule we use to allocate Gaussians in our GMMs.
+When initializing the parameters of the “mixed-up” ﬁnal weight matrix, we make it correspond quite
+closely with the original weight matrix. Each row of the new weight matrix corresponds to a row
+of the old weight matrix, plus a small noise term to allow the values of the rows to diverge; and we
+modify the bias term to normalize for the fact that some classes have more sub-classes than others.
+We have generally found that this slightly improves results, but again, this is not a focus of the
+current paper and we won’t be showing experimental results about this. More recent experimental
+results4 show that the mixture components may not have diverged sufﬁciently that we can regard
+them as truly distinct; the method may only be helping because it has the same effect as decreasing
+the learning rate for the ﬁnal-layer parameters corresponding to the higher-frequency classes. We
+describe it only for completeness.
+This note is being added after publication as an ICLR workshop paper. Further experiments con-
+ducted by Minhua Wu discovered that the mixture components were not diverging sufﬁciently to be
+regarded as distinct mixtures, and the observed small improvement was likely due to a stabilizing
+effect on the update of parameters for higher-count classes, by splitting the gradient into multiple
+pieces. We were able to improve our results slightly by removing the mixture-component and adding
+instead a ﬁxed scaling as a separate component/layer after the ﬁnal weight matrix and before the
+softmax, with scales proportional to (data-count)−0.25, renormalized so that the average was 1.
+C.6
+INPUT DATA NORMALIZATION
+As mentioned in (LeCun et al., 2012, Section 4.3), when training neural networks it is helpful to nor-
+malize the input data so that it is zero mean and so that more important dimensions of input data have
+a larger variance. We wanted a generic way to achieve this that would be invariant to arbitrary afﬁne
+transforms of the input. The technique we developed requires as statistics a within-class covariance
+W and a between-class covariance B, accumulated from the class-labeled data as if in preparation
+for multi-class Linear Discriminant Analysis (LDA). Assume in what follows that we have already
+normalized the data so that it is zero-mean. For the technique we are about to describe to make
+sense, the number of classes should not be much smaller than the feature dimension; fortunately, in
+our case it is much larger– 5000 > 300, to give typical numbers.
+Suppose we were to do multi-class LDA but not actually reduce the dimension. We would transform
+into a space where W was unit and B was diagonalized. Suppose the B in this space has diagonal
+elements bi. Then the total covariance in each dimension i is bi + 1. This has the desirable property
+that the data covariance is higher in “more important” directions, but it doesn’t drop as fast as
+we’d like for unimportant directions– it never goes below 1. In our method, we do the LDA-type
+transform as mentioned above, then scale each row of the transform by
+p
+(bi + 0.001)/(bi + 1).
+After this scaling, the total covariance becomes bi + 0.001, where bi is the ratio of between-class to
+within-class covariance. This seems to work well.
+After creating the transform matrix as described above, we do a singular value decomposition on
+it, ﬂoor the singular values (normally to 5), and reconstruct again. The motivation here is to avoid
+a rarely encountered pathology that occurs when the training data covariance was close to singular,
+which leads to a transform with very large elements, that might produce very large transformed data
+values on mismatched test data or due to roundoff. This step rarely ﬂoors more than a handful of
+singular values so has little effect on the transform.
+4Thanks to Minhua Wu
+25
+
+Accepted as a workshop contribution at ICLR 2015
+C.7
+PARAMETER INITIALIZATION
+We decided not to implement generative pre-training as in (Hinton et al., 2006), because while it is
+well established that it improves results for small datasets, our understanding is that as the amount
+of training data gets larger, it eventually gives no improvement compared to a suitable random
+initialization or discriminative layer-wise backpropagation as in (Seide et al., 2011a). We could
+not ﬁnd a published reference for this; it is something we have been told verbally. We refer here
+speciﬁcally to speech recognition tasks; this does not apply to tasks like computer vision where
+much larger networks are used. In fact, the alternative “nnet1” implmentation of DNNs in Kaldi
+does support pre-training, and for small datasets (say, 50 hours or less), it generally gives slightly
+better results than the “nnet2” implementation which we speak of here. For larger datasets, the
+“nnet1” implementation eventually becomes impractical to run because it takes too long, and a
+detailed comparison is way beyond the scope of this paper.
+Instead of pre-training, we use what is described in (Seide et al., 2011a) as layer-wise back-
+propagation (BP). What this means is, we initialize a network with one hidden layer, train with
+BP for a short time (two “outer iterations” for our experiments reported here), then remove the ﬁnal
+softmax layer and add a new, randomly initialized hidden layer on top of the existing hidden layer;
+train for a short time again; and repeat the process until we have the desired number of hidden layers.
+Similar to (Glorot & Bengio, 2010), we use a standard deviation of
+1
+√
+i for the weights, where i is
+the fan-in to the weight matrix; but we initialize the parameters of softmax layers to zero. Note: we
+found it essential to discard the parameters of the ﬁnal softmax layer when adding each new hidden
+layer, as prescribed in (Seide et al., 2011a).
+For smaller datasets we can improve results versus layer-wise BP by initializing all but the last layer
+of the network from a network trained on another large dataset, possibly from another language.
+When initializing this way we typically ﬁnd it best to use a larger network than we otherwise would
+have used.
+Because we noticed that sometimes on an outer iteration immediately following the random initial-
+ization of parameters (including the ﬁrst outer iteration), the parameter averaging can degrade rather
+than improve the objective function, we modiﬁed our parallel training method so that on these iter-
+ations, instead of averaging the parameters we choose the one that had the best objective function
+computed on the subset of data that it was trained on (this approach avoids any extra computation).
+C.8
+SEQUENCE TRAINING
+Sequence training (Mohamed et al., 2010) is a term that has the the same meaning for DNNs that
+“discriminative training” (Povey, 2004) has in the speech recognition community for GMMs. It is a
+collective term for various objective functions used for training DNNs for sequence tasks, that only
+make sense at the whole-sequence level. This contrasts with the cross-entropy objective function
+which, given a ﬁxed Viterbi alignment of the HMM states, easily decomposes over the frames of
+training data. In GMM-based speech recognition, the term “discriminative training” contrasts with
+Maximum Likelihood estimation; in DNN-based speech recognition it contrasts with cross-entropy
+training. There are two popular classes of sequence/discriminative objective functions:
+• Maximum Mutual Information (MMI)-like objective functions (Bahl et al., 1986; Povey,
+2004), more properly called conditional maximum likelihood: these have the form of sum
+over all utterances of the log-posterior of the correct word sequence for each utterance,
+given the model and the data. These include its popular ’boosted’ variant (Povey et al.,
+2008) which is inspired by margin-based objective functions.
+• Minimum Bayes Risk (MBR)-like objective functions: popular variants include Minimum
+Phone Error (MPE) (Povey. & Woodland, 2002; Povey, 2004) and state-level Minimum
+Bayes Risk (M. & T., 2006; Povey & Kingsbury, 2007). These have the form of an ex-
+pectation, given the data and the model, of an edit-distance type of error. We can compute
+its derivative w.r.t. the model parameters, because the posteriors of the different sequences
+vary with the model parameters.
+This paper is mainly about our parallel approach to standard cross-entropy training. However, we
+also apply the same ideas (model averaging, NG-SGD) to sequence training. We generally use
+26
+
+Accepted as a workshop contribution at ICLR 2015
+state-level Minimum Bayes Risk (sMBR) (M. & T., 2006; Povey & Kingsbury, 2007) although we
+have also implemented Minimum Phone Error (MPE) (Povey. & Woodland, 2002) and Boosted
+MMI (Povey et al., 2008). The high-level details of our lattice-based training procedure are similar
+to (Vesel`y et al., 2013), but note that in that paper we describe an alternative implementation of
+deep neural nets (the “nnet1” setup) that exists within Kaldi; this paper is about the alternative
+“nnet2” setup. Some items in common with the sequence training described in that paper include
+the following:
+• We use a low, ﬁxed learning rate (e.g. 0.00002).
+• We generally train for about 4 epochs.
+Some differences include the following:
+• We do parallel SGD on multiple machines, with periodic model averaging.
+• Rather than randomizing at the utterance level, we split the lattice into as small pieces as
+possible given the lattice topology, and excise parts of the lattice that would not contribute
+nonzero derivatives; and we randomize the order of the remaining pieces.
+• To ensure that all layers of the network are trained about the same amount, we modify
+the learning rates in order to ensure that the relative change in parameters on each “outer
+iteration” is the same for each layer; their geometric average is constrained to equal the
+user-speciﬁed ﬁxed learning rate (e.g. 0.00002) which we mentioned above.
+• In our recipe, we generate the lattices only once.
+• The minibatches actually consist of several small chunks of lattice (split as described
+above), from many different utterances, spliced together.
+Something that we should note in connection with the learning rates is that for p-norm networks,
+since the network output is invariant to (nonzero) scaling of the parameters of the p-norm layers5, and
+since the generalized weighted combination of Section C.4 may output arbitrarily scaled weights,
+it is hard to specify in advance a suitable learning rate. To solve this problem, we ﬁrst scale the
+parameters of p-norm layers so so that the expected square of a randomly chosen matrix element is
+one.
+For sequence training, because the frames in a minibatch are not drawn independently from the
+training data but consist of sequential frames from one or a few utterances, our “simple” NG-SGD
+method is not applicable, and we only apply the online method.
+C.9
+ONLINE DECODING AND I-VECTOR INPUTS
+In speech recognition applications it is sometimes necessary to process data continuously as it ar-
+rives, so that there will be no latency in response. This makes it necessary that the algorithms used
+should not have any dependencies that are “backwards” in time. Backwards-in-time dependencies
+in our conventional neural net recipes, e.g. as reported in (Zhang et al., 2014), include cepstral mean
+normalization (CMN), in which we subtract the mean of the input features; and fMLLR adaptation,
+also known as constrained MLLR adaptation (Gales & Woodland, 1996), in which we use a baseline
+GMM system to compute a likelihood-maximizing linear transform of the features. Although we
+use “online” versions of both of these things for online GMM-based decoding, it makes the system
+very complex and is not ideal for combination with DNNs.
+In order to have a system that is easier to turn into an online algorithm, we use i-vectors (Dehak et al.,
+2011) as an additional input to the neural network, in addition to the spliced cepstral features. This
+has been done before, e.g. Saon et al. (2013); Bacchiani (2013). An i-vector is a vector normally of
+dimension in the range of several hundred, that represents speaker characteristics in a form suitable
+for speaker identiﬁcation, and which is extracted in a Maximum Likelihood way in conjunction with
+a single mixture-of-Gaussians model (their means are regressed on the i-vector). The parameters
+of the factor analysis model that extracts the i-vectors are trained without any supervision, just
+on a large number of audio recordings. In our case we extract i-vectors of dimension 100. Once
+the i-vector extractor is trained, we switch to “online” extraction of i-vectors for both training and
+5This is thanks to the “renormalization layers” that follow each p-norm layer (Zhang et al., 2014)
+27
+
+Accepted as a workshop contribution at ICLR 2015
+decoding, in which only frames preceding the current frame are taken as inputs to the i-vector
+estimation process. At the beginning of the utterance, the i-vector will be zero due to the prior term.
+The actual inputs to the DNN in this setup normally consist of the i-vector, plus ±7 frames of
+Mel frequency cepstral coefﬁcients (MFCCs) (Davis & Mermelstein, 1980), without cepstral mean
+normalization. Some other authors (Senior & Lopez-Moreno, 2014) use log Mel ﬁlterbank energies;
+the MFCC features we use here are equivalent to log Mel ﬁlterbank energies because MFCCs are
+a linear transform of them (we use the same number of coefﬁcients as ﬁlterbanks, 40 for these
+experiments) and our input data normalization (Section C.6) is invariant to such transforms; we only
+use MFCCs because they are more easily compressible and our “training example” data structure
+(Appendix C.2) compresses the input features.
+In order to train models that are well matched both to per-speaker decoding, where statistics from
+previous utterances of the same speaker are included in the i-vector estimation, and per-utterance
+decoding, where we make a fresh start each time, we generally train after splitting the speakers into
+“fake” speakers that each have no more than two utterances.
+In experiments on a number of datasets, we have generally found that this method gives us about
+the same performance as our previous recipe where we trained a DNN on top of ±4 frames of the
+standard 40-dimensional features consisting of mean-normalized MFCC features processed with
+LDA and MLLT, and speaker adapted with fMLLR (a.k.a. constrained MLLR (Gales & Woodland,
+1996)). We prefer it due to its convenience for applications and its convenience for cross-system
+transfer learning.
+28
+

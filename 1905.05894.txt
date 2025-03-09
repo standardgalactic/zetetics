@@ -1,0 +1,2551 @@
+Online Normalization for Training Neural Networks
+Vitaliy Chiley∗
+Ilya Sharapov∗
+Atli Kosson
+Urs Koster
+Ryan Reece
+Sofía Samaniego de la Fuente
+Vishal Subbiah
+Michael James∗†
+Cerebras Systems
+175 S. San Antonio Road
+Los Altos, California 94022
+Abstract
+Online Normalization is a new technique for normalizing the hidden activations
+of a neural network. Like Batch Normalization, it normalizes the sample dimen-
+sion. While Online Normalization does not use batches, it is as accurate as Batch
+Normalization. We resolve a theoretical limitation of Batch Normalization by intro-
+ducing an unbiased technique for computing the gradient of normalized activations.
+Online Normalization works with automatic differentiation by adding statistical
+normalization as a primitive. This technique can be used in cases not covered by
+some other normalizers, such as recurrent networks, fully connected networks,
+and networks with activation memory requirements prohibitive for batching. We
+show its applications to image classiﬁcation, image segmentation, and language
+modeling. We present formal proofs and experimental results on ImageNet, CIFAR,
+and PTB datasets.
+1
+Introduction
+Traditionally, neural networks are functions that map inputs deterministically to outputs. Normaliza-
+tion makes this non-deterministic because each sample is affected not only by the network weights
+but also by the statistical distribution of samples. Therefore, normalization re-deﬁnes neural networks
+to be statistical operators. Normalized networks treat each neuron’s output as a random variable that
+ultimately depends on the network’s parameters and input distribution. No matter how it is stimulated,
+a normalized neuron produces an output distribution with zero mean and unit variance.
+While normalization has enjoyed widespread success, current normalization methods have theoretical
+and practical limitations. These limitations stem from an inability to compute the gradient of the
+ideal normalization operator.
+Batch methods are commonly used to approximate ideal normalization. These methods use the
+distribution of the current minibatch as a proxy for the distribution of the entire dataset. They produce
+biased estimates of the gradient that violate a fundamental tenet of stochastic gradient descent (SGD):
+It is not possible to recover the true gradient from any number of small batch evaluations. This bias
+becomes more pronounced as batch size is reduced.
+Increasing the minibatch size provides more accurate approximations of normalization and its gradient
+at the cost of increased memory consumption. This is especially problematic for image processing
+and volumetric networks. Here neural activations outnumber network parameters, and even modest
+batch sizes reduce the trainable network size by an order of magnitude.
+∗Equal contribution
+†Corresponding author: michael@cerebras.net
+33rd Conference on Neural Information Processing Systems (NeurIPS 2019), Vancouver, Canada.
+arXiv:1905.05894v3  [cs.LG]  3 Dec 2019
+
+Online Normalization is a new algorithm that resolves these limitations while matching or exceeding
+the performance of current methods. It computes unbiased activations and unbiased gradients without
+any use of batching. Online Normalization differentiates through the normalization operator in a
+way that has theoretical justiﬁcation. We show the technique working at scale with the ImageNet [1]
+ResNet-50 [2] classiﬁcation benchmark, as well as with smaller networks for image classiﬁcation,
+image segmentation, and recurrent language modeling.
+Instead of using batches, Online Normalization uses running estimates of activation statistics in the
+forward pass with a corrective guard to prevent exponential behavior. The backward pass implements
+a control process to ensure that back-propagated gradients stay within a bounded distance of true
+gradients. A geometrical analysis of normalization reveals necessary and sufﬁcient conditions that
+characterize the gradient of the normalization operator. We further analyze the effect of approximation
+errors in the forward and backward passes on network dynamics. Based on our ﬁndings we present the
+Online Normalization technique and experiments that compare it with other normalization methods.
+Formal proofs and all details necessary to reproduce results are in the appendix. Additionally we
+provide reference code in PyTorch, TensorFlow, and C [3].
+2
+Related work
+Ioffe and Szegedy introduced normalization of hidden activations [4], deﬁning it as a transformation
+that uses full dataset statistics to eliminate internal covariate shift. They observed that the inability
+to differentiate through a running estimator of forward statistics produces a gradient that leads to
+divergence [5]. They resolved this with the Batch Normalization method [4]. During training, each
+minibatch is used as a statistical proxy for the entire dataset. This allows use of gradient descent
+without a running estimator process. However, training still maintains running estimates for use
+during validation and inference.
+The success of Batch Normalization has inspired a number of related methods that address its
+limitations. They can be classiﬁed as functional or heuristic methods.
+Functional methods replace the normalization operator with a normalization function. The func-
+tion is chosen to share certain properties of the normalization operator. Layer Normalization [6]
+normalizes across features instead of across samples. Group Normalization [7] generalizes this by
+partitioning features into groups. Weight Normalization [8] and Normalization Propagation [9] apply
+normalization to network weights instead of network activations.
+The advantage of functional normalizers is that they ﬁt within the SGD framework, and work in
+recurrent networks and large networks. However, when compared directly to batch normalization
+they generally perform worse [7].
+Heuristic methods use measurements from previous network iterations to augment the current
+forward and backward passes. These methods do not differentiate through the normalization operator.
+Instead, they combine terms from previous batch-based approximations. An advantage of heuristic
+normalizers is that they use more data to generate better estimates of forward statistics; however, they
+lack correctness and stability guarantees.
+Batch Renormalization [5] is one example of a heuristic method. While it uses an online process to
+estimate dataset statistics, these estimates are based on batches and are only allowed to be within a
+ﬁxed interval of the current batch’s statistics. Batch Renormalization does not differentiate through
+its statistical estimation process, and like Instance Normalization [10], it cannot be used with fully
+connected layers at a batch size of one.
+Streaming Normalization [11] is also a heuristic method. It performs one weight update for every
+several minibatches. Instead of differentiating through the normalization operator, it averages point
+gradients at long and short time scales. It applies a different mixture in a saw-tooth pattern to each
+minibatch depending on its timing relative to the latest weight update.
+In recurrent networks, circular dependencies between sample statistics and activations pose a chal-
+lenge to normalization [12, 13, 14]. Recurrent Batch Normalization [12] offers the approach of
+maintaining distinct statistics for each time step. At inference this results in a different linear op-
+eration being applied at each time step, breaking the formalism of recurrent networks. Functional
+normalizers avoid circular dependencies and have been shown to perform better [6].
+2
+
+P⃗1⊥(⃗x)
+⃗x
+SN−1
+⃗1⊥
+⃗y
+0
+SN−2
+T⃗y
+(a)
+⃗y ′
+P⃗1⊥(⃗y ′)
+P⃗1⊥∩⃗y⊥(⃗y ′)
+⃗x ′
+⃗1⊥
+⃗y⊥
+⃗1⊥∩⃗y⊥
+0
+(b)
+Figure 1: Geometry of normalization.
+3
+Principles of normalization
+Normalization is an afﬁne transformation fX that maps a scalar random variable x to an output y with
+zero mean and unit variance. It maps every sample in a way that depends on the distribution X,
+fX [x] ≡x −µ[x]
+σ [x]
+x ∼X ,
+(1)
+resulting in normalized output y satisfying
+µ[y] = 0
+and
+µ
+
+y2
+= 1 .
+(2)
+When we apply normalization to network activations, the input distribution X is itself functionally
+dependent on the state of the network, in particular on the weights of all prior layers. This poses a
+challenge for accurate computation of normalization because at no point in time can we observe the
+entire distribution corresponding to the current values of the weights.
+Backpropagation uses the chain rule to compute the derivative of the loss function L with respect to
+hidden activations. We express this using the convention (·)′ = ∂L/∂(·) as
+x′ = ∂fX[x]
+∂x
+[y′] .
+(3)
+It is not obvious how to handle the derivative in the preceding equation, which is itself a statistical
+operator. The usual approaches do not work: Automatic differentiation cannot be applied to expec-
+tations. Exact computation over the entire dataset is prohibitive. Ignoring the derivative causes a
+feedback loop between gradient descent and the estimator process, leading to instability [4].
+Batch Normalization avoids these challenges by freezing the network while it measures the statistics
+of a batch. Increasing batch size improves accuracy of the gradients but also increases memory
+requirements and potentially impedes learning. We started our study with the question: Is freezing
+the network the only way to resolve interference between an estimator process and gradient descent?
+It is not. In the following sections we will show how to achieve the asymptotic accuracy of large
+batch normalization while inspecting only one sample at a time.
+3.1
+Properties of normalized activations and gradients
+Differential geometry provides key insights on normalization. Let ⃗x ∈RN be a ﬁnite-dimensional
+vector whose components approximate the normalizer’s input distribution. In the geometric setting,
+normalization is a function deﬁned on RN. Its output ⃗y satisﬁes both conditions of (2). The zero
+mean condition is satisﬁed on the subspace ⃗1⊥orthogonal to the ones vector, whereas the unit
+variance condition is satisﬁed on the sphere SN−1 with radius
+√
+N (Figure 1a). Therefore ⃗y lies on
+the manifold SN−2 = ⃗1⊥∩SN−1.
+Clearly, mapping RN to a sphere is nonlinear. The forward pass (1) does this in two steps: It subtracts
+the same value from all components of ⃗x, which is orthogonal projection P⃗1⊥; then it rescales the
+3
+
+SN−1
+✓−1
++1
+◆
+✓+1
+−1
+◆
+P~1?
+x1
+x0
+SN−2 =
+⇢✓−1
++1
+◆
+,
+✓+1
+−1
+◆$
+y =
+✓−1
++1
+◆
+y =
+✓+1
+−1
+◆
+Figure 2: Two element normalization (N=2).
+2
+4
+8
+16
+32
+64
+128
+Batch size
+2°
+4°
+8°
+16°
+32°
+Bias
+Figure 3: Gradient bias (BN).
+result to SN−1. In contrast, the backward pass (3) is linear because the chain rule produces a product
+of Jacobians. The Jacobian J = [∂yj/∂xi] must suppress gradient components that would move ⃗y off
+the manifold’s tangent space. SN−2 is a sphere embedded in a subspace, so its tangent space T⃗y at ⃗y
+is orthogonal to both the sphere’s radius ⃗y and the subspace’s complement ⃗1.
+⃗x ′ = J⃗y ′
+=⇒
+P⃗1(⃗x ′) = P⃗y(⃗x ′) = 0 .
+(4)
+Because (1) is the composition of two steps, J is a product of two factors (Figure 1b). The unbiasing
+step P⃗1⊥is linear and therefore is also its own Jacobian. The scaling step is isotropic in ⃗y⊥and
+therefore its Jacobian acts equally to all components in ⃗y⊥scaling them by σ. The remaining ⃗y
+component must be suppressed (4), resulting in:
+J = 1
+σ P⃗1⊥P⃗y⊥
+=⇒
+⃗x ′ = 1
+σ
+ I −P⃗1
+
+(I −P⃗y) ⃗y ′ .
+(5)
+This is the exact expression for backpropagation through the normalization operator. It is also possible
+to reach the same conclusion algebraically [5] (Appendix B).
+The input ⃗x is a continuous function of the neural network’s weights and dataset distribution. During
+training, the incremental weight updates cause ⃗x to drift. Meanwhile, normalization is only presented
+with a single scalar component of ⃗x while the other components remain unknown. Online Normaliza-
+tion handles this with an online control process that examines a single sample per step while ensuring
+(5) is always approximately satisﬁed throughout training.
+3.2
+Bias in gradient estimates
+Although normalization applies an afﬁne transformation, it has a nonlinear dependence on the input
+distribution X. Therefore, sampling the gradient of a normalized network with mini-batches results
+in biased estimates. This effect becomes more pronounced for smaller mini-batch sizes. Consider
+the extreme case of normalizing a fully connected layer with batch size two (Figure 2). Each pair
+of samples is transformed to either (−1, +1) or (+1, −1), resulting in a piecewise constant surface.
+Since the output is discrete, the corresponding gradient is zero almost everywhere. Of course, the
+true gradient is nonzero almost everywhere and therefore cannot be recovered from any number of
+batch-two evaluations.
+The same effect can be seen in more realistic cases. Figure 3 shows gradient bias as a function of
+batch size measured for a convolutional network with the CIFAR-10 dataset [15]. Ground truth for
+this plot used all 50,000 images in the dataset with weights randomly initialized and ﬁxed. Even in
+this simple scenario, moderate batch sizes exhibit bias exceeding an angle of 10 degrees.
+3.3
+Exploding and vanishing activations
+All normalizers are presented with the task of calculating speciﬁc values of the afﬁne coefﬁcients
+µ[x] and σ[x] for the forward pass (1). Exact computation of these coefﬁcients is impossible without
+processing the entire dataset. Therefore, SGD-based optimizers must admit errors in normalization
+statistics. These errors are problematic for networks that have unbounded activation functions, such
+as ReLU. It is possible for the errors to amplify through the depth of the network causing exponential
+growth of activation magnitudes.
+Figure 4 shows exponential behavior for a 100-layer fully connected network with a synthetic dataset.
+In each layer we compute exact afﬁne coefﬁcients using the entire dataset. We randomly perturb
+4
+
+-10%
+-5%
+0%
+5%
+10%
+Perturbation magnitude 
+-10%
+-5%
+0%
+5%
+10%
+Growth rate per layer
+=  without Layer Scaling
+~
+(0, ) without Layer Scaling
+With Layer Scaling
+Figure 4: Activation growth.
+η E |w′|
+|w|
+ηλ|w|
+Figure 5: Weight equilibrium.
+the coefﬁcients before applying inference to assess the sensitivity to errors. Exponential behavior is
+easy to observe even with mild noise. This effect is particularly pronounced when variances σ2 are
+systematically underestimated, in which case each layer ampliﬁes the signal in expectation.
+Batch Normalization does not exhibit exponential behavior. Although its estimates contain error,
+exact normalization of a batch of inputs imposes (2) as strict constraints on normalized output. For
+each layer, the largest possible output component is bounded by the square root of the batch size.
+Exponential behavior is precluded because this bound does not depend on the depth of the network.
+This property is also enjoyed by Layer Normalization and Group Normalization.
+Any successful online procedure will also need a mechanism to avoid exponential growth of activa-
+tions. With a bounded activation function, such as tanh, this is achieved automatically. Layer scaling
+(Figure 4) that enforces the second equality of (2) across all features in a layer is another possible
+mechanism that prevents both growth and decay of activations.
+3.4
+Invariance to gradient scale
+When a normalizer follows a linear layer, the normalized output is invariant to the scale of the weights
+|w| [5, 6]. Scaling the weights by any constant is immediately absorbed by the normalizer. Therefore,
+∂y/∂|w| is zero and gradient descent makes steps orthogonal to the weight vector (Figure 5). With
+a ﬁxed learning rate η, a sequence of steps of size O(η) leads to unbounded growth of |w|. Each
+successive step will have decreasing relative effect on the weight change reducing the effective
+learning rate.
+Others have observed that the L2 weight decay [16] commonly used in normalized networks coun-
+teracts the growth of |w|. In particular, [17] analyzes this phenomenon, although under a faulty
+assumption that gradients are not backpropagated through the mean and variance calculations. In-
+stead, we observe that weight growth and decay are balanced when weights reach an equilibrium
+scale (Figure 5). We denote the gradient with respect to weights w′ and the increment in weights
+∆w ≡ηw′. When η and decay factor λ are small, solving for equilibrium yields (Appendix C):
+|w| =
+r η
+2λE |w′| .
+(6)
+The equilibrium weight magnitude depends on η. When the weights are away from their equilibrium
+magnitude, such as at initialization and after each learning rate drop, the weights tend to either grow
+or diminish network-wide. This tendency can create a biased error in statistical estimates that can
+lead to exponential behavior (Section 3.3).
+Scale invariance with respect to the weights means that the learning trajectory depends only on the
+ratio ∆w/|w| and the problem can be arbitrarily reparametrized as long as this ratio is kept constant.
+This shows that L2 weight decay does not have a regularizing effect; it only corrects for the radial
+growth artifact introduced by the ﬁnite step size of SGD.
+When weights are in the equilibrium described by (6),
+∆w
+|w| =
+p
+2ηλ
+w′
+E |w′| .
+(7)
+This equation shows that learning dynamics are invariant to the scale of the distribution of gradients
+E |w′|. We also observe that the effective learning rate is √2ηλ. This correspondence was indepen-
+5
+
+Aﬃne
+norm (8a)
+Mean
+tracker (8b)
+Variance
+tracker (8c)
+Aﬃne
+train
+ 
+y-projection (11a)
+y-error accu- 
+mulator (11b)
+Scaling +
+-projection (12a)
+-error accu-
+mulator (12b)
+Forward estimator process
+Backward control process
+Scaling
+features
+features
+~1
+~1
+Layer   
+scaling (9)
+z-projection
+      + scaling (10)
+x
+β
+γ
+{x}
+{x0}
+{y0}
+{z0}
+{z}
+{y}
+y0
+x0
+µ
+σ
+˜x0
+y
+Optional
+⇣
+"(1)
+"(y)
+Required for unbounded 
+activation functions, e.g. ReLU.
+Figure 6: Online Normalization.
+dently observed by Page [18]. Practitioners tend to use linear scaling of the learning rate with batch
+size [19] while keeping the L2 regularization constant λ ﬁxed. Equation (7) shows that this amounts
+to the square root scaling suggested earlier by Krizhevsky [20].
+4
+Online Normalization
+To deﬁne Online Normalization (Figure 6), we replace arithmetic averages over the full dataset in
+(2) with exponentially decaying averages of online samples. Similarly, projections in (4) and (5) are
+computed over online data using exponentially decaying inner products. The decay factors αf and αb
+for forward and backward passes respectively are hyperparameters for the technique.
+We allow incoming samples xt, such as images, to have multiple scalar components and denote
+feature-wide mean and variance by µ(xt) and σ2 (xt). The algorithm also applies to outputs of fully
+connected layers with only one scalar output per feature. In fact, this case simpliﬁes to µ(xt) = xt
+and σ (xt) = 0. We use scalars µt and σt to denote running estimates of mean and variance across
+all samples. The subscript t denotes time steps corresponding to processing new incoming samples.
+Online Normalization uses an ongoing process during the forward pass to estimate activation means
+and variances. It implements the standard online computation of mean and variance [21, 22]
+generalized to processing multi-value samples and exponential averaging of sample statistics. The
+resulting estimates directly lead to an afﬁne normalization transform.
+yt = xt −µt−1
+σt−1
+(8a)
+µt = αfµt−1 + (1 −αf)µ(xt)
+(8b)
+σ2
+t = αfσ2
+t−1 + (1 −αf)σ2 (xt) + αf(1 −αf) (µ(xt) −µt−1)2
+(8c)
+This process removes two degrees of freedom for each feature that may be restored adding another
+afﬁne transform with adaptive bias and gain. Corresponding equations are standard in normalization
+literature [4] and are not reproduced here. The forward pass concludes with a layer-scaling stage that
+uses data from all features to prevent exponential growth (Section 3.3):
+zt = yt
+ζt
+with
+ζt =
+q
+µ({y2
+t }) ,
+(9)
+where {·} includes all features.
+The backward pass proceeds in reverse order, starting with the exact gradient of layer scaling:
+y′
+t = z′
+t −ztµ({ztz′
+t})
+ζt
+.
+(10)
+6
+
+Table 1: Memory for training (GB).
+Network
+Online
+Batch
+Norm
+32
+128
+ResNet-50, ImageNet
+1
+2
+4
+ResNet-50, PyTorcha
+2
+5
+15
+U-Net, 1503 voxels
+1
+29
+115
+U-Net, 2503 voxels
+6
+195
+785
+U-Net, 10242 pixels
+2
+31
+123
+U-Net, 20482 pixels
+5
+137
+546
+a PyTorch stores multiple copies of
+activations for improved performance.
+Table 2: Best validation: loss (accuracy%).
+Normalizer CIFAR-10
+ResNet-20
+CIFAR-100
+ResNet-20
+ImageNet
+ResNet-50
+Online
+0.26 (92.3) 1.12 (68.6) 0.94 (76.3)
+Batcha
+0.26 (92.2) 1.14 (68.6) 0.97 (76.4)
+Group
+0.32 (90.3) 1.35 (63.3)
+(75.9)b
+Instance
+0.31 (90.4) 1.32 (63.1)
+(71.6)b
+Layer
+0.39 (87.4) 1.47 (59.2)
+(74.7)b
+Weight
+-
+-
+(67
+)b
+Propagation
+-
+-
+(71.9)b
+a Batch size 128 for CIFAR and 32 for ImageNet.
+b Data from [7, 23, 24].
+The backward pass continues through per-feature normalization (8) using a control mechanism to
+back out projections deﬁned by (5). We do it in two steps, controlling for orthogonality to ⃗y ﬁrst
+˜x′
+t = y′
+t −(1 −αb)ε(y)
+t−1yt
+(11a)
+ε(y)
+t
+= ε(y)
+t−1 + µ(˜x′
+tyt)
+(11b)
+and then for the mean-zero condition
+x′
+t =
+˜x′
+t
+σt−1
+−(1 −αb)ε(1)
+t−1
+(12a)
+ε(1)
+t
+= ε(1)
+t−1 + µ(x′
+t) .
+(12b)
+Gradient scale invariance (Section 3.4) shows that scaling with the running estimate of input variance
+σt in (12a) is optional and can be replaced by rescaling the output x′
+t with a running average to force
+it to the unit norm in expectation.
+Formal Properties
+Online Normalization provides arbitrarily good approximations of ideal nor-
+malization and its gradient. The quality of approximation is controlled by the hyperparameters αf,
+αb, and the learning rate η. Parameters αf and αb determine the extent of temporal averaging and η
+controls the rate of change of the input distribution. Online Normalization also satisﬁes the gradient’s
+orthogonality requirements. In the course of training, the accumulated errors ε(y)
+t
+and ε(1)
+t
+that track
+deviation from orthogonality (5) remain bounded. Formal derivations are in Appendix D.
+Memory Requirements
+Networks that use Batch Normalization tend to train poorly with small
+batches. Larger batches are required for accurate estimates of parameter gradients, but activation
+memory usage increases linearly with batch size. This limits the size of models that can be trained on
+a given system. Online Normalization achieves same accuracy without requiring batches (Section 5).
+Table 1 shows that using batches for classiﬁcation of 2D images leads to a considerable increase
+in the memory footprint; for 3D volumes, batching becomes prohibitive even with modestly sized
+images.
+5
+Experiments
+We demonstrate Online Normalization in a variety of settings. In our experience it has ported easily to
+new networks and tasks. Details for replicating experiments as well as statistical characterization of
+experiment reproducibility are in Appendix A. Scripts to reproduce our results are in the companion
+repository [3].
+CIFAR image classiﬁcation (Figures 7-8, Table 2). Our experiments start with the best-published
+hyperparameter settings for ResNet-20 [2] for use with Batch Normalization on a single GPU. We ac-
+cept these hyperparameters as ﬁxed values for use with Online Normalization. Online Normalization
+introduces two hyperparameters, decay rates αf and αb. We used a logarithmic grid sweep to deter-
+mine good settings. Then we ran ﬁve independent trials for each normalizer. Online Normalization
+had the best validation performance of all compared methods.
+7
+
+0
+50
+100
+150
+200
+250
+Epoch
+0.3
+0.4
+0.5
+0.6
+0.7
+0.8
+0.9
+Validation loss
+ON
+BN (128)
+GN
+LN
+IN
+Figure 7: CIFAR-10 / ResNet-20.
+0
+50
+100
+150
+200
+250
+Epoch
+1.00
+1.25
+1.50
+1.75
+2.00
+2.25
+2.50
+2.75
+Validation loss
+ON
+BN (128)
+GN
+LN
+IN
+Figure 8: CIFAR-100 / ResNet-20.
+0
+20
+40
+60
+80
+100
+Epoch
+1.0
+1.2
+1.4
+1.6
+1.8
+2.0
+Validation loss
+ON
+BN (32)
+Figure 9: ImageNet / ResNet-50.
+0
+5
+10
+15
+20
+25
+30
+35
+Epoch
+0.94
+0.95
+0.96
+0.97
+0.98
+Jaccard similarity
+ON
+BN (25)
+None
+Figure 10: Image Segmentation with U-Net.
+ImageNet image classiﬁcation (Figure 9, Table 2). For the ResNet-50 [2] experiment, we are reporting
+the single experimental run that we conducted. This trial used decay factors chosen based on the
+CIFAR experiments. Even better results should be possible with a sweep. Our training procedure is
+based on a protocol tuned for Batch Normalization [25]. Even without tuning, Online Normalization
+achieves the best validation loss of all methods. At validation time it is nearly as accurate as Batch
+Normalization and both methods are better than other compared methods.
+U-Net image segmentation (Figure 10). The U-Net [26] architecture has applications in segmenting
+2D and 3D images. It has been applied to volumetric segmentation in 3D scans [27]. Volumetric con-
+volutions require large memories for activations (Table 1), making Batch Normalization impractical.
+Our small-scale experiment performs image segmentation on a synthetic shape dataset [28]. Online
+Normalization achieves the best Jaccard similarity coefﬁcient among compared methods.
+0
+2
+4
+6
+8
+10
+Epoch
+85
+86
+87
+88
+89
+Validation accuracy (%)
+ON
+BN (32)
+LN
+None
+Figure 11: FMNIST with MLP.
+5
+10
+15
+20
+25
+Epoch
+125
+150
+175
+200
+225
+250
+Perplexity
+ON
+LN
+None
+Figure 12: RNN (dashed) and LSTM (solid).
+Fully-connected network (Figure 11). Online Normalization also works when normalizer inputs are
+single scalars. We used a three-layer fully connected network, 500+300 HU [29], for the Fashion
+MNIST [30] classiﬁcation task. Fashion MNIST is a harder task than MNIST digit recognition,
+and therefore provides more discrimination power in our comparison. The initial learning trajectory
+shows Online Normalization outperforms the other normalizers.
+Recurrent language modeling (Figure 12). Online Normalization works without modiﬁcation in
+recurrent networks. It maintains statistics using information from all previous samples and time
+steps. This information is representative of the distribution of all recurrent activations, allowing
+Online Normalization to work in the presence of circular dependencies (Section 2). We train word
+based language models of PTB [31] using single layer RNN and LSTM. The LSTM network uses
+normalization on the four gate activation functions, but not the memory cell. This allows the memory
+cell to encode a persistent state for unbounded time without normalization forcing it to zero mean. In
+both the RNN and LSTM, Online Normalization performs better than the other methods. Remarkably,
+the RNN using Online Normalization performs nearly as well as the unnormalized LSTM.
+8
+
+6
+Conclusion
+Online Normalization is a robust normalizer that performs competitively with the best normalizers
+for large-scale networks and works for cases where other normalizers do not apply. The technique
+is formally derived and straightforward to implement. The gradient of normalization is remarkably
+simple: it is only a linear projection and scaling.
+There have been concerns in the ﬁeld that normalization violates the paradigm of SGD [5, 8, 9]. A
+main tenet of SGD is that noisy measurements can be averaged to the true value of the gradient. Batch
+normalization has a fundamental gradient bias dependent on the batch size that cannot be eliminated
+by additional averaging or reduction in the learning rate. Because Batch Normalization requires
+batches, it leaves the value of the gradient for any individual input undeﬁned. This within-batch
+computation has been seen as biologically implausible [11].
+In contrast, we have shown that the normalization operator and its gradient can be implemented
+locally within individual neurons. The computation does not require keeping track of speciﬁc prior
+activations. Additionally, normalization allows neurons to locally maintain input weights at any scale
+of choice–without coordinating with other neurons. Finally any gradient signal generated by the
+neuron is also scale-free and independent of gradient scale employed by other neurons. In aggregate
+ideal normalization (1) provides stability and localized computation for all three phases of gradient
+descent: forward propagation, backward propagation, and weight update. Other methods do not
+have this property. For instance, Layer Normalization requires layer-wide communication and Batch
+Normalization is implemented by computing within-batch dependencies.
+We expect normalization to remain important as the community continues to explore larger and
+deeper networks. Memory will become even more precious in this scenario. Online Normalization
+enables batch-free training resulting in over an order of magnitude reduction of activation memory.
+Acknowledgments
+We thank Rob Schreiber, Gary Lauterbach, Natalia Vassilieva, Andy Hock, Scott James and Xin
+Wang for their help and comments that greatly improved the manuscript. We thank Devansh Arpit
+for insightful discussions. We also thank Natalia Vassilieva for modeling memory requirements for
+U-Net and Michael Kural for work on this project during his internship.
+References
+[1] Olga Russakovsky, Jia Deng, Hao Su, Jonathan Krause, Sanjeev Satheesh, Sean Ma, Zhiheng
+Huang, Andrej Karpathy, Aditya Khosla, Michael Bernstein, Alexander C. Berg, and Li Fei-Fei.
+ImageNet large scale visual recognition challenge. International Journal of Computer Vision
+(IJCV), 115(3):211–252, 2015.
+[2] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Deep residual learning for image
+recognition. In 2016 IEEE Conference on Computer Vision and Pattern Recognition, CVPR
+2016, Las Vegas, NV, USA, June 27-30, 2016, pages 770–778, 2016.
+[3] Vitaliy Chiley, Michael James, and Ilya Sharapov. Online Normalization reference implementa-
+tion. https://github.com/cerebras/online-normalization, 2019.
+[4] Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training
+by reducing internal covariate shift. CoRR, abs/1502.03167, 2015.
+[5] Sergey Ioffe.
+Batch renormalization: Towards reducing minibatch dependence in batch-
+normalized models. CoRR, abs/1702.03275, 2017.
+[6] Lei Jimmy Ba, Ryan Kiros, and Geoffrey E. Hinton.
+Layer normalization.
+CoRR,
+abs/1607.06450, 2016.
+[7] Yuxin Wu and Kaiming He. Group normalization. CoRR, abs/1803.08494, 2018.
+[8] Tim Salimans and Diederik P. Kingma. Weight normalization: A simple reparameterization to
+accelerate training of deep neural networks. CoRR, abs/1602.07868, 2016.
+[9] Devansh Arpit, Yingbo Zhou, Bhargava Urala Kota, and Venu Govindaraju. Normalization
+propagation: A parametric technique for removing internal covariate shift in deep networks. In
+9
+
+Proceedings of the 33nd International Conference on Machine Learning, ICML 2016, New York
+City, NY, USA, June 19-24, 2016, pages 1168–1176, 2016.
+[10] Dmitry Ulyanov, Andrea Vedaldi, and Victor Lempitsky. Instance normalization: The missing
+ingredient for fast stylization. arXiv preprint arXiv:1607.08022, 2016.
+[11] Qianli Liao, Kenji Kawaguchi, and Tomaso A. Poggio. Streaming normalization: Towards
+simpler and more biologically-plausible normalizations for online and recurrent learning. CoRR,
+abs/1610.06160, 2016.
+[12] Tim Cooijmans, Nicolas Ballas, César Laurent, and Aaron C. Courville. Recurrent batch
+normalization. CoRR, abs/1603.09025, 2016.
+[13] C. Laurent, G. Pereyra, P. Brakel, Y. Zhang, and Y. Bengio. Batch normalized recurrent neural
+networks. In 2016 IEEE International Conference on Acoustics, Speech and Signal Processing
+(ICASSP), pages 2657–2661, March 2016.
+[14] Dario Amodei, Rishita Anubhai, Eric Battenberg, Carl Case, Jared Casper, Bryan Catanzaro,
+Jingdong Chen, Mike Chrzanowski, Adam Coates, Greg Diamos, Erich Elsen, Jesse Engel,
+Linxi Fan, Christopher Fougner, Tony Han, Awni Y. Hannun, Billy Jun, Patrick LeGresley,
+Libby Lin, Sharan Narang, Andrew Y. Ng, Sherjil Ozair, Ryan Prenger, Jonathan Raiman,
+Sanjeev Satheesh, David Seetapun, Shubho Sengupta, Yi Wang, Zhiqian Wang, Chong Wang,
+Bo Xiao, Dani Yogatama, Jun Zhan, and Zhenyao Zhu. Deep speech 2: End-to-end speech
+recognition in english and mandarin. CoRR, abs/1512.02595, 2015.
+[15] Alex Krizhevsky, Vinod Nair, and Geoffrey Hinton. CIFAR-10 (Canadian Institute for Advanced
+Research). http://www.cs.toronto.edu/ kriz/cifar.html.
+[16] Anders Krogh and John A. Hertz. A simple weight decay can improve generalization. In
+Proceedings of the 4th International Conference on Neural Information Processing Systems,
+NIPS’91, pages 950–957, San Francisco, CA, USA, 1991. Morgan Kaufmann Publishers Inc.
+[17] Twan van Laarhoven.
+L2 regularization versus batch and weight normalization.
+CoRR,
+abs/1706.05350, 2017.
+[18] David Page. How to train your ResNet. https://www.myrtle.ai/2018/09/24/how_to_
+train_your_resnet/, 2018.
+[19] Priya Goyal, Piotr Dollár, Ross B. Girshick, Pieter Noordhuis, Lukasz Wesolowski, Aapo
+Kyrola, Andrew Tulloch, Yangqing Jia, and Kaiming He. Accurate, large minibatch SGD:
+training imagenet in 1 hour. CoRR, abs/1706.02677, 2017.
+[20] Alex Krizhevsky. One weird trick for parallelizing convolutional neural networks. CoRR,
+abs/1404.5997, 2014.
+[21] Tony Finch. Incremental calculation of weighted mean and variance. http://people.ds.
+cam.ac.uk/fanf2/hermes/doc/antiforgery/stats.pdf, 2009.
+[22] Tony F. Chan, Gene H. Golub, and Randall J. LeVeque. Algorithms for computing the sample
+variance: Analysis and recommendations. The American Statistician, 37:242–247, 1983.
+[23] Igor Gitman and Boris Ginsburg. Comparison of batch normalization and weight normalization
+algorithms for the large-scale image classiﬁcation. CoRR, abs/1709.08145, 2017.
+[24] Wenling Shang, Justin Chiu, and Kihyuk Sohn. Exploring normalization in deep residual
+networks with concatenated rectiﬁed linear units. In Proceedings of the Thirty-First AAAI
+Conference on Artiﬁcial Intelligence, AAAI’17, pages 1509–1516. AAAI Press, 2017.
+[25] ResNet in TensorFlow.
+https://github.com/tensorflow/models/tree/r1.9.0/
+official/resnet, 2018.
+[26] Olaf Ronneberger, Philipp Fischer, and Thomas Brox. U-net: Convolutional networks for
+biomedical image segmentation. CoRR, abs/1505.04597, 2015.
+[27] Özgün Çiçek, Ahmed Abdulkadir, Soeren S. Lienkamp, Thomas Brox, and Olaf Ronneberger. 3d
+u-net: Learning dense volumetric segmentation from sparse annotation. CoRR, abs/1606.06650,
+2016.
+[28] Naoto Usuyama. Simple PyTorch implementations of U-Net/FullyConvNet for image segmen-
+tation. https://github.com/usuyama/pytorch-unet, 2018.
+[29] Yann LeCun and Corinna Cortes. MNIST handwritten digit database. 2010.
+10
+
+[30] Han Xiao, Kashif Rasul, and Roland Vollgraf. Fashion-MNIST: a novel image dataset for
+benchmarking machine learning algorithms. CoRR, abs/1708.07747, 2017.
+[31] Mitchell Marcus, Grace Kim, Mary Ann Marcinkiewicz, Robert MacIntyre, Ann Bies, Mark
+Ferguson, Karen Katz, and Britta Schasberger. The Penn Treebank: Annotating predicate
+argument structure. In Proceedings of the Workshop on Human Language Technology, HLT ’94,
+pages 114–119, Stroudsburg, PA, USA, 1994. Association for Computational Linguistics.
+[32] The MNIST Database. http://yann.lecun.com/exdb/mnist/.
+[33] Oﬁr Press and Lior Wolf. Using the output embedding to improve language models. CoRR,
+abs/1608.05859, 2016.
+[34] Ilya Sutskever, James Martens, George Dahl, and Geoffrey Hinton. On the importance of
+initialization and momentum in deep learning. In Proceedings of the 30th International Con-
+ference on International Conference on Machine Learning - Volume 28, ICML’13, pages
+III–1139–III–1147. JMLR.org, 2013.
+11
+
+Appendix A
+Experimental details
+We give an overview of experimental details for the results presented in the paper. All experiments
+were performed on Amazon’s EC2 P3 single GPU instances.
+A.1
+ResNet
+We train ResNet using the SGD with momentum optimizer. L2 regularization is applied. A learning
+rate decay factor is applied at predeﬁned epochs. Training procedure and hyperparameters are adapted
+from [25].
+For CIFAR10 and CIFAR100 training, we adopt the hyperparameters optimized for training using
+Batch Normalization. Performing a hyperparameter search for the network with Online Normalization
+is expected to produce better results. We perform a logarithmic sweep from 1/2 through 4095/4096 to
+set the forward and backward decay factors αf and αb. Then we perform ﬁve independent runs for
+the network with Batch Normalization and Online Normalization. The results shown in Figure 7-8
+are a median of the ﬁve independent results.
+We conduct and report only a single experimental run for ImageNet training. When using Batch
+Normalization, the optimal hyperparameters for training ImageNet are given in [2] where training was
+done at batch size 256. We train our network using batch sizes appropriate for single GPU training.
+The momentum and learning rate hyperparameters are adapted using the scaling rules found in
+Appendix F. For training ResNet with Online Normalization we use the same hyperparameters used for
+training with Batch Normalization and set decay factors based on CIFAR10 experiments. Performing
+a hyperparameter search for all hyperparameters is expected to produce better performance.
+All hyperparameters are summarized in Table 3.
+Table 3: ResNet Training Hyperparameters.
+Dataset
+ImageNet
+CIFAR10
+CIFAR100
+Network
+ResNet50
+ResNet20
+ResNet20
+Epochs
+100
+250
+250
+Batch size
+32
+128
+128
+Learning rate (η)
+0.01308
+0.1
+0.1
+Optimizer momentum (µ)
+0.98692
+0.9
+0.9
+L2 constant (λ)
+10−4
+2 × 10−4
+2 × 10−4
+LR decay factor
+0.1
+0.1
+0.1
+LR decay epochs
+{30, 60, 80, 90}
+{100, 150, 200}
+{100, 150, 200}
+Forward decay factor (αf)
+.999
+1023/1024
+511/512
+Backward decay factor (αb)
+.99
+127/128
+15/16
+A.2
+U-Net
+U-Net is trained updating parameters at an update cadence of 25. Training is done for 40 epochs
+using the SGD with momentum optimizer on a synthetic image dataset [28]. L2 regularization is
+applied. A learning rate (LR) decay factor is applied at epoch 25. The dataset uses 2000 samples
+in the training set and 200 samples in the validation set. Synthetic dataset generation and model
+deﬁnition are adapted from [28]. U-Net is trained using no normalization, Batch Normalization
+and Online Normalization. Normalization is added before each ReLU as in [27]. Learning rate,
+η = m × 10−n, sweeps are performed on the network with no normalization and on the network
+with Batch Normalization. m and n are swept in the ranges 0 to 9 and 0 to 5 respectively using
+a step size of 1. We use Online Normalization as a drop-in replacement for Batch Normalization.
+The network with Online Normalization uses the learning rate found to perform optimally in the
+network with Batch Normalization. Logarithmic sweeps from 15/16 to 32767/32768 and 1/2 to 8191/8192
+are performed to set the forward and backward decay factors respectively. All hyperparameters are
+summarized in Table 4.
+12
+
+For U-Net training, and subsequent examples, we observe relatively high run to run variability
+because the datasets are small. Training the network without normalization produced a few outliers
+which show poor average performance. We report the median of 50 runs (Figure 10); reporting
+the mean would unfairly misrepresent the network without normalization as having poor expected
+performance.
+Table 4: U-Net Training Hyperparameters.
+Normalizer
+ON
+BN
+-
+Learning rate (η)
+0.04
+0.04
+0.6
+Optimizer momentum (µ)
+0.9
+0.9
+0.9
+L2 constant (λ)
+10−6
+10−6
+10−6
+LR decay factor
+0.1
+0.1
+0.1
+LR decay epoch
+25
+25
+25
+Forward decay factor (αf)
+63/64
+-
+-
+Backward decay factor (αb)
+1/2
+-
+-
+A.3
+Fully Connected
+To test the Online Normalization technique on fully connected networks we use a three-layer dense
+network, 500+300 hidden units (3-layer NN, 500+300 HU, softmax, cross entropy, weight decay
+[29, 32]), with ReLU activation functions on the Fashion MNIST [30] classiﬁcation task. The
+network is trained using the SGD optimizer and L2 regularization. We consider three cases: without
+normalization, using Batch Normalization, Layer Normalization and Online Normalization. A
+learning rate sweep in the range 0.001 to 0.02 using a step size of 0.001 and the range 0.02 to
+0.1 using a step size of 0.01 is performed for the network without normalization and with Batch
+Normalization. The networks using Layer Normalization and Online Normalization use the same
+hyperparameters found to be optimal for training when using Batch Normalization. A logarithmic
+sweep from 1/2 to 8191/8192 is performed to set the forward and backward decay factors. The optimum
+setting closely matched the hyperparameters used for ImageNet training. All hyperparameters are
+summarized in Table 5.
+Table 5: Fully Connected Network Training Hyperparameters.
+Epoch
+10
+Batch size
+32
+Learning rate (η)
+4 × 10−2
+L2 constant (λ)
+10−4
+Forward decay factor (αf)
+0.999
+Backward decay factor (αb)
+0.99
+A.4
+Recurrent Neural Network
+For the recurrent network experiments we use single layer RNN and LSTM networks. The embedding
+and decoder are "tied" to share parameters as described in [33]. The networks are trained using SGD
+and L2 regularization. The sequence length is selected uniformly in the range [1, 128] to preclude the
+network from learning a sequence length. The recurrent networks are trained in three settings: using
+no normalization, Layer Normalization and Online Normalization. A linear sweep is done to set the
+learning rate (Table 7-8). A logarithmic sweep is used to set the forward and backward decay factors
+αf and αb (Table 7-8). All hyperparameters are summarized in Table 6.
+A.5
+Gradient bias experiment
+We used a simple network to quantify gradient bias for Batch Normalization (Section 3.2, Figure 3).
+The weights are held ﬁxed to decouple learning rate changes from the bias. In our setup a single
+convolution layer with a normalizer is followed by ReLU feeding into a fully connected layer and
+13
+
+Table 6: Recurrent Network Training Hyperparameters.
+Recurrent Unit Type
+RNN
+LSTM
+Normalization type
+-
+LN
+ON
+-
+LN
+ON
+Learning rate (η)
+0.5
+0.95
+1.7
+3.5
+3.25
+6.5
+Embedding size
+200
+200
+Hidden state size
+200
+200
+Epochs
+40
+25
+Batch size
+20
+20
+L2 constant (λ)
+10−6
+10−6
+Forward decay factor (αf)
+16383/16384
+8191/8192
+Backward decay factor (αb)
+127/128
+31/32
+Table 7: RNN Network Hyperparameter Sweeps.
+Normalization type
+-
+LN
+ON
+Learning rate (η)
+0.5
+0.95
+1.7
+η sweep range
+0.05 to 0.7
+0.05 to 2
+0.05 to 2
+η sweep step size
+0.075
+0.05
+0.075
+Sweep range for αf
+511/512 to 32767/32768
+Sweep range for αb
+3/4 to 4095/4096
+Table 8: LSTM Network Hyperparameter Sweeps.
+Normalization type
+-
+LN
+ON
+Learning rate (η)
+3.5
+3.25
+6.5
+η sweep range
+2.5 to 10
+1.25 to 5.75
+1 to 10
+η sweep step size
+0.5
+1
+0.5
+Sweep range for αf
+511/512 to 32767/32768
+Sweep range for αb
+3/4 to 4095/4096
+softmax (Figure 13). We used the entire CIFAR-10 dataset to compute the ground truth gradient and
+compared it to the gradient resulting from batched computations using batch sizes in powers of two.
+The error shown represents the angle in degrees derived from cosine similarity of resulting gradients
+and the ground truth averaged over ten runs.
+Cross-
+entropy
+Softmax
+Fully
+connected
+ReLU
+Norm
+Conv
+CIFAR
+Figure 13: Network used to quantify gradient bias.
+A.6
+Statistical Characterization of Experiment Reproducibility
+The numerical values reported in Section 5 are median values for a set of runs. Figure 14 is a set of
+box-plots which statistically characterize the reproducibility of the experiments. Experiments with a
+single run are depicted using dashed lines. The run-to-run variability using Online Normalization is
+comparable to that of other normalizers.
+The sensitivity of Online Normalization to decay rates when training ResNet20 on CIFAR10 is shown
+in Figure 15. For this ﬁne-grained logarithmic sweep, the decay rates are expressed as the horizon
+of averaging h = 1/(1 −α). It shows that Online Normalization not highly sensitive to the chosen
+decay rate since the region of near-optimal performance is broad. This allows for coarser sweeps
+when generalizing the technique to different models and datasets.
+14
+
+92.2
+92.2
+GN 90.3
+IN 90.4
+LN 87.4
+5 runs
+76.3
+76.4
+1 run
+129.2
+141.9
+172
+25 runs
+0.264
+0.26
+GN 0.32
+IN 0.31
+LN 0.39
+5 runs
+0.94
+0.97
+1 run
+4.9
+5
+5.1
+25 runs
+68.6
+68.6
+GN 63.3
+IN 63.1
+LN 59.2
+5 runs
+0.977
+0.976
+0.961
+50 runs
+113.4
+121.6
+124.4
+25 runs
+1.1
+1.1
+GN 1.4
+IN 1.3
+LN 1.5
+5 runs
+0.007
+0.007
+0.01
+50 runs
+4.7
+4.8
+4.8
+25 runs
+PTB / RNN
+Perplexity
+PTB / RNN
+Loss
+PTB / LSTM
+Perplexity
+PTB / LSTM
+Loss
+ImageNet / ResNet−50
+Accuracy
+ImageNet / ResNet−50
+Loss
+SynthShape / U−Net
+Jaccard
+SynthShape / U−Net
+Loss
+CIFAR−10 / ResNet−20
+Accuracy
+CIFAR−10 / ResNet−20
+Loss
+CIFAR−100 / ResNet−20
+Accuracy
+CIFAR−100 / ResNet−20
+Loss
+ON
+LN
+None
+ON
+LN
+None
+ON
+LN
+None
+ON
+LN
+None
+ON
+BN
+ON
+BN
+ON
+BN
+None
+ON
+BN
+None
+ON
+BN
+ON
+BN
+ON
+BN
+ON
+BN
+1.1
+1.2
+1.3
+1.4
+0.006
+0.007
+0.008
+0.009
+0.010
+0.011
+4.7
+4.8
+4.9
+5.0
+60.0
+62.5
+65.0
+67.5
+0.960
+0.965
+0.970
+0.975
+0.980
+105
+115
+125
+135
+145
+0.25
+0.30
+0.35
+0.94
+0.95
+0.96
+0.97
+5.0
+5.5
+6.0
+88
+90
+92
+76.1
+76.2
+76.3
+76.4
+100
+150
+200
+250
+300
+350
+88.9
+88.8
+88.3
+88.2
+400 runs
+0.325
+0.329
+0.326
+0.332
+400 runs
+FMNIST / MLP
+Accuracy
+FMNIST / MLP
+Loss
+ON
+BN
+LN
+None
+ON
+BN
+LN
+None
+0.31
+0.32
+0.33
+0.34
+0.35
+87.5
+88.0
+88.5
+89.0
+Figure 14: Reproducibility.
+90.6
+90.6
+90.9
+91.1
+91.4
+90.9
+91.8
+91.8
+91.8
+71.3
+92
+91.9
+92.1
+91.8
+91.8
+92.1
+92.1
+92.1
+92
+92
+92
+91.9
+91.9
+92.1
+92.1
+92
+91.9
+91.7
+91.6
+91.8
+92.1
+92
+91.9
+91.6
+91
+90.8
+91.5
+91.8
+92.2
+92.1
+92
+91.6
+90.7
+90.4
+90.3
+91.3
+91.8
+91.8
+91.8
+91.6
+91.4
+90.5
+89.9
+88.9
+88.7
+69.4
+91.4
+91.5
+91.5
+91
+91.1
+89.9
+86.8
+86.8
+86.7
+88
+19.2
+24.5
+85.8
+87.7
+89
+89
+87.6
+85.9
+78.3
+78.5
+82.5
+80.5
+Mean Accuracy (over 4 runs)
+4096
+2048
+1024
+512
+256
+128
+64
+32
+16
+8
+4
+2
+2
+4
+8
+16
+32
+64
+128
+256
+512
+1024
+2048
+4096
+Backward horizon
+Forward horizon
+Figure 15: Hyperparameter sweep.
+Appendix B
+Gradient properties
+The main part of the paper proved the expression of the gradient via projections (5) based on geometric
+considerations (Section 3.1). It is also possible to derive this property without geometry. Here is an
+alternative algebraic proof.
+15
+
+Claim 1. In ﬁnite-dimensional spaces the backpropagation of the gradient of normalization (1) can
+be represented as a composition of two orthogonal projections: ⃗x ′ = 1
+σ
+ I −P⃗1
+
+(I −P⃗y) ⃗y ′.
+Proof. In the N-dimensional space transformation (1) becomes
+µ = 1
+N
+X
+i
+xi
+σ2 = 1
+N
+X
+i
+(xi −µ)2
+yi = xi −µ
+σ
+.
+(13)
+The derivatives of the mean and variance with respect to the xj are:
+∂µ
+∂xj
+= 1
+N
+(14)
+∂σ
+∂xj
+=
+1
+2σN
+X
+i
+
+2 (xi −µ)
+
+δij −1
+N
+
+=
+1
+Nσ
+X
+i
+[(xi −µ)δij] −
+1
+N 2σ
+X
+i
+(xi −µ)
+= xj −µ
+Nσ
+−0
+= yj
+N ,
+(15)
+where δij is the Kronecker delta function. The components of the Jacobian satisfy
+Jij ≡∂yi
+∂xj
+=
+(δij −∂µ
+∂xj )σ −(xi −µ) ∂σ
+∂xj
+σ2
+=
+(δij −1
+N ) −yi ∂σ
+∂xj
+σ
+= (δij −1
+N ) −yiyj
+N
+σ
+= (Nδij −1) −yiyj
+Nσ
+.
+(16)
+The j-th component of the gradient passing through normalization is
+x′
+j = ∂L
+∂xj
+=
+X
+i
+∂L
+∂yi
+∂yi
+∂xj
+=
+P
+i (y′
+i [(Nδij −1) −yiyj])
+Nσ
+= Ny′
+j −P
+i y′
+i −yj
+P
+i(y′
+iyi)
+Nσ
+= y′
+j
+σ −
+P
+i y′
+i
+Nσ
+−yj
+P
+i(y′
+iyi)
+Nσ
+= 1
+σ
+
+y′
+j −
+P
+i y′
+i
+N
+−yj
+P
+i(y′
+iyi)
+N
+
+(17)
+and
+⃗x ′ = 1
+σ
+"
+⃗y ′ −(⃗y ′,⃗1)
+N
+⃗1 −(⃗y ′, ⃗y)
+N
+⃗y
+#
+,
+(18)
+16
+
+where (·, ·) is the inner product in N dimensions.
+Because ∥⃗1∥2 = N and
+∥⃗y∥2 =
+X
+i
+y2
+i
+=
+X
+i
+N (xi −µ)2
+P
+j (xj −µ)2
+= N ,
+(19)
+we can express (18) in terms of the projections
+⃗x ′ = 1
+σ
+"
+⃗y ′ −(⃗y ′,⃗1)
+(⃗1,⃗1)
+⃗1 −(⃗y ′, ⃗y)
+(⃗y, ⃗y) ⃗y
+#
+= 1
+σ
+ I −P⃗1 −P⃗y
+
+⃗y ′ .
+(20)
+From this expression and because ⃗y is orthogonal to ⃗1, we can see that resulting gradient ⃗x ′ is
+orthogonal to both ⃗1 and ⃗y.
+Orthogonality of ⃗y and ⃗1 also implies that P⃗1P⃗y = 0 and therefore
+⃗x ′ = 1
+σ
+ I −P⃗1 −P⃗y + P⃗1P⃗y
+
+⃗y ′
+= 1
+σ
+ I −P⃗1
+
+(I −P⃗y) ⃗y ′ .
+(21)
+This proves equation (5) algebraically. Note that orthogonality conditions (4) follow from this
+representation.
+Appendix C
+Weights and gradients equilibrium conditions
+For the weight update shown in Figure 5 we have
+|w|2 −(ηE|w′|)2 = (|w| −ηλ|w|)2
+= |w|2 −2ηλ|w|2 + η2λ2|w|2
+(22)
+(ηE(|w′|))2 = (2 −ηλ)ηλ|w|2
+≈2ηλ|w|2 .
+(23)
+Solving for equilibrium norm of the weights |w| we get
+|w| =
+r η
+2λE|w′|
+(24)
+and correspondingly
+∆w
+|w| =
+ηw′
+p η
+2λE|w′|
+=
+p
+2ηλ
+w′
+E |w′|
+(25)
+matching equations (6) and (7).
+17
+
+Appendix D
+Properties of Online Normalization
+In this section we prove the properties of Online Normalization presented in Section 4. We focus on
+per-feature normalization in steps (8) and (11) and do not discuss layer scaling steps (9) and (10).
+For simplicity in subsequent derivations we only consider the case of scalar samples. A generalization
+to multi-scalar samples is straightforward but clutters the equations. Under this simpliﬁcation the
+forward process (8) can be rewritten as
+yt = xt −µt−1
+σt−1
+(26a)
+µt = αµt−1 + (1 −α)xt
+(26b)
+σ2
+t = ασ2
+t−1 + α(1 −α) (xt −µt−1)2 .
+(26c)
+This process is a standard way to compute mean and variance of the incoming sequence x via
+exponentially decaying averaging:
+µt = (1 −α)
+t
+X
+j=0
+αt−jxj
+(27)
+σt = (1 −α)
+t
+X
+j=0
+αt−j(xj −µt)2
+.
+(28)
+We start with an observation that the computation of the mean in (26) can be equivalently performed
+as a control process:
+Claim 2. Control process
+ˆyt = xt −(1 −α)εt−1
+εt = εt−1 + ˆyt.
+(29)
+is equivalent to estimator process (26b)
+ˆyt = xt −µt−1
+µt = αµt−1 + (1 −α)xt
+(30)
+with the accumulated control error εt proportional to the running mean µt
+µt = (1 −α)εt .
+(31)
+Proof. The equivalence of the ﬁrst lines is obvious. From (29) and (31) we also have
+µt = (1 −α)εt
+= (1 −α)(εt−1 + ˆyt)
+= µt−1 + (1 −α)(xt −(1 −α)εt−1)
+= µt−1 + (1 −α)(xt −µt−1)
+= αµt−1 + (1 −α)xt ,
+(32)
+which matches (30).
+To proceed we make an assumption that the input to the normalizer is bounded:
+Assumption 1. We assume that inputs x are bounded: |xt| < Cx
+∀t.
+Claim 3. Under this assumption, the accumulated output of process (30) is uniformly bounded by
+
+t
+X
+j=0
+ˆyj
+
+<
+1
+1 −αCx
+∀t .
+(33)
+18
+
+Proof. Second line of (29) implies that
+t
+X
+j=0
+ˆyj = εt .
+(34)
+From representation (27) and equality (31) we have
+
+t
+X
+j=0
+ˆyj
+
+= |εt|
+=
+|µt|
+1 −α
+=
+
+t
+X
+j=0
+αt−jxj
+
+< Cx
+∞
+X
+j=0
+αj
+=
+Cx
+1 −α .
+(35)
+Process (26) is identical to process (30) except scaling with σ
+yt =
+ˆyt
+σt−1
+.
+(36)
+To extend the result of Claim 3 to (26) we assume that there is nonzero variability in the input.
+Assumption 2. Variance of the input stream x computed via exponentially decaying averaging (26c,
+28) is uniformly bounded away from zero after initial N steps:
+σ2
+t > C2
+σ > 0
+∀t ≥N .
+(37)
+Note that this assumption only requires that there is sufﬁcient variability in the input for successful
+normalization. The ﬁrst N steps correspond to the warmup of the process when the approximated
+statistics may experience high variability.
+Claim 4. Arbitrarily long accumulated sum of output of the process (26) starting with time step N is
+uniformly bounded by
+
+t
+X
+j=N+1
+yj
+
+<
+1
+1 −α
+2Cx
+Cσ
+∀t .
+(38)
+Proof. From the bound (35) and equivalence (36) for any t have
+
+t
+X
+j=N+1
+yj
+
+=
+
+t
+X
+j=N+1
+ˆyj
+σt−1
+
+< 1
+Cσ
+
+t
+X
+j=N+1
+ˆyj
+
+≤1
+Cσ
+
+
+
+N
+X
+j=0
+ˆyj
+
++
+
+t
+X
+j=0
+ˆyj
+
+
+
+< 1
+Cσ
+2Cx
+1 −α .
+(39)
+19
+
+This uniform bound implies that the average of the normalized stream yj generated by (26) asymptot-
+ically approaches zero as the window of averaging increases.
+Claim 5. After initial N steps (Assumption 2), the output y generated by generated by (26) satisﬁes
+lim
+t→∞µt(y) ≡lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+yj
+
+= 0 ,
+(40)
+We can construct a similar result for the variance of y.
+Claim 6. Output y generated by (26) satisﬁes
+lim
+t→∞σ2
+t (y) ≡lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+(yj −µt(y))2
+
+= 1
+α
+(41)
+Proof. Based on the equality σ2(y) = µ(y2) −µ(y)2 and Claim 5 we observe that
+lim
+t→∞σ2
+t (y) = lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+y2
+j
+
+−lim
+t→∞
+1
+t µt(y)
+2
+= lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+(xj −µj−1)2
+σ2
+j−1
+
+.
+(42)
+From (26c) we have (xj −µj−1)2 = (σ2
+j −ασ2
+j−1)/(α(1−α)), and therefore
+lim
+t→∞σ2
+t (y) = lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+σ2
+j −ασ2
+j−1
+α(1 −α)σ2
+j−1
+
+
+= lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+σ2
+j −σ2
+j−1 + (1 −α)σ2
+j−1
+α(1 −α)σ2
+j−1
+
+
+= lim
+t→∞
+
+1
+t
+N+t
+X
+j=N+1
+σ2
+j −σ2
+j−1
+α(1 −α)σ2
+j−1
+
++ 1
+α
+= 1
+α .
+(43)
+Note that the resulting asymptotic variance approaches 1 as α approaches 1 (in our experiments
+α ≈0.999). Additionally, any ﬁxed asymptotic variance in all features will be absorbed in subsequent
+layer scaling bringing resulting variance to 1.
+Combined, the previous two claims prove the following property.
+Property 1. Output y generated by the forward pass of Online Normalization (26) is asymptotically
+mean zero and unit variance.
+Now we analyze the stability of the algorithm with respect to imperfect estimates µ and σ.
+Claim 7. Derivatives of the output y generated by (26) with respect to µ and σ are bounded.
+Proof. We ﬁrst observe that under previous assumptions y is bounded
+|yt| =
+
+xt −µt−1
+σt−1
+
+≤
+
+1
+σt−1
+ (|xt| + |µt−1|)
+< 2Cx
+Cσ
+≡Cy .
+(44)
+20
+
+The derivatives of y are
+
+∂yt
+∂µt−1
+ =
+
+1
+σt−1
+
+< 1
+Cσ
+(45)
+and
+
+∂yt
+∂σt−1
+ =
+
+xt −µt−1
+σ2
+t−1
+
+=
+
+yt
+σt−1
+
+< Cy
+Cσ
+.
+(46)
+Because normalized output y is a continuous function of running estimates of µ and σ with bounded
+derivatives, errors in the estimates have a bounded effect on the result.
+Property 2. The deviation of the output of Online Normalization (26) from normal distribution is a
+Lipschitz function with respect to errors in estimates of mean and variance of its input.
+In particular, it means that with sufﬁciently small learning rate, the normalization process is guaranteed
+to produce generate outputs with mean and variance arbitrarily close to zero and one even when the
+network parameters are changing.
+Now we turn our attention to the corresponding backward pass (11-12), which in the case of single
+scalar per sample becomes
+˜x′
+t = y′
+t −(1 −α)ε(y)
+t−1yt
+ε(y)
+t
+= ε(y)
+t−1 + ˜x′
+tyt
+(47)
+and
+x′
+t =
+˜x′
+t
+σt−1
+−(1 −α)ε(1)
+t−1
+ε(1)
+t
+= ε(1)
+t−1 + x′
+t .
+(48)
+We can formulate the counterpart of Claim 2 for this process. for (47) is
+Claim 8. Control process (47) is equivalent to estimator process
+˜x′
+t = y′
+t −µ(y)
+t−1yt
+µ(y)
+t
+= (1 −(1 −α)y2
+t )µ(y)
+t−1 + (1 −α)y′
+tyt
+(49)
+with
+µ(y)
+t
+= (1 −α)ε(y)
+t
+.
+(50)
+Proof. Similarly to the proof of Claim 2 we have
+µ(y)
+t
+= (1 −α)ε(y)
+t
+= (1 −α)(ε(y)
+t−1 + ˜x′
+tyt)
+= µ(y)
+t−1 + (1 −α)
+
+y′
+t −(1 −α)ε(y)
+t−1yt
+
+yt
+= µ(y)
+t−1 + (1 −α)
+
+y′
+t −µ(y)
+t−1yt
+
+yt
+= (1 −(1 −α)y2
+t )µ(y)
+t−1 + (1 −α)y′
+tyt ,
+(51)
+which matches (49).
+21
+
+Assumption 3. The incoming gradient y′
+t is bounded:
+y′
+t < Cy′
+∀t
+(52)
+and that exponentially decaying average of normalized output y2
+t is bounded away from zero:
+(1 −α)
+t
+X
+j=0
+αt−jy2
+t > Cy2 > 0
+∀t > N .
+(53)
+The last condition is natural given that yt is the result of forward normalizations and we have shown
+that it is asymptotically mean zero and 1/α variance.
+Assumption 4. The decay factor α for the backward pass is sufﬁciently close to one to satisfy
+Cy >
+1
+1 −α .
+(54)
+Claim 9. Error accumulator ε(y)
+t
+in (47) is bounded.
+Proof. Because of the equivalency shown in Claim 8 it is sufﬁcient to prove the statement only for
+µ(y)
+t
+in (49). For t > N we have
+µ(y)
+t
+= (1 −(1 −α)y2
+t )µ(y)
+t−1 + (1 −α)y′
+tyt
+µ(y)
+t
+= (1 −(1 −α)y2
+t )
+h
+(1 −(1 −α)y2
+t−1)µ(y)
+t−2 + (1 −α)y′
+t−1yt−1
+i
++ (1 −α)y′
+tyt
+= . . .
+= (1 −α)
+t
+X
+k=0
+
+
+k−1
+Y
+j=0
+ 1 −(1 −α)y2
+t−j+1
+
+
+y′
+t−kyt−k ,
+(55)
+and
+|µ(y)
+t
+| < (1 −α)NCyCy′ + (1 −α)CyCy′
+t−N
+X
+k=0
+
+
+k−1
+Y
+j=0
+ 1 −(1 −α)y2
+t−j+1
+
+
+.
+(56)
+If individual values of y2
+t were bounded below, the summation would be done over a geometric
+progression converging to a bounded value. But individual values of y2
+t can be zero so we cannot
+directly bound the sum by a converging geometric series. Instead, we’ll use the property that the
+exponentially averaged y2
+t is bounded away from zero to show that it implies that the arithmetic
+average of any sufﬁciently long consecutive sequence of y2
+t is bounded away from zero and use that
+to bound µ(y).
+First we notice that we can replace the last term in (56) by a power of arithmetic average using the
+convexity property
+k−1
+Y
+j=0
+(1 −αj) ≤
+
+1 −1
+k
+k−1
+X
+j=0
+αj
+
+
+k
+if
+αj
+∀j
+(57)
+that can be proven inductively starting with k = 2. Then, after substituting αj ←(1 −α)y2
+t−j+1,
+inequality (56) becomes
+|µ(y)
+t
+| < (1 −α)NCyCy′ + (1 −α)CyCy′
+t−N
+X
+k=0
+
+1 −(1 −α)
+
+1
+k
+k−1
+X
+j=0
+y2
+t−j
+
+
+
+
+k
+.
+(58)
+Finally, if we show that the averages in (58) are bounded from below by a nonzero positive constant
+then the resulting geometric sum with the ﬁxed base less than one will be bounded.
+For α < 1 the series (1 −α) P αk is converging and therefore we can ﬁnd K such that the tail of
+this series is less than a ﬁxed value Cy2/2Cy+:
+(1 −α)
+∞
+X
+k=K
+αk < Cy2
+2Cy+
+.
+(59)
+22
+
+This is true when
+αK < (1 −α) Cy2
+2Cy
+K log α < log (1 −α)Cy2
+2Cy
+K =
+&
+log (1 −α)Cy2
+2Cy
+
+log α
+'
+.
+(60)
+Combining (54) and (59) for all n > N we get a lower bound for the top K terms in (53)
+(1 −α)
+t
+X
+k=t−K+1
+αt−ky2
+k = (1 −α)
+t
+X
+k=0
+αt−ky2
+k −(1 −α)
+t−K
+X
+k=0
+αt−ky2
+k
+> Cy2 −(1 −α)Cy
+∞
+X
+k=K
+αk
+> Cy2 −Cy2
+2
+= Cy2
+2
+.
+(61)
+Then for all t > N we can bound from below the arithmetic average of the K corresponding terms of
+y.
+1
+K
+K−1
+X
+k=0
+y2
+t−k >
+1
+αK−1
+K−1
+X
+k=0
+αky2
+t−k
+>
+Cy2
+2(1 −α)αK−1 ≡Cy > 0 .
+(62)
+That shows that after the ﬁrst N terms, the average of any consecutive K-sequence of y exceeds a
+ﬁxed constant. For any t and K′ > K we can apply this property to
+
+K′/K
+
+K-chunks to get
+1
+K′
+K′−1
+X
+k=0
+y2
+t−k >
+K′
+K
+ K
+K′ Cy
+> Cy
+2 .
+(63)
+Combining (58) and (63) we get the bound
+|µ(y)
+t
+| < (1 −α)(N + K)Cy′Cy + (1 −α)Cy′Cy
+t−N
+X
+k=K
+
+1 −(1 −α)
+
+1
+k
+k−1
+X
+j=0
+y2
+t−j
+
+
+
+
+k
+< (1 −α)(N + K)Cy′Cy + (1 −α)Cy′Cy
+t−N
+X
+k=K
+
+1 −(1 −α)Cy
+2
+k
+< (1 −α)(N + K)Cy′Cy + (1 −α)Cy′Cy
+2
+(1 −α)Cy
+= Cy′Cy
+
+(1 −α)(N + K) + 2
+Cy
+
+≡Cµy ,
+(64)
+and because of the equivalency (50) between µ(y)
+t
+and ε(y)
+t
+|ε(y)
+t
+| < Cµy
+1 −α ≡Cεy .
+(65)
+23
+
+Claim 10. ˜x′
+t in process (47), (49) is uniformly bounded.
+Proof. From (49) and bounds on
+|˜x′
+t| = |y′
+t −µ(y)
+t−1yt|
+≤|y′
+t| + |µ(y)
+t−1||yt|
+= Cy′ + CµyCy .
+(66)
+The second stage of the backward pass (48) is the same is the process (29) with input ˜x′
+t/σt−1 that is
+bounded:
+
+˜x′
+t
+σt−1
+ < Cy′ + CµyCy
+Cσ
+.
+(67)
+We can reuse the earlier results to conclude that both the output of (48) x′
+t and accumulated error
+ε(1)
+t
+= P x′
+t are bounded:
+|x′
+t| < Cx′
+(68)
+and
+|ε(1)
+t | < Cε1 .
+(69)
+These observations together with (65) can be restated as properties.
+Property 3. The backward pass of Online Normalization (11)-(12) generates uniformly bounded
+gradients x′
+t.
+Property 4. Accumulated errors ε(y)
+t
+and ε(1)
+t
+that track deviations from orthogonality conditions (5)
+in Onine Normalization (11)-(12) are bounded.
+Appendix E
+Emulation of Online Normalization on GPU
+While Online Normalization offers a normalization technique that does not rely on batching, some
+hardware architectures beneﬁt from batched execution of compute-intensive linear operations. For
+fast GPU execution we reformulated the algorithm to operate on tensors with the batch dimension
+and still generate results equivalent to true online processing. Of course this forces the weight updates
+to be performed on batch boundaries, which the original algorithm does not require.
+Let’s assume that we are computing the exponentially decaying mean of a sequence of inputs xt
+(26b)
+µt = αµt−1 + (1 −α)xt ,
+(70)
+which is equivalent to (27)
+µt = (1 −α)
+t
+X
+j=0
+αt−jxj
+= (1 −α)
+t
+X
+j=0
+αjxt−j .
+(71)
+We also assume that inputs xt arrive in groups of n elements
+Xt−n = (xt−n, . . . , xt−1)
+Xt = (xt, . . . , xt+n−1) ,
+(72)
+where Xt−n is a previously processed group with resulting values
+Mt−n = (µt−n, . . . , µt−1)
+(73)
+matching (71) and Xi is the current batch that we need to process and generate
+Mt = (µt, . . . , µt+n−1) .
+(74)
+24
+
+We will use the superscript to refer to a speciﬁc element of the the group
+M l
+t ≡µt+l = (1 −α)
+t+l
+X
+j=0
+xt+l−jαj .
+(75)
+We will also use a n-vector of powers of α
+A =
+ 1, α, . . . , αn−1
+(76)
+and a (2n −1)-long concatenation of two adjacent X batches (with the very ﬁrst element removed):
+Xt−n,i = (xt−n+1, . . . , xt, . . . , xt+n−1) .
+(77)
+Multiplying previously computed batch by αn we get
+αnM l
+t−n = αnµt−n+l
+= (1 −α)
+t−n+l
+X
+j=0
+xt−n+l−jαj+n
+= (1 −α)
+t+l
+X
+j=n
+xt+l−jαj .
+(78)
+This matches our target expression (75) except the summation starts from n instead of zero. We can
+cover the missing summation range by applying a 1D convolution with ﬁlter (76) to (77):
+(Xt−n,i ⊛A)l =
+n
+X
+j=0
+Xl+n−j
+t−n,t Aj
+=
+n
+X
+j=0
+xt+l−jαj .
+(79)
+Therefore we can generate target values (75) as
+M l
+t = µt+l
+= (1 −α)
+t+l
+X
+j=0
+xt+l−jαj
+= αnM l
+t−n + (1 −α) (Xt−n,t ⊛A)l .
+(80)
+The resulting group-level expression is
+Mt = αnMt−n + (1 −α) (Xt−n,t ⊛A) ,
+(81)
+where Mt−n is the previously computed batch of results, Xt−n,t is the concatenation of the previous
+and current batches of x (without the very ﬁrst element), A is the vector of n powers of α, and ⊛
+is the 1D convolution. In the limit case of n = 1 this expression matches the origingal method.
+With n > 1 and X and M initialized to zero tensors the resulting procedure will match (in exact
+arithmetic) the values of the streaming process (26b) with standard initialization.
+The generalization of this method to the computation of variance (26c) and to the procedure (47-48)
+in the backward pass can be found in the accompanying code [3].
+Appendix F
+Hyperparameter scaling rules
+In our studies we performed experiments with different batch sizes. For momentum training
+ν = µν + (1 −µ)g
+w = w −ην ,
+(82)
+25
+
+we applied scaled the learning rate linearly with batch size b:
+ηnew = bnew
+bold
+ηold,
+(83)
+while keeping the weight decay parameter unchanged. This effectively leads to a square root scaling
+rule for training (Section 3.4).
+To scale the momentum µ in (82) we equate per-sample decay
+µnew
+1
+bnew = µold
+1
+bold ,
+(84)
+which results in
+µnew = µold
+bnew
+bold .
+(85)
+Note that some deep learning frameworks implement momentum as outlined in [34]:
+ν = µν + g
+w = w −ην ,
+(86)
+This is equivalent to (82) except the gradient is not multiplied by (1 −µ). To apply hyperparameter
+updates to momentum optimizers implemented by these deep learning frameworks, we apply another
+scale to the learning rate:
+η∗
+new = 1 −µnew
+1 −µ
+ηnew .
+(87)
+26
+

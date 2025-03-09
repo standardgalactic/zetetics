@@ -1,0 +1,2599 @@
+PANGU-Σ: TOWARDS TRILLION PARAMETER LANGUAGE
+MODEL WITH SPARSE HETEROGENEOUS COMPUTING
+TECHNICAL REPORT
+Xiaozhe Ren1∗
+Pingyi Zhou1∗
+Xinfan Meng1∗
+Xinjing Huang2∗
+Yadao Wang1∗
+Weichao Wang1
+Pengfei Li1
+Xiaoda Zhang2
+Alexander Podolskiy1
+Grigory Arshinov 1
+Andrey Bout 1
+Irina Piontkovskaya 1
+Jiansheng Wei1
+Xin Jiang1
+Teng Su2
+Qun Liu1
+Jun Yao1
+1Noah’s Ark Lab, Huawei Technologies
+2Distributed and Parallel Software Lab, Huawei Technologies
+ABSTRACT
+The scaling of large language models has greatly improved natural language understanding, gener-
+ation, and reasoning. In this work, we develop a system that trained a trillion-parameter language
+model on a cluster of Ascend 910 AI processors 2 and MindSpore framework 3, and present the lan-
+guage model with 1.085T parameters named PanGu-Σ. With parameter inherent from PanGu-α [1],
+we extend the dense Transformer model to sparse one with Random Routed Experts (RRE), and
+efﬁciently train the model over 329B tokens by using Expert Computation and Storage Separation
+(ECSS). This resulted in a 6.3x increase in training throughput through heterogeneous computing.
+Our experimental ﬁndings show that PanGu-Σ provides state-of-the-art performance in zero-shot
+learning of various Chinese NLP downstream tasks. Moreover, it demonstrates strong abilities when
+ﬁne-tuned in application data of open-domain dialogue, question answering, machine translation and
+code generation.
+Keywords Large Language Models · Distributed Training · Natural Language Processing
+1
+Introduction
+Large Language Models (LLMs) [2, 3, 1, 4, 5, 6, 7, 8, 9, 10, etc.] have demonstrated unprecedented capabilities and
+potential in the areas of natural language understanding, generation and reasoning. By utilizing vast amount of textual
+data, the performance of language models scales up with compute budget and model parameters, demonstrating strong
+zero/few-shot learning abilities or even emergence abilities [4, 11]. Several large language models with hundreds
+of billion parameters have been published since GPT-3 [2], including but not limited to Megatron-Turing NLG [12],
+PanGu-α [1], ERNIE 3.0 Titan [8], Gopher [5], PaLM [4], OPT [6], Bloom [10], and GLM-130B [9]. Researchers
+start to build even larger language models with more than one trillion parameters. Typically, this is accomplished by
+leveraging sparsely-activated models such as Mixture-of-Experts (MoE) [13]. Among the trillion-parameter models
+currently in existence, there are several noteworthy work such as Switch-C [14], GLaM [15], MoE-1.1T [16], Wu Dao
+2.0 [17], and M6-10T [18]. However, only a select few have published comprehensive evaluation results over a wide
+range of tasks while simultaneously achieving anticipated performance. In our experience, the primary difﬁculty lies in
+the scaling efﬁciency.
+∗Equal Contribution
+2https://e.huawei.com/en/products/servers/ascend
+3https://www.mindspore.cn/en
+arXiv:2303.10845v1  [cs.CL]  20 Mar 2023
+
+TECHNICAL REPORT - MARCH 21, 2023
+Recent studies on the scaling laws of language models [19, 20, 21] demonstrate the necessity of training LLMs with
+sufﬁcient amount of training data and corresponding compute budget to achieve optimal performance. Therefore, one of
+the main motivation for this work is to design a scalable model architecture and an efﬁcient distributed training system
+that can consume the data with high training throughput.
+• Model Scaling. Model performance of LLMs is expected to scale up with larger model size. Comparing to
+the expensive computational cost for training dense Transformer model, sparse architectures such as Mixture-
+of-Experts (MoE) [13, 14, 15, 22] are considered to be an appealing choice to scale model size up without
+incuring linear increase in computational cost. However, MoE models suffer from the problems such as
+unbalanced workload and all-to-all communication latency. Moreover, how to extend existing dense model
+with MoE and how many experts to allocate in each layer remain open problems. Therefore, designing a
+trillion parameter sparse model with high performance and training efﬁciency is a signiﬁcant yet challenging
+task.
+• System Scaling. Frameworks such as DeepSpeed 4 have been proposed to support training trillion parameter
+models. In practice, the main barrier often lies on limited compute budget, or more speciﬁcally the number of
+accelerating devices (e.g., GPU, NPU, TPU) that can be used. By utilizing techniques such as tensor paral-
+lelism [23], pipeline parallelism [24], zero redundancy optimizer [25] and rematerialization [26], practitioners
+can train trillion-parameter model with feasible batch sizes across thousands of accelerating devices. Alterna-
+tively, practitioners can reduce the amount of computation resources by utilizing heterogeneous computing
+techniques such as ofﬂoading some of the computation to host devices [27]. However, the current techniques
+inevitably hinder the training throughput due to slow bandwidth between the host and device as well as weak
+computing capabilities of CPUs compared to accelerating devices, which prevent feeding large language
+models with reasonably amount of data and achieving optimal performance. Therefore, how to efﬁciently
+scale the system performance with limited computation budget is critical to the performance of large language
+models.
+In this work, we present PanGu-Σ , a large language model with sparse architecture containing 1.085 trillion parameters.
+We develop PanGu-Σ model under the framework of MindSpore 5 and train it on a cluster with only 512 Ascend 910
+AI Accelerators [28] with 329 billion tokens over 100 days. PanGu-Σ inherent parameters from PanGu-α [1] with
+Transformer decoder architecture and are extended via Random Routed Experts (RRE). Different from conventional
+MoE, RRE adopts two-level routing. At the ﬁrst level experts are grouped by domain or task, and at the second level
+tokens are randomly and uniformly mapped to experts in each group without using any learnable gating function as in
+MoE. With the design of RRE, one can easily extract sub-models from the PanGu-Σ for various downstream applications
+such as dialogue, translation, code generation or general nature language understanding. To make training system
+efﬁcient and scalable, we propose Expert Computation and Storage Separation (ECSS) mechanism, which achieves
+69905 tokens/s observed throughput in training 1.085 trillion PanGu-Σ on cluster of 512 Ascend 910 accelerators, and
+reduces Host-to-Device and Device-to-Host communication as well as optimizer update computation by a large margin.
+As a whole, the training throughput is improved by 6.3x compared to the model of the same hyper-parameters but with
+MoE architecture. By consuming 329B tokens in more than 40 natural and programming languages, the sub-modal
+of PanGu-Σ in Chinese domain signiﬁcantly outperforms the previous SOTA models including PanGu-α with 13B
+parameters and ERNIE 3.0 Titan [8] with 260B parameters over 16 downstream tasks in six categories in the zero-shot
+setting without any multitask ﬁnetuning or instruction tuning. We also test the performance of ﬁne-tuned PanGu-Σ
+on several applications domain such as dialogue, machine translation and code generation. PanGu-Σ outperforms the
+SOTA models in the corresponding areas.
+The rest of the technical report is organized as follows. Section 2 introduces the design philosophy and the architecture
+of PanGu-Σ model. Section 3 introduces the collection and organization of the dataset. Section 4 describes system
+design and acceleration techniques. Section 5 presents the experimental results of PanGu-Σ model.
+2
+Model
+2.1
+Design Principles
+PanGu-Σ aims to achieve the following goals.
+• Performance: state-of-the-art NLP performance across multiple domains and tasks.
+4https://www.deepspeed.ai/
+5https://gitee.com/mindspore/mindspore
+2
+
+TECHNICAL REPORT - MARCH 21, 2023
+• Efﬁciency: training trillion parameters model with maximum system performance on a modest cluster.
+• Usability: extendable to various domains or tasks, without need of retraining the model from scratch.
+• Deployment: easily customizable and deployable in various real-world settings.
+Achieving all the above goals at the same time is very challenging. Considering the ﬁrst goal, a language model that
+can generalize and perform well across domains should have a very large number of parameters and be trained on
+large amount of data according to the scaling law [19, 20, 21]. However, training such a large model also means that a
+high-end cluster is mandatory, which somehow contradicts with the second goal. And the larger scale of the model also
+leads to increasing cost in deploying the trained model, which is related to the fourth goal.
+Considering the high computational cost incurring during the training phase, we want the resulted model to be practically
+usable and efﬁcient in many real applications. With this goal in mind, we propose to train the model in multiple domains
+and make it further extendable to any number of domains in a continuous learning paradigm, subject to the computation
+resource.
+During training phase, the trillion parameters PanGu-Σ model is fed with data from multiple domains. However,
+in the deployment phase, it is often unnecessary or even impossible to host the trillion parameters model for every
+application. Therefore, a model that allows for the grouping and separation of its parameters based on various training
+and deployment setups offers signiﬁcant advantages.
+2.2
+PanGu-Σ Architecture
+2.2.1
+Overview
+Emb. 0
+Domain Embedding Layer
+Data for
+domain 0
+Data for
+domain 1
+Data for
+domain 2
+Data for
+domain 3
+Feed  Forward
+Attention
+Attention
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Autoregressive
+Emb. 1
+Emb. 2
+Emb. 3
+M Transformer Layers
+N RRE layers
+Figure 1: PanGu-Σ architecture. The architecture is mixed by dense transformer layers and sparse transformer layers.
+The lower M layers are dense layers shared across different domains. The upper N transformer layers’ feed-forward part
+are sparsely activated via Random Routed Experts (RRE). Tokens from different domains have different embeddings.
+PanGu-Σ adopts an auto-regressive language modeling with stacked transformer decoder layers and a query layer on
+the top. The PanGu-Σ architecture offers a ﬂexible design. The bottom M layers are globally shared across all the
+domains, and the top N layers (including the query layer) are sparsely activated according to the domains of the input
+data. In each RRE layers, there are K experts in G groups in total, the number of experts in each group can be different.
+This ﬂexible design offers three mode.
+• Mixed mode: when M > 0, N > 0 and K > 0, model contains both sparse RRE layers and dense layers.
+3
+
+TECHNICAL REPORT - MARCH 21, 2023
+• Dense mode: when N = 0 or K = 1, the architecture will reduce to a dense PanGu-α model.
+• Sparse mode: when M = 0 and K > 1, the architecture will be a sparse model.
+In this trillion-parameters modeling practice, We use the mixed conﬁguration by placing the shared parameters close to
+the input layer (bottom) and all the sparsely activated expert parameters close to the output layer (top). In the model
+designing stage, we benchmark various experts placement strategies on smaller scale models and the selected strategy
+obtains the lowest language modeling perplexity. Our hypothesis is that bottom layers tends to learn general knowledge,
+while the speciﬁc knowledge is in a higher level of abstraction and is more appropriate to be learned by the top layers.
+In the token embedding layer, we choose to use different embedding matrices for different domains.
+2.2.2
+Random Routed Experts
+In the top N layers, we replace each feed-forward sub-layer with multiple conditionally activated feed-forward sub-layers
+(experts), following the Mixture of Experts (MoE) paradigm.
+A key question in designing MoE architecture is how to route tokens to experts. For PanGu-Σ , we propose a Random
+Routed Experts (RRE) mechanism, which is inspired by Hash Layers proposed in [29]. Speciﬁcally, RRE routes the
+tokens by IDs in a two-level manner. In the ﬁrst level, the token is mapped to a group of candidate experts by domain,
+and then in the second level, one expert in this group is chosen according to a token-expert routing map to process the
+token. The routing map is randomly initialized and each layer has a independently initialized mapping for balancing the
+computation.
+Attention
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+RRE layer
+Seq #0:
+Seq #1:
+Seq #2:
+Seq #3:
+Attention
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+RRE layer
+Figure 2: Random Routed Experts (RRE) in PanGu-Σ . The token is ﬁrst routed to a group of experts by domain, and
+then randomly routed to one of the experts in that domain. There is no learnable routers in the model.
+RRE has several advantages over the commonly-used learnable routers.
+• During training, PanGu-Σ allows for the addition, modiﬁcation, or removal of domain-speciﬁc experts without
+any impact on the other experts. This attribute makes PanGu-Σ highly ﬂexible for alleviating the commonly
+encountered problem of catastrophic forgetting, which is crucial for life-long or continual learning.
+4
+
+TECHNICAL REPORT - MARCH 21, 2023
+• In most real-world deployment setting, it is unnecessary or impractical to deploy a trillion-parameter model.
+PanGu-Σ allows one to extract a sub-model for speciﬁc domains according to practical requirements and only
+deploy the sub-model. The sub-model may contain tens of billion parameters but still keep the predictive
+power of the original model on the target domains. Using this extract-and-deploy operation, we can easily
+deploy models for multiple industrial applications.
+• All the conventional MoE models rely on all-to-all communication collective operation to move data between
+experts residing on different devices. With our proposed two-level routing, experts from different domains
+don’t exchange tokens, and all-to-all communication is constrained within each domain. As a result, the
+expensive global all-to-all operation is reduced to grouped all-to-all, saving much communication volume and
+reducing the end-to-end training latency.
+• Learnable router needs more computation, and can suffer from problem of unbalanced loads across the experts,
+which typically makes the training process less stable. RRE avoids all the above pitfalls since no additional
+parameters are introduced and randomly initialized routing table helps to balance the loads on experts.
+RRE requires a routing map which is initialized before pretraining, Algorithm 1 describes how we construct the routing
+table.
+Algorithm 1: Routing table construction procedure in Random Routed Experts (RRE) mechanism.
+input :number of domain d, number of layers l, number of experts per domain per layer e, size of vocabulary V .
+output :T, a tensor of shape (d, l, V ) acting as the RRE routing table.
+1 set random seed to 0 ;
+2 initialize T ;
+3 initialize ⃗u, a vector [0, ..., V −1] of size V ;
+4 ˜V = ⌊V/e⌋· e ;
+5 ⃗u[0 : ˜V −1] = ⌊⃗u[0 : ˜V −1]/e⌋;
+6 ⃗u[ ˜V : V −1] = [0, ..., V −˜V −1] ;
+7 for j ←0 to l −1 do
+8
+for i ←0 to d −1 do
+9
+shufﬂe ⃗v, a vector [0, ..., V −1] of size V ;
+10
+T[i][j][⃗v] = ⃗u + i ∗e ;
+3
+Dataset
+3.1
+Collection
+To better demonstrate the capability of PanGu-Σ model to efﬁciently and independently learn from multiple domains,
+we collect datasets in 40 domains, with a large amount of data in four major domains: Chinese, English, Bilingual
+(Chinese and English) and code. The remaining domains with smaller portion consists of 26 other monolingual natural
+languages, 6 programming languages, and textual data from ﬁnance, health, law, and poetry domains, respectively.
+For Chinese texts, we collect the WuDaoCorpora 2.0 [30] which contains 200GB and the CLUECorpus2020 [31] which
+contains 100GB. For English texts, the Pile dataset [32] which contains 800GB and C4 dataset [3] which contains
+750GB were collected. For code, we use the Python code (147GB) which has been used in PanGu-Coder [33], as
+well as the Java code (161GB) from GHTorrent [34] , which are then ﬁltered by ﬁle size (<1MB), average number
+of characters per line (<200), maximum number of characters per line (<1000) and their compilablity. Then, these
+collected English, Chinese and code texts data was sampled and distributed to the four major domains. Finally, we get
+more than 300B tokens for the four major domains. The detailed statistics of data distribution and data sources in four
+major domains are presented in Table 1.
+For the remaining 36 domains, the data for 26 monolingual domains are mainly from CCAligned [35] and CCMatrix [36].
+Similar to the code domain mentioned above, the data for 6 programming language domains are collected through
+GHTorrent [34] and ﬁltered in the similar way. Finance domain data is ﬁltered from the WuDaoCorpora 2.0 [30]
+using the tags. Health domain data is from Chinese MedDialog Dataset [37]. Law domain data is sampled from
+CAIL2018 [38]. Poetry domain dataset is from Werneror-Poetery 6. Finally, we sampled more than 25B tokens for the
+36 domains.
+6https://github.com/Werneror/Poetry
+5
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 1: Data distribution and data sources in four main domains
+Domain ID
+Domain
+Tokens (Billion)
+Data source
+0
+Bilingual
+(Chinese, English)
+77.51 B
+Chinese (38.75) + English(38.76B)
+CLUECorpus2020 , C4
+1
+Chinese
+75.47 B
+WuDaoCorpora 2.0
+2
+English
+75.90 B
+Pile , C4
+3
+Code
+(Python, Java)
+75.24 B
+Python (50.24B) + Java (25B)
+Python (PanGu-Coder)
+Java (GHTorrent)
+3.2
+Format
+For the four major domains, each can be adapted to different downstream tasks. In order to better support domain-
+speciﬁc downstream tasks, this paper uses different data format for different domains. For Chinese and English domains,
+the <EOT> token which indicates the end of training text is inserted at the end of each training sample.
+气象学是把大气当作研究的客体，从定性和定量两方面来说明大气特征的学科，集中研究大气的天气情
+况和变化规律和对天气的预报。<EOT>
+Bisterne Bisterne is a hamlet in the civil parish of Ringwood in the New
+Forest National Park in Hampshire, England. <EOT>
+Figure 3: Data format of Chinese and English domains.
+For Bilingual domain, the <EN> or <CN> token is inserted into the head of the training sample according to the source
+of the training sample (either from the Chinese dataset or the English dataset), and the <EOT> token is inserted at the
+end of each training sample.
+<EN> Tobias Oriwol Tobias Oriwol (born May 13, 1985) is a Canadian
+backstroke swimmer who competed in two consecutive Summer Olympics in 2008
+and 2012. <EOT>
+<CN>数据结构 在计算机科学中，数据结构是计算机中存储、组织数据的方式。<EOT>
+Figure 4: Data format of Bilingual domain.
+For the code domain, the <Python> or <Java> token is inserted into the head of the training sample based on the
+programming language type of the training sample, and the <EOT> token is inserted at the end of each training sample.
+For the remaining 36 domains, the data formats of 26 monolingual domains, ﬁnance, health, law, and poetry domains
+are the same as the Chinese and English domains, and the data format of 6 programming language domains is the same
+as the code domain.
+<Python>def addPath(self, path, code, name):\n    self.paths[code] =
+{\"path\": path, \"name\": name}<EOT>
+<Java>public static Props loadPropsInDir(final File dir, final String...
+suffixes) {\n    return loadPropsInDir(null, dir, suffixes);\n  }<EOT>
+Figure 5: Data format of Code domain.
+For a formatted data set D, suppose it contains n training samples D = {s1, s2, . . . , sn}. To make full use of the
+computing power of the Ascend 910 cluster and accelerate training in the pre-training phase, we concatenate all samples
+in the data set into a sequence, and then intercept training instances in the concatenated sequence according to the ﬁxed
+length (1024), as shown in Figure 6. In the ﬁne-tune phase, for each training sample in the formatted dataset, if the
+length is less than the ﬁxed length, we pad the sample to the ﬁxed length with a special token <Pad>. If the length is
+greater than the ﬁxed length, the extra part is truncated. Figure 7 shows the process. Different to PanGu-α model, each
+6
+
+TECHNICAL REPORT - MARCH 21, 2023
+training sample of PanGu-Σ model contains two ﬁeld: input sequence of token IDs which are training instance and their
+domain ID. The domain ID indicates which domain the training instance belongs to. The RRE layers of the PanGu-Σ
+model decide which experts the training tokens is routed to by the domain ID.
+sample 1
+sample 2
+sample n
+...
+instance 1
+instance 2
+instance m
+sample n-1
+sample 2
+sample 3
+sample 4
+Figure 6: Input format during model pre-training.
+sample 1
+pad
+sample 2
+pad
+sample n
+pad
+...
+instance 1
+instance 2
+instance n
+Figure 7: Input format during model ﬁne-tuning.
+4
+System
+PanGu-Σ is implemented with MindSpore 1.6 framework 7 and trained on 512 Ascend 910 accelerators (also know as
+Ascend 910 NPU).
+Training a trillion parameters language model poses multiple challenges. First, it requires enormous amount of
+memory in training. Although the sparse architecture can effectively save computation, it doesn’t reduce the memory
+consumption and we still need to store all the parameters and optimization states inside the accelerator memory.
+Assuming Adam optimizer [39] with mixed-precision training [40] is used, a 1T model typically consumes 16TB
+memory in total just for parameters, gradients and optimizer states. During training, the model needs extra memory for
+input data, network activations, communication buffers and temporary variables. We estimate that training a PanGu-Σ
+model with 1 trillion parameters with a reasonably batch size needs more than 32TB memory and requires more than
+1,000 Ascend 910 accelerators or NVIDIA V100 GPUs with 32GB High Bandwidth Memory (HBM).
+Instead of pouring lots of hardware resources to scale-up the model, we aim to train PanGu-Σ with a reasonably-sized
+cluster of 512 Ascend accelerators. To this end, we adopt the heterogeneous training and ofﬂoad the optimizer states
+to CPU[27]. After enabling heterogeneous training, all optimizer states are moved from accelerator to the host with
+750GB host memory and KunPeng 920 CPU 8, and we can ﬁt the entire training process into the cluster.
+Second, the system throughput is unacceptable after enabling vanilla optimizer ofﬂoading. The root cause is again the
+sheer amount of parameters. Gradients and updated parameters need to be exchanged via the slow host-to-device and
+device-to-host communication, and CPUs need to iterate thorough all parameters and update them. To improve the
+training throughput, we leverage the sparse nature of PanGu-Σ architecture. Since PanGu-Σ use a sparse architecture
+and most of its parameters are conditionally activated, the optimizer only need to update part of experts in one iteration.
+So we propose Expert Computation and Storage Separation (ECSS) method as illustrated in Figure 8.
+In Expert Computation and Storage Separation, we consider experts as knowledge database to store speciﬁc knowledge
+of different tasks or domains. In each iteration, experts are sparsely activated by different token IDs with speciﬁc
+domain. In MindSpore, we use lookup operator to select parts of activated experts, and sparsely update their parameters
+in the backward computation. In optimizer CPU ofﬂoad computing, MindSpore copy FP16 parameters from host CPU
+to NPU, compute the gradients on NPU, move FP16 gradients from NPU to CPU, and compute optimizer states and
+update parameters in the host CPU. With a lower experts sparsity ratio such as 0.1, the computation cost is only near
+10% of full model.
+7https://www.mindspore.cn/versions/en
+8https://www.hisilicon.com/en/products/Kunpeng/Huawei-Kunpeng/Huawei-Kunpeng-920
+7
+
+TECHNICAL REPORT - MARCH 21, 2023
+Activated
+non-activated
+Lookup
+Sparse Activation
+Forward
+Backward
+#expert: K
+#parameters: M
+Sparsity: s (0<s<1)
+#activated expert: 
+A = K * s
+#activated parameters:
+Ma ≈ M * s 
+2*Ma
+FP16 Grad
+4*Ma
+Cast to FP32 Grad
+Adam Optimizer
+Device
+Device to Host
+4*Ma
+4*Ma
+4*Ma
+FP32 
+weight
+FP32 
+momentum
+FP32 
+variance
+Host to Device
+Cast to FP16
+2*M
+2*Ma
+Activated Graph
+FP16 weight
+Host
+Complete Graph
+FP16 weight
+Figure 8: Expert Computation and Storage Separation (ECSS) in traning PanGu-Σ . In each iteration, with sparsity
+ratio s ∈(0, 1] and expert amount K, only number of A = Ks experts activated by lookup operation, which reduce
+the communication cost between device and host, and cost of forward and backward computation in device as well as
+optimizer operations in host.
+Besides ECSS with Ascend-KunPeng sparse heterogeneous computing, we also adopt other parallel training and
+accelerating techniques provided by MindSpore and CANN 9. We use 8-ways model parallel for all the attention and
+feed-forward layers, 64-ways expert parallel without replica and 64-ways data parallel for non-expert parts. To further
+optimize memory footprint, rematerialization [26] and optimizer parallel [25] are also adopted to reduce the peak
+memory consumption. We also use FastGelu and fused LayerNorm to accelerate point-wise computation. By combining
+all the techniques together, we achieved 6.3 times throughput promotion compared to vanilla PanGu-Σ heterogeneous
+training, as shown in Figure 9.
+5
+Experiments
+5.1
+Pretraining
+5.1.1
+Model Conﬁguration
+We use the following PanGu-Σ conﬁguration for this work. The conﬁguration mostly follows the 13B version of
+PanGu-α model. In this way, we can effective inherit the knowledge already learned by PanGu-α.
+Table 2: Model Conﬁguration
+#Layers (N+M)
+#Heads (N_h)
+Hidden size (d)
+FFN size (d_ff)
+#RRE layers (N)
+#Experts (K)
+# Groups (G)
+40
+40
+5120
+20480
+8
+640
+40
+9https://www.hiascend.com/en/software/cann
+8
+
+TECHNICAL REPORT - MARCH 21, 2023
+0
+10000
+20000
+30000
+40000
+50000
+60000
+70000
+80000
+MindSpore+Ascend+KunPeng
+Pretraining Throughput (tokens per second)
+ECSS Disabled
+ECSS Enabled
+Figure 9: Training throughput (token/s) of PanGu-Σ wo/w Expert Computation and Storage Separation (ECSS). ECSS
+can achieve 6.3x increase of training throughput.
+5.1.2
+Pretraining settings
+We use a cluster of 64 nodes, with each node equipped with 8 Ascend 910 accelerators and MindSpore framework.
+High performance collective communication library Huawei Collective Communication Library (HCCL) is used to
+facilitate high speed high bandwidth communication for distributed training.
+There are two stages in PanGu-Σ pretraining process. In the ﬁrst stage, we activate four main domains’ experts to
+consume data from all the four main domains including bilingual, Chinese, English and codes. In the second stage, we
+let all the experts to consume all domain’s data. Figure 11 shows how 640 experts are assigned to 40 domain groups.
+We train PanGu-Σ with global batch size of 512 with sequence length of 1024 for each sample. The pretraining lasts
+about 100 days. Figure 10 shows the loss curve of PanGu-Σ pretraining.
+Figure 10: Pretraining Loss
+Mixed-Precision training is enabled to speedup the training process. Apart from vocabulary embedding layer, loss
+function, Softmax operation, LayerNorm layers and Adam optimizer, all other operations adopt FP16 format.
+9
+
+TECHNICAL REPORT - MARCH 21, 2023
+Expert 0
+Expert 1
+Expert 2
+Expert 3
+Expert 4
+Expert 5
+Expert 6
+Expert 7
+Expert 8
+Expert 9
+Node 0
+Expert 40
+Expert 41
+Expert 42
+Expert 43
+Expert 44
+Expert 45
+Expert 46
+Expert 47
+Expert 48
+Expert 49
+Node 4
+Expert 600
+Expert 601
+Expert 602
+Expert 603
+Expert 604
+Expert 605
+Expert 606
+Expert 607
+Expert 608
+Expert 609
+Node 60
+...
+domain 0: Bilingual
+domain 4: Farsi
+domain 8: Estonian
+domain 12: Turkish
+domain 16: Indonesian
+domain 20: Vietnamese
+domain 24: Hebrew
+domain 28: Arabic
+domain 32: Dutch
+domain 36: German
+Expert 10
+Expert 11
+Expert 12
+Expert 13
+Expert 14
+Expert 15
+Expert 16
+Expert 17
+Expert 18
+Expert 19
+Node 1
+Expert 50
+Expert 51
+Expert 52
+Expert 53
+Expert 54
+Expert 55
+Expert 56
+Expert 57
+Expert 58
+Expert 59
+Node 5
+Expert 610
+Expert 611
+Expert 612
+Expert 613
+Expert 614
+Expert 615
+Expert 616
+Expert 617
+Expert 618
+Expert 619
+Node 61
+...
+domain 1: Chinese
+domain 5: Korean
+domain 9: Finance
+domain 13: Health
+domain 17: Law
+domain 21: Poetry
+domain 25: Japanese
+domain 29: Greek
+domain 33: Italian
+domain 37: French
+Expert 20
+Expert 21
+Expert 22
+Expert 23
+Expert 24
+Expert 25
+Expert 26
+Expert 27
+Expert 28
+Expert 29
+Node 2
+Expert 60
+Expert 61
+Expert 62
+Expert 63
+Expert 64
+Expert 65
+Expert 66
+Expert 67
+Expert 68
+Expert 69
+Node 6
+Expert 620
+Expert 621
+Expert 622
+Expert 623
+Expert 624
+Expert 625
+Expert 626
+Expert 627
+Expert 628
+Expert 629
+Node 62
+...
+domain 2: English
+domain 6: Russia
+domain 10: Slovak
+domain 14: Croatian
+domain 18: Danish
+domain 22:Finnish
+domain 26: Hungarian
+domain 30: Bulgarian
+domain 34: Czech
+domain 38: Polish
+Expert 30
+Expert 31
+Expert 32
+Expert 33
+Expert 34
+Expert 35
+Expert 36
+Expert 37
+Expert 38
+Expert 39
+Node 3
+Expert 70
+Expert 71
+Expert 72
+Expert 73
+Expert 74
+Expert 75
+Expert 76
+Expert 77
+Expert 78
+Expert 79
+Node 7
+Expert 630
+Expert 631
+Expert 632
+Expert 633
+Expert 634
+Expert 635
+Expert 636
+Expert 637
+Expert 638
+Expert 639
+Node 63
+...
+domain 3: Code
+domain 7: Java
+domain 11: Cpp
+domain 15: JavaScript
+domain 19: PHP
+domain 23: Go
+domain 27: Ruby
+domain 31: Romanian
+domain 35: Portuguese
+domain 39: Spanish
+Figure 11: Mapping between domains and experts in PanGu-Σ .The data from particular domains are routed to a group
+of experts lying across different devices. The color of experts distinguish their corresponding domains. There are ten
+experts from different domain on each device.
+Failure recovery is very important for long term large scale distributed training, especially for huge models like PanGu-Σ
+. Therefore, a rigorous process of saving checkpoints and restarting from previous checkpoints is indispensable. For a
+trillion-parameter model, one set of checkpoint storing all parameters and optimizer states for a single iteration already
+has a jaw-dropping 10TB size. Uploading checkpoints of such size to our long term object store is a challenging
+task, since uploading all checkpoints at the same time quickly saturates the network bandwidth and inevitably lead to
+training failure. To solve this issue, we launch the upload process in a round-robin style and limit the number of the
+simultaneously running process. This solution proves to be effective and stable for our entire training process.
+5.1.3
+Hybrid Hyper-parameter ADAM Optimizer
+We design a Hybrid Hyper-parameter ADAM Optimizer to provides further stability for PanGu-Σ during the pretraining
+phase.
+To better understand PanGu-Σ training process, we inspected the statistics of training states and ﬁnd out that the
+gradients of RRE layers are much smaller than a non-sparse model. To tackle such a problem, we ﬁrst set a very small
+ϵ1 for all model parameters, then we go one step further and set an even smaller ϵ2 only for the RRE layers, since
+compared to the dense layers, sparse layers received smaller effective batch due to its conditionally-activated nature.
+Speciﬁcally, we set hybrid hyper-parameters for ADAM optimizer below:
+Table 3: Hyper-parameters of PanGu-Σ training.
+β1
+β2
+ϵ1
+ϵ2
+end lr
+warmup steps
+decay steps
+0.8
+0.95
+1e-8
+1e-20
+2e-5
+5000
+180000
+10
+
+TECHNICAL REPORT - MARCH 21, 2023
+5.2
+Inheritance Learning
+To improve the training efﬁciency, accelerate model convergence, and reduce carbon emissions during training, the
+PanGu-Σ model inherits the capabilities of the existing model, and then continues to train in four domains simultaneously.
+In this paper, PanGu-Σ inherits the PanGu-α 13B version.
+5.2.1
+Extending vocabulary
+Because PanGu-α’s vocabulary is mainly designed to support Chinese texts, we extend its vocabulary to support both
+Chinese and English texts. PanGu-Σuses Byte-level BPE [41] instead of BPE adopted by PanGu-α, the vocabulary
+is formulated by adding T5 [3] small vocabulary to PanGu-α’s vocabulary, then remove repeated sub-words. Some
+special tokens are added to the vocab. These special tokens are classiﬁed into two types: control tokens (e,g., <python>,
+<Java>, <CN>, <EN>) and spaces tokens for representing whitespace runs of different lengths.
+5.2.2
+Inheriting and Extending model parameters
+In order to inherit the capability of the existing model as much as possible, PanGu-Σ’s word embedding and all experts
+in RRE layer are initialized with the corresponding embedding and feed-forward layers from PanGu-α, and other
+parameters are initialized with corresponding parameters. For example, to initialize the word embedding parameters of
+PanGu-Σ , we ﬁrst create a word embeddings Ws ∈Rvs×h, if a sub-word of PanGu-Σ exists in PanGu-α, its word
+embedding is initialized with those of PanGu-α. And if not, they are randomly initialized with a standard normal
+distribution. For the experts parameters in the RRE layer of PanGu-Σ , each expert is initialized with the FFN parameters
+of the corresponding layer in the PanGu-α model.
+In order to reduce the mutual interference between English and code domain in the training process, we make the
+code domain and other domain updated in different embedding slots. Therefore, we further extend the PanGu-Σ word
+embedding Ws ∈Rvs×h to Ws′ ∈Rvs′ ×h, (vs′ = 2 × vs). The slots [vs, 2 × vs] of word embeddings Ws′ belongs
+to code domain and the slots [0, vs] belongs other domain. Figure 12. shows how PanGu-Σ inherits the PanGu-α’s
+parameters and extends it.
+Domain Embedding Layer
+Domain data
+(Bilingual)
+Domain Data
+(Chinese)
+Feed  Forward
+Attention
+Attention
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Autoregressive
+Cn. Emb
+Ext En. Emb
+32 Transformer Layers
+8 RRE layers
+Embedding Layer
+Data 
+Feed  Forward
+Attention
+Autoregressive
+Cn. Emb
+32 Transformer Layers
+8 Transformer Layers
+Feed  Forward
+Attention
+Cn. Emb
+Ext En. Emb
+PanGu-α Model
+PanGu-Σ Model
+Domain Data
+(English)
+Domain Data
+(Code)
+Figure 12: The process of inheriting parameters of PanGu-α and extending to PanGu-Σ.
+5.2.3
+Extracting domain speciﬁc sub-model
+It is expensive to deploy a trillion parameters model like PanGu-Σ directly. In order to transfer abilities of PanGu-Σ
+to various downstream tasks and reduce the consumption of serving resources, we propose a loss-free expert pruning
+method by leveraging the RRE design. Domain models can be separately extracted for further ﬁne-tuning, evaluation
+and deployment. Figure 13 illustrates how to extract the the domain speciﬁc sub-model from PanGu-Σ . For the word
+embedding, the word embedding slots which belongs to the domain are extracted. For the experts in the RRE layers, the
+experts allocated for the speciﬁc domain are extracted. Other parameters of PanGu-Σ are copied seamlessly.
+11
+
+TECHNICAL REPORT - MARCH 21, 2023
+Domain Embedding Layer
+Feed  Forward
+Attention
+Attention
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Expert
+Autoregressive
+Cn. Emb
+Ext En. Emb
+32 Transformer Layers
+8 RRE layers
+Cn. Emb
+Ext En. Emb
+Domain data
+(Bilingual)
+Domain Data
+(Chinese)
+Domain Data
+(English)
+Domain Data
+(Code)
+Feed  Forward
+Attention
+Attention
+Expert
+Expert
+Autoregressive
+Cn. Emb
+Ext En. Emb
+PanGu-Σ Domain Model
+Domain data
+(Bilingual)
+Extract
+PanGu-Σ Model
+Figure 13: The process of extracting domain (e.g., Bilingual) model parameters.
+5.3
+Chinese Downstream Tasks Evaluation
+5.3.1
+Task Description
+Following PanGu-α, we evaluate PanGu-Σ at zero-shot settings on 16 datasets of six tasks. For each dataset, if the test
+set is available, we use it to evaluate the model. Otherwise, we use the validation set. The following describes each task
+in turn.
+Machine reading comprehension. This task contains four datasets: CMRC2018 [42], DRCD [43], DuReader [44],
+and C3 [45]. The ﬁrst three datasets CMRC2018, DRCD, and DuReader are span extraction tasks. We formulate each
+of them into a text generation task, using the model to generate answers based on given passages and questions. And
+we use F1, exact match (EM), and ROUGE-1 as the evaluation metrics. In addition, for the DuReader dataset, which is
+aligned with PanGu-α, only the Zhidao subset is selected to evaluate the model performance. The last dataset, C3, is a
+multi-choice reading comprehension task. Given a passage, a question, and multiple candidate answers, the purpose is
+to select one of the candidate answers as the predicted answer to the question.
+Natural language inference. There are two datasets: OCNLI [46] and CMNLI [47]. Given two sentences, one as
+a premise and the other as a hypothesis, the aim is to determine whether the relation between the premise and the
+hypothesis is entailment, neutral, or contradiction. We convert this task into a three-class classiﬁcation problem to solve.
+Text classiﬁcation. We use TNEWS and IFLYTEK [47] datasets. The total number of categories for TNEWS and
+IFLYTEK is 15 and 119, respectively. Following PanGu-α, for each instance, we randomly sample three negative
+categories plus one ground-truth category to form a new set of candidate categories, then simplify this task into a
+four-class classiﬁcation task for processing.
+Semantic similarity. We use two datasets: AFQMC and CSL [47]. AFQMC aims to determine whether two sentences
+are semantically the same or different. Given an abstract of a paper and a set of keywords, the goal of CSL is to judge
+whether the set of keywords contains pseudo keywords according to the abstract. Hence we convert each of them into a
+two-class classiﬁcation problem to solve.
+Winograd schema challenge. This task contains only the CLUEWSC2020 [47] dataset. CLUEWSC2020 is a
+coreference resolution task. Given a sentence, together with a pronoun and a noun in the sentence, the aim is to
+determine whether the pronoun refers to the noun. We merge multiple instances with the same sentence and the same
+pronoun into a single instance that contains a sentence, a pronoun, and multiple nouns. Then the goal becomes to select
+one of the multiple nouns as the object the pronoun refers to.
+12
+
+TECHNICAL REPORT - MARCH 21, 2023
+Cloze and completion. There are ﬁve datasets: CHID [48], CMRC2019 [49], PD [50], CFT [50], and CMRC2017 [51].
+Both CHID and CMRC2019 are multi-choice completion tasks. Given a passage with multiple blanks and multiple
+candidate answers, for each blank in the passage, the goal is to select the appropriate one from all the candidate answers
+to ﬁll in the blank. For CHID, we use the Hungarian algorithm to post-process the model prediction results to ensure
+that different blanks in the same passage are ﬁlled in different idioms. On the CMRC2019 dataset, following ERNIE
+3.0 Titan [8], for each blank, we randomly sample three negative candidate answers plus one ground-truth answer to
+form a new set of candidate answers, and moreover, beam search is also used in the model prediction process to ﬁnd an
+optimal combination of answers for multiple blanks in a passage. CMRC2017 contains two subsets, one for completion
+and the other for reading comprehension. As with PanGu-α, we also evaluate PanGu-Σ only on the completion subset.
+For CMRC2017, PD and CFT, given a passage with a blank, the goal is to ﬁll in the blank with the appropriate words.
+Aligned with ERNIE 3.0 Titan, we also convert PD, CFT and CMRC2017 into multi-choice completion tasks, and the
+choices are all words that appear in the passage where the blank is located.
+5.3.2
+Evaluation Details
+Each dataset of all Chinese downstream tasks can be evaluated using either a generation-based method or a scoring-based
+method. We use the generation-based method to evaluate CMRC2018, DRCD, DuReader, and the scoring-based method
+to evaluate other datasets. For each instance, a text sequence is obtained by ﬁlling it into a manually designed template,
+and then the text sequence is fed into PanGu-Σ for prediction to get the result. The templates we used for all datasets
+are shown in Table 4.
+Table 4: The templates for all datasets. "/" indicates that the corresponding dataset does not contain answer choices.
+Dataset
+Template
+Answer Choices
+CMRC2018
+阅读文章：{Passage}\n根据上文，回答如下问题：{Question}\n答：
+/
+DRCD
+阅读文章：{Passage}\n根据上文，回答如下问题：{Question}\n答：
+/
+DuReader
+阅读文章：{Passage}\n根据上文，回答如下问题：{Question}\n答：
+/
+C3
+问：{Question}\n答：{Answer}\n该答案来自对话：{Passage}
+Answer ∈All options
+CMNLI
+{Premise}？{Answer}，{Hypothesis}
+Answer ∈{对, 错, 或许}
+OCNLI
+{Premise}？{Answer}，{Hypothesis}
+Answer ∈{对, 错, 或许}
+TNEWS
+这是关于{Answer}的文章：{Passage}
+Answer ∈All categories
+IFLYTEK
+这是关于{Answer}的应用程序：{Passage}
+Answer ∈All categories
+AFQMC
+{Sentence1}。{Sentence2}。上面两个句子的语义是{Answer}
+Answer ∈{不同的, 相同的}
+CSL
+摘要：{Abstract} {Answer}的关键词：{Keywords}
+Answer ∈{含有错误, 全部正确}
+CLUEWSC2020
+{Text to the left of the pronoun}{Answer}{Text to the right of the pronoun}
+Answer ∈All mentions
+CHID
+{Text to the left of the blank}{Answer}{Text to the right of the blank}
+Answer ∈All candidates
+PD
+{Text to the left of the blank}{Answer}{Text to the right of the blank}
+Answer ∈All words in the text
+CFT
+{Text to the left of the blank}{Answer}{Text to the right of the blank}
+Answer ∈All words in the text
+CMRC2017
+{Text to the left of the blank}{Answer}{Text to the right of the blank}
+Answer ∈All words in the text
+CMRC2019
+{Text to the left of the blank}{Answer}{Text to the right of the blank}
+Answer ∈All candidates
+Generation-based evaluation method
+For each instance to be predicted, it is ﬁlled into the corresponding template to obtain a text sequence. After that, the
+text sequence is used as the input to PanGu-Σ to generate the answer. We use a greedy decoding strategy to generate
+the answer.
+Scoring-based evaluation method
+Each instance to be predicted contains multiple candidate answers. For each candidate answer, a text sequence is
+obtained by ﬁlling the candidate answer together with the sample into the corresponding template, and the perplexity of
+the text sequence is calculated by PanGu-Σ. Finally, the candidate answer corresponding to the text sequence with the
+smallest perplexity is selected as the predicted answer for the instance to be predicted.
+5.3.3
+Result
+We choose PanGu-α and ERNIE 3.0 Titan as the baseline for comparison. The performance of each Chinese downstream
+task is shown in Table 5. Compared to ERNIE 3.0 Titan with 260 billion parameters, PanGu-Σ surpassed on 11 out of
+16 datasets, with an average score of 3.96 points higher on all datasets.
+13
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 5: Zero-shot results of Chinese downstream tasks. Compared to ERNIE 3.0 Titan, PanGu-Σ surpassed on 11 out
+of 16 datasets, with an average score of 3.96 points higher on all datasets.
+Task Type
+Dataset
+Split
+Metric
+PanGu-α 13B
+ERNIE 3.0 Titan
+PanGu-Σ
+Reading comprehension
+CMRC2018
+dev
+avg(EM/F1)
+10.37(1.46/19.28)
+30.41(16.62/44.20)
+31.23(15.97/46.49)
+DRCD
+dev
+avg(EM/F1)
+5.61(0.66/10.55)
+29.46(21.08/37.83)
+37.78(27.70/47.86)
+DuReader
+dev
+ROUGE-1
+24.46
+32.13
+32.20
+C3
+dev
+Acc
+54.47
+54.85
+56.93
+Natural language inference
+CMNLI
+dev
+Acc
+48.44
+51.70
+51.14
+OCNLI
+dev
+Acc
+41.53
+44.61
+45.97
+Text classiﬁcation
+TNEWS
+dev
+Acc
+60.26
+72.60
+69.19
+IFLYTEK
+dev
+Acc
+73.80
+79.84
+75.72
+Semantic similarity
+AFQMC
+dev
+Acc
+65.76
+68.99
+68.49
+CSL
+dev
+Acc
+49.30
+55.80
+56.93
+Winograd Schema Challenge
+CLUEWSC2020
+dev
+Acc
+75.00
+81.08
+85.20
+Cloze and completion
+CHID
+dev
+Acc
+70.64
+86.21
+81.01
+PD
+test
+Acc
+43.86
+67.06
+77.80
+CFT
+test
+Acc
+46.60
+66.14
+86.84
+CMRC2017
+test
+Acc
+38.90
+74.63
+83.57
+CMRC2019
+dev
+Acc
+68.19
+75.00
+93.87
+/
+Overall
+/
+Average
+48.57
+60.66
+64.62
+5.4
+Chinese Dialogue Generation
+To verify the ability of PanGu-Σ on Chinese dialogue generation, in this subsection, we compare with several high
+performance Chinese dialogue systems, including CDialGPT [52], EVA [53], EVA 2.0 [54] and PanGu-Bot [55]. The
+PanGu-Σ model is ﬁne-tuned on about 51.5M dataset including social media data, knowledge-grounding dialogue and
+question answering data, which is consistent with PanGu-Bot. PanGu-Σ consistently outperforms baselines on self-chat,
+topic-grounded dialogue generation and question answering in terms of automatic evaluation and human evaluation.
+5.4.1
+Baselines
+CDialGPT: A GPT-based Chinese dialogue model trained on a large-scale cleaned Chinese conversation dataset LCCC,
+which contains about 104M parameters.
+EVA: An encoder-decoder-based Chinese dialogue model trained on WDC-Dialog corpus including 1.4B Chinese
+context-response pairs. This model contains about 2.8B parameters.
+EVA2.0: An improved version of EVA. A well designed data processing pipeline is explored to construct training
+data based on WDC-Dialog corpus, and various decoding strategies are utilized to improve generation. Furthermore,
+EVA2.0 designs better model architecture for open-domain Chinese dialogue, including attention scale strategy, deeper
+decoding network, and role embedding.
+PanGu-Bot: The PanGu-α [1] based Chinese dialogue models trained on collected 51.5M dialog sessions, which contain
+two versions of 350M and 2.6B parameters, respectively. To improve training efﬁciency, multiple dialogue sessions are
+concatenated with a special token, and resetting strategies on position ids and attention masks are utilized to distinguish
+different samples.
+5.4.2
+Self-chat evaluation
+Self-chat is a common method for evaluating the quality of dialogue systems. During the evaluation, the conversation
+goes based on given prompts, with dialogue system playing both roles of user and bot. In this subsection, we provide
+50 prompts to trigger multi-turns conversation with each containing 9 turns. We use top-5 random sampling [56]
+with repetition penalty [54] set to 1.2 during decoding. Three human annotators are asked to judge whether each turn
+conforms to the following six criteria: 1) Sensibility evaluates the semantic-consistency with the context of response; 2)
+Speciﬁcity evaluates the speciﬁcity and informativeness of response; 3) Interestingness evaluates the interest of response
+and the ability to catch people’s attention; 4) SSI averages values of Sensibility, Speciﬁcity and Interestingness; 5)
+Hallucination evaluates factual mistakes contained in response; 6) Safety evaluates the avoidance of unsafe behavior of
+dialogue system, e.g. response with social bias, toxicity, harmfulness and offensives.
+As shown in Table 6, in self-chat evaluation, the overall response quality of PanGu-Σ is much higher than the baselines,
+especially in terms of Speciﬁcity. This is because PanGu-Σ inherits the 13B version of PanGu-α model, and the
+sub-model for dialogue generation contains about 38B parameters, which can memorize a wealth of knowledge. The
+improvements in terms of Hallucination and Safety indicate that PanGu-Σ can learn the patterns of knowledge and
+14
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 6: The self-chat human evaluation results
+Models
+Sensibility
+Speciﬁcity
+Interestingness
+SSI
+Hallucination
+Safety
+CDial-GPT
+0.607
+0.531
+0.414
+0.517
+0.098
+0.964
+EVA
+0.557
+0.687
+0.453
+0.566
+0.152
+0.963
+EVA2.0
+0.872
+0.710
+0.516
+0.699
+0.114
+0.991
+PanGu-Bot 350M
+0.891
+0.697
+0.553
+0.714
+0.101
+0.992
+PanGu-Bot 2.6B
+0.907
+0.714
+0.543
+0.721
+0.093
+0.993
+PanGu-Σ
+0.927
+0.786
+0.561
+0.758
+0.090
+0.993
+safe expression in human dialogue effectively, and therefore generate factually correct and safe responses. A case of
+self-chat is shown in Figure 14, where the conversation goes smoothly with rich knowledge. More self-chat cases are
+shown in Appendix A.1.
+春节有哪些习俗？
+还有呢？具体点。谢!~
+还有没? 我想要更多的。
+吃饺子。
+Bot
+放鞭炮贴春联，拜年
+你可以在百度上搜"民俗"
+Bot
+好的，你喜欢放鞭炮吗？
+喜欢，可以烘托节日气氛
+What are the customs of the Spring Festival?
+What else? Please be specific. Thanks.
+Anything else? I want more.
+Eating dumplings.
+Bot
+Setting off firecrackers, sticking Spring Festival
+couplets and paying a New Year call.
+You can search "folk custom" on Baidu.
+Bot
+OK. Do you like setting off firecrackers?
+Yes, because it can foil the festival atmosphere.
+谢谢你的提醒
+要注意安全的
+Please be careful when setting off firecrackers.
+Thank you for your reminding.
+Figure 14: A case of self-chat.
+5.4.3
+Topic-grounded dialogue evaluation
+A well-designed dialogue system should be able to incorporate relevant knowledge with characteristic of chit-chat.
+Therefore, in this subsection, we aim to evaluate the performance on topic-grounded dialogue, where the dialogue
+history contains abundant knowledge and topic information. We randomly sample 2,000 dialogues from topic-grounded
+corpus NaturalConv [57], and keep each context containing at least 5 turns. We use nuclear sampling [58] with top-p set
+to 0.5 during decoding. The following metrics are used for automatic evaluation: 1) Semantic consistency measures the
+consistency between generated response and context, which is scored by a BERT-based binary classiﬁer model trained
+on NaturalConv [57] with an accuracy of 0.906; 2) Distinct-1 and distinct-2 [59] are the ratios of distinct unigrams and
+bigrams in response, respectively, for evaluating the diversity; 3) Bleu can evaluate the n-gram overlap degree between
+generated response and golden response.
+Table 7: The automatic evaluation results on topic-grounded dialogue generation
+Models
+distinct-1
+distinct-2
+bleu-2
+bleu-3
+Semantic-consistency
+CDial-GPT
+0.035
+0.172
+0.1405
+0.088
+0.344
+EVA
+0.067
+0.313
+0.169
+0.103
+0.393
+EVA2.0
+0.073
+0.341
+0.169
+0.104
+0.458
+PanGu-Bot 350M
+0.090
+0.335
+0.168
+0.105
+0.447
+PanGu-Bot 2.6B
+0.089
+0.337
+0.171
+0.106
+0.459
+PanGu-Σ
+0.109
+0.369
+0.177
+0.110
+0.502
+15
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 8: The human evaluation results on topic-grounded dialogue generation
+Models
+Sensibility
+Speciﬁcity
+Interestingness
+SSI
+Hallucination
+Safety
+CDial-GPT
+0.597
+0.680
+0.143
+0.473
+0.070
+0.970
+EVA
+0.507
+0.743
+0.210
+0.487
+0.080
+0.953
+EVA2.0
+0.677
+0.783
+0.287
+0.582
+0.070
+0.980
+PanGu-Bot 350M
+0.763
+0.820
+0.290
+0.624
+0.043
+0.993
+PanGu-Bot 2.6B
+0.810
+0.803
+0.293
+0.635
+0.050
+0.987
+PanGu-Σ
+0.830
+0.857
+0.340
+0.676
+0.040
+0.993
+Table 9: A case of topic-grounded dialog
+Dialog history
+你最近有看中国排球比赛吗?
+(Have you watched the Chinese volleyball match recently?)
+就是啊,当然有在看,中国女排这几次的比赛都很优秀。
+(Of course. The Chinese women’s volleyball team has been excellent in these competitions.)
+我觉得中国女排能有现在的成功也离不开教练郎平的教导。
+(I think the success of the Chinese women’s volleyball team can not be achieved without the
+guidance of coach Lang Ping.)
+就是讲说啊,我觉得还是很优秀的能够这么成功不容易啊。
+(Yes, they are excellent, and it is not easy to be so successful.)
+背后一定付出很多,我以前打过排球,很容易受伤。
+(They must have payed a lot of effort. I’ve played volleyball before, and it’s easy to get hurt.)
+EVA2.0
+是啊是啊!真的不容易。
+(Yeah yeah! it’s really not easy.)
+PanGu-Bot 2.6B
+所以我们要好好的保护自己,不让自己受伤。
+(So we need to protect ourselves from getting hurt.)
+PanGu-Σ
+郎平的执教也是很有一套的,她还入选过世界排球名人堂呢。
+(Lang Ping is also a good coach. She has also been selected into the World Volleyball Hall of
+Fame.)
+The results of automatic evaluation and human evaluation are shown in table 7 and table 8, respectively. Compared with
+baselines, PanGu-Σ can generate more diverse, semantic-consistent, knowledgeable and interesting responses. This is
+because PanGu-Σ can well response with consideration of topic and knowledge contained in dialogue history. A case of
+topic-grounded dialog is shown in Table 9, where the response of PanGu-Σ introduces knowledge about 郎平(Lang
+Ping). More topic-grounded cases are shown in Appendix A.2.
+5.4.4
+Open domain question-answering evaluation
+Table 10: The evaluation results on question-answering
+Models
+P
+R
+F1
+Human-eva
+CDial-GPT
+0.033
+0.067
+0.041
+0.036
+EVA
+0.008
+0.051
+0.012
+0.036
+EVA2.0
+0.082
+0.139
+0.103
+0.119
+PanGu-Bot 350M
+0.511
+0.745
+0.554
+0.738
+PanGu-Bot 2.6B
+0.509
+0.761
+0.556
+0.738
+PanGu-Σ
+0.574
+0.822
+0.621
+0.774
+For evaluating the PanGu-Σ’s ability to answer fact-based question in conversation, 6 categories of questions collected
+from PanGu Bot [55] are utilized for evaluation. The greedy search decoding strategy is applied. The results of
+open domain question-answering evaluation is shown in table 10. PanGu-Σ model can well answer factual questions
+with highest accuracy, which can further verify the advantages of PanGu-Σ on knowledge memorization. A case of
+question-answering is shown in Table 11, where the answer of PanGu-Σ is the the most accurate. More cases of
+question-answering are shown in Appendix A.3.
+16
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 11: A case of open domain question-answering
+Question:
+中国的四大发明是哪四个？
+What are China’s four major inventions?
+EVA2.0:
+我觉得是发明了“发明”这个词的人
+I think it’s the man who invented the word
+‘invented’.
+PanGu-Bot 2.6B:
+造纸术、火药术、火药武器、火药武器
+Papermaking,
+gunpowder,
+gunpowder
+weapons, gunpowder weapons
+PanGu-Σ:
+造纸术、印刷术、指南针、火药
+Papermaking, printing, compass, gunpow-
+der
+5.4.5
+Natural language generation of base PanGu-Σ model
+For evaluating base PanGu-Σ’s abilities on open-ended text generation, we present three categories of cases about
+character dialog, question-answering and text generation with few-shot prompt learning, which are shown in Table 12,
+Table 13 and Table 14 respectively. More cases of character dialog and open-end text generation are shown in
+Appendix A.4 and Appendix A.5.
+5.5
+Machine Translation
+To verify the generative and multilingual ability, we compare the performance of PanGu-Σ with the state-of-the-art
+model CeMAT, and the benchmark pre-trained large models (mT5-XXL, CPM-2, ERNIE3.0) on the machine translation
+task. Following the existing pre-training methods, we use the PanGu-Σ model to ﬁne-tune directly on the dataset of
+translation tasks and use SacreBLEU [60] as an evaluation metric. We perform validation on two mainstream datasets,
+WMT17 and WMT20, covering two different translation reversals, Chinese-English and English-Chinese, respectively.
+The experiments ﬁnd that PanGu-Σ has a large improvement over both baseline models, and in low-resource translation
+experimental scenarios even outperforms signiﬁcantly the results of full data ﬁne-tuning of other pre-trained models.
+Benchmark
+mT5 [61] is a multilingual variant of T5, which leveraged a uniﬁed text-to-text format and scale to attain state-of-the-art
+results on a wide variety of English-language NLP tasks. mT5 was pre-trained on a new Common Crawl-based dataset
+covering 101 languages and achieved the state-of-the-art performance on many multilingual benchmarks, such as
+machine translation. mT5-XXLarge is a largest version of mT5 with 13B parameter size.
+CPM-2 [62] is a large-scale cost-efﬁcient pre-trained language model. CPM-2 accelerate the pre-training process by
+dividing the pre-training process into three stages: Chinese pre-training, bilingual pre-training, and MoE pre-training.
+To test the cross-lingual generation ability, we use the bilingual version model.
+ERINE3.0 [63] is a uniﬁed framework for pre-training large-scale knowledge enhanced models. Which fuses auto-
+regressive network and auto-encoding network, and can be easily tailored for both natural language understanding and
+generation tasks with zero-shot learning, few-shot learning or ﬁne-tuning.
+CeMAT [64] is a universal Conditional Masked Language Pre-training for both Autoregressive and non-Autoregressive
+machine translation tasks. Which is also a multi-lingual pre-trained language model consist of 32 languages.
+During the ﬁne-tuning, we used the language tag "<Language ID>" as the preﬁx for Chinese and English text sequences
+respectively, and then spliced the source and target sequences together as the input to the model, with the source
+sequence at the beginning of the sequences and the two sequences separated by "<EOT>". We ﬁrst veriﬁed PanGu-Σ
+on WMT20 Chinese-English dataset, almost large scale pre-trained language model eval the cross-linugal genetation
+ability on that. In addition to this, we also compare the performance of PanGu-Σ with the current SOTA translation
+pre-trained model CeMAT on WMT17 datasets, and covering two different translation reversals, Chinese-English and
+English-Chinese, respectively.
+As shown in Table Table 16, on the WMT20 Chinese-English translation task, PanGu-Σ exceeded the mT5-XXL
+model by 12.6 BLEU, which also showed a signiﬁcantly higher improvement of 9.8 BLEU compared to the Ernie3.0,
+which is the Chinese-English SOTA pre-trained large model, indicating that the PanGu-Σ model was able to learn
+stronger cross-language understanding and generation abiliby from the pre-trained data. To further veriﬁed PanGu-Σ´s
+performance in low-resource scenarios, we using a randomly sampled 30w training dataset, as shown in Table 2. Using
+only a small amount of training data, the PanGu-Σ model still outperformed large models such as Ernie3.0 by more
+than 3.19 BLEU, which used a full 26M of training data.
+Compared to the translation pre-trained language model CeMAT, PanGu-Σ also shows a meaningful quality improve-
+ment. As show in Table Table 16, the PanGu-Σ pre-trained model exceeds the CeMAT model by 3.0 BLEU on the
+17
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 12:
+A case of character dialog.
+Source of the prompt about 黄健翔(Huang Jianxiang) is from
+https://baike.baidu.com
+Prompt
+黄健翔,中国著名体育解说员。从事体育节目解说,以充满激情,富有感染力的解说风格
+著称。现为一级播音员。已经完成现场直播超过六百场,涉及足球、田径、游泳、跳
+水、篮球、射击等多种体育项目。另外解说各种足球比赛超过两千场。
+(Huang Jianxiang is a famous sports commentator in China. He is engaged in sports program
+commentary, with full of passion and rich infectious interpretation style. Now he is a ﬁrst-class
+announcer, and has completed more than 600 live broadcasts, involving football, track and
+ﬁeld, swimming, diving, basketball, shooting and other sports. In addition, he has commented
+more than 2,000 football games.)
+黄健翔:你好,我是黄健翔,体育解说员。
+(Huang Jianxiang: Hello, I’m Huang Jianxiang, a sports commentator.)
+记者:你好,非常高兴今天和你对话。你认为中国队会跻身下一届男足世界杯吗?
+(Reporter:Hello, it’s a pleasure to talk to you today. Do you think China will qualify to
+compete in the next Men’s World Cup?)
+PanGu-Σ
+黄健翔:这个问题,我想应该是所有中国人都关心的问题。中国足球现在的发展是有目
+共睹的,但是在亚洲范围内,中国足球还不能算是一个强队,但是我相信中国足球会在中
+国足球的努力下,不断的提高,我也希望中国足球能够在世界杯上取得好成绩。
+(Huang Jianxiang: I think this issue should be a concern of all Chinese people. The devel-
+opment of Chinese football is obvious to all, but in Asia, Chinese football is not a strong
+team. However, I believe Chinese football will continue to improve with the efforts of Chinese
+football, and I also hope Chinese football can achieve good results in the World Cup.)
+记者:在世界杯的预选赛中,中国男足的表现不是很理想,尤其是在对阵泰国的比赛
+中,中国队竟然以0:1输掉了比赛,这让很多球迷都感到非常的失望,对此你有什么看法?
+(Reporter:In the World Cup qualiﬁers, the performance of the Chinese men’s football team is
+not very ideal. Especially against Thailand, the Chinese team unexpectedly lost the game by
+0-1, which makes many fans feel very disappointed. What do you think about this?)
+黄健翔:我觉得足球比赛的结果并不是最重要的,重要的是我们在比赛中所表现出来的
+精神,我们在比赛中所表现出来的勇气,我觉得这才是最重要的。
+(Huang Jianxiang: I think the result of the football match is not the most important, but the
+spirit and courage we showed in the game, which is the most important.)
+记者:中国足球的发展和其他国家相比,有什么优势吗?
+(Reporter:Is there any advantage in the development of Chinese football compared with other
+countries?)
+黄健翔:中国足球和其他国家相比,最大的优势就是我们的人口基数,中国有十几亿的人
+口,而足球的人口也有好几亿,所以中国足球的发展潜力是非常大的。
+(Huang Jianxiang: Compared with other countries, the biggest advantage of Chinese football
+is our population base. China has a population of more than one billion, and the population
+of playing football is hundreds of millions. Therefore, the development potential of Chinese
+football is very great.)
+记者:你觉得中国足球有希望在世界杯上取得好成绩吗?
+(Reporter:Do you think Chinese football has any hope of achieving good results in the World
+Cup?)
+黄健翔:我觉得现在还为时尚早,我觉得中国足球现在最需要的是建立一个好的足球环
+境,包括国家队,包括俱乐部的球员,包括俱乐部的教练,包括俱乐部的管理者,包括足协
+的管理者,大家都能够团结在一起,能够共同把中国足球的发展,能够提高到一个新的高
+度。
+(Huang Jianxiang: I think it’s still too early. I think what Chinese football needs most is to
+build a good football environment, including the national team, the players of the club, the
+coaches of the club, the managers of the club, and the managers of the football association, so
+that we can all unite together to jointly develop Chinese football to raise the development of
+Chinese football to a new height.)
+18
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 13: A case of QA
+Query
+深圳的发展,依靠什么?
+(What does Shenzhen rely on for its development?)
+PanGu-Σ
+深圳市城市规划设计研究院高级规划师吴剑平认为,深圳的发展,依靠的是改革、创
+新、人才、环境。改革开放,是深圳的根。深圳是中国改革开放的窗口,是中国改革开
+放的“试验场”,是中国改革开放的“窗口”和“试验田”。创新,是深圳的魂。深圳是中国
+科技创新的前沿阵地,是中国科技创新的“领航区”。深圳聚集了一大批中国最优秀的
+科技企业,是中国科技创新的重要发源地,是中国科技创新的“领航区”。
+(Wu Jianping, senior planner of Shenzhen Urban Planning and Design Institute, believes that
+Shenzhen’s development depends on reform, innovation, talent and environment. Reform and
+opening up are the root of Shenzhen. Shenzhen is the window, the "test ground" and the "test
+ﬁeld" of China’s reform and opening up. Innovation is the soul of Shenzhen. Shenzhen is
+the frontier position and the "pilot zone" of China’s scientiﬁc and technological innovation.
+Shenzhen gathers a large number of China’s best science and technology enterprises, which
+is an important birthplace of China’s scientiﬁc and technological innovation, and the "pilot
+zone" of China’s scientiﬁc and technological innovation.)
+English-Chinese task and also has a 0.7 BLEU improvement on the Chinese-English task, both achieving SOTA results.
+Also, in the speciﬁc translation case, we found that the translation results of PanGu-Σ model have higher ﬁdelity
+compared with CeMAT, as shown in Table Table 17.
+5.6
+Code Generation
+In order to measure the performance of PanGu-Σ on code downstream tasks, we evaluated the performance of PanGu-Σ
+’s code domain model on MBPP [65] tasks. MBPP is a benchmark to measure the ability of pre-trained models
+to generate Python programs from natural language descriptions. The MBPP datasets contain 374 programming
+problems for ﬁne-tuning and 500 programming tasks as test dataset. Each sample in ﬁne-tuning dataset contain function
+description, three test cases which check for functional correctness, and function code which is a ground-truth solution
+that passes all test cases. Figure 15 shows a sample in the MBPP ﬁne-tune dataset.
+function description
+Write a function to find the minimum total path sum in the given triangle.
+test cases
+assert min_sum_path([[ 2 ], [3, 9 ], [1, 6, 7 ]]) == 6
+assert min_sum_path([[ 2 ], [3, 7 ], [8, 5, 6 ]]) == 10
+assert min_sum_path([[ 3 ], [6, 4 ], [5, 2, 7 ]]) == 9
+function code
+def min_sum_path(A):
+    memo = [None] * len(A)
+    n = len(A) - 1
+    for i in range(len(A[n])):
+        memo[i] = A[n][i]
+    for i in range(len(A) - 2, -1,-1):
+        for j in range( len(A[i])):
+            memo[j] = A[i][j] + min(memo[j],
+                                    memo[j + 1])
+    return memo[0]
+Figure 15: A sample in the MBPP ﬁne-tune dataset
+5.6.1
+Fine-tuning datasets
+PanGu-Coder [33] introduces additional datasets which contain APPS [66] and Code Contests [67] (CC) datasets from a
+more similar distribution. The additional datasets provide a large number of competitive programming problems. APPS
+includes 10, 000 programming tasks that generate or complete code given the problem description. Code Contests (CC)
+containing over 13k programming problems. PanGu-Σ also introduces these additional datasets. For each problems
+in APPS and CC, we up-sample 5 different correct solutions. Then, we ﬁlter the samples with text length over 1024.
+Finally, we get 56k instances for ﬁne-tuning.
+19
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 14: A case of text generation with few-shot prompt learning
+Prompt
+Q：以“我的未来不是梦”为主题，写一篇字数150左右的作文。
+(Q: Write a composition about 150 words on the theme of "my future is not a dream".)
+A：我的未来不是梦，梦想和努力会让它变成现实。我从小爱读书，尤其喜欢探索
+未知的知识，我将不断学习，提升自己的视野和能力，以便未来能够胜任自己的工
+作。我会努力工作，以实现自己的梦想。我会为自己设定切实可行的目标，每一步
+都在迈向我的未来。每当遇到困难，我会耐心地排除问题，继续前进，永不放弃。
+我将把未来作为一种挑战，努力改变自己的命运，以实现自己的梦想。
+(A: My future is not a dream. Dreams and efforts will make it a reality. I love reading since
+childhood, especially exploring unknown knowledge. I will continue to learn and improve
+my vision and ability so that I can be competent for my work in the future. I will work hard
+to realize my dream. I will set practical goals for myself towards my future. Whenever I
+encounter difﬁculties, I will patiently eliminate problems, continue to move forward and
+never give up. I will take the future as a challenge and try to change my destiny to realize my
+dream.)
+Q：以“谈自信”为主题，写一篇字数150左右的作文。
+(Q: Write a composition with about 150 words on the theme of "talking about conﬁdence".)
+A：自信是成功的重要前提，它可以增强人们的自我意识，让人们对未来充满信心。
+自信是一种能力，可以使人在一些困难和挑战中从容应对，并获得成功。要培养自
+信，首先要有自信心，坚信自己可以做到，不管有多难，都要坚持到底。其次，要
+勇于接受挑战，不断地挑战自己，以增强自信心。此外，在遭遇挫折时，要学会正
+确认识挫折，不要太看重结果，而是要从容面对失败，从中汲取智慧。总之，要想
+取得成功，自信是不可缺少的，它可以帮助我们走出困境，走上成功之路。
+(A: Conﬁdence is an important prerequisite for success. It can enhance people’s self-awareness
+and make people conﬁdent in the future.
+Self-conﬁdence is a kind of ability that can
+make people deal with difﬁculties and challenges calmly and achieve success. To cultivate
+self-conﬁdence, ﬁrst of all, you should be conﬁdent, believe that you can do it, and stick to it
+no matter how difﬁcult it is. Secondly, you should be brave to accept challenges and constantly
+challenge yourselves to enhance self-conﬁdence. In addition, when encountering setbacks,
+you should learn to correctly recognize setbacks, not pay too much attention to the results, but
+take it easy to face failures and learn wisdom from them. In short, to succeed, self-conﬁdence
+is indispensable. It can help us out of difﬁculties and embark on the road to success.)
+Q：以“吃火锅”为主题，写一篇字数150左右的作文。
+(Q: Write a composition with about 150 words on the theme of "eating hot pot".)
+PanGu-Σ
+A：所谓“人生如火锅,苦辣酸甜是味道”。人生就像火锅一样,生活中充满了酸甜苦
+辣,需要我们自己去品尝。我的生活就像火锅一样,充满了酸甜苦辣,因为我有着爸爸妈
+妈,奶奶,外公,外婆,叔叔婶婶等家人的关爱。当我快乐时,他们和我一起快乐,当我伤心
+时,他们和我一起伤心，他们的陪伴是我生活中最重要的组成部分。这就像火锅里的
+味道一样,它们相辅相成,形成了我生活中的酸甜苦辣。
+(A: The so-called "life is like hot pot, bitter, spicy, sour and sweet are the taste". Life is like hot
+pot, which is full of ups and downs. We need to taste it ourselves. My life is like hot pot, full
+of ups and downs, because I have the care of my parents, grandmother, grandpa, grandmother,
+uncle and aunt and other families. When I am happy, they are happy with me. When I am sad,
+they are sad with me. Their company is the most important part of my life. This is like the
+taste in hot pot. They complement each other and form the ups and downs of my life.)
+20
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 15: The results on WMT20 translation task. PanGu-Σ outperforms previous Chinese-English SOTA pre-trained
+large model with a large margin. Compared with the mullingual pre-trained language model CeMAT, PanGu-Σ model
+also obtain the very competitive results. Even in the low-resource scenario, PanGu-Σ only used 30w of data for
+ﬁne-tuning, which also able to achieve better results than these large models.
+Data
+WMT20
+Lang
+Corpus
+BLEU
+mT5-XXL
+26.0M
+24.0
+CPM-2
+26.0M
+26.2
+Ernie3.0
+26.0M
+26.8
+CeMAT
+26.0M
+37.1
+PanGu-Σ
+26.0M
+36.6
+PanGu-Σ (Low-resource)
+0.3M
+31.0
+Table 16:
+The results on WMT17 translation task. PanGu-Σ achieved a large performance improvement, which
+outperforms CeMAT 3.0 BLEU on English-Chinese task.
+Model
+WMT17
+En2Zh
+Zh2En
+CeMAT
+35.8
+22.8
+PanGu-Σ
+38.8
+23.5
+To make it easier for the model to distinguish between task descriptions and solutions, we format training instances for
+ﬁne-tuning. For these instances in MBPP, we concatenate function description and three test cases to form prompt, and
+then add a <comment> token to the head of the prompt and a <python> token to the end of the prompt. Function code
+is appended to the <python> token and the <EOT> token is add to the end of function code. Similar for these instances
+in APPS or CC, the only different is that the function description is treated to prompt directly.
+All these formatted instances from the MBPP ﬁne-tune dataset, APPS and CC constitute the ﬁne-tune datasets. We
+ﬁne-tune the code domain model, which is extracted from PanGu-Σ , for 5 epochs on the ﬁne-tuning datasets.
+5.6.2
+Results
+For all sample in MBPP test dataset, function descriptions are augmented with three test cases as prompt, which is
+similar to the data format used during ﬁne-tuning. We use greedy decoding to generate function code based on the
+formatted prompt. If the generated code passes all three of the given test cases, then the generated code passes the test.
+To evaluate the performance of the ﬁne-tuned code domain mode of PanGu-Σ , we use the pass@1 as the estimator.
+The pass@1 of model refers to generating only one function code for each sample in the test dataset, and then counting
+the percentage of the generated function code that passes the test.
+Table 17: Case Study. Compared to CeMAT, PanGu-Σ model demonstrates better ﬁdelity.
+Src
+You may drink more water, have more fruit during stay up.
+Ref
+熬夜时适时补充水分，多吃水果。
+CeMAT
+睡觉时可以多喝水、多吃水果。
+PanGu-Σ
+熬夜时不妨多喝水，多吃水果。
+Src
+We still have a lot we want to learn about how, when and why stars slow their spin rates.
+Ref
+关于恒星如何、何时以及为何减慢自转速度并且"收起自己的舞鞋" ，
+我们仍有许多需要了解的知识。
+CeMAT
+我们还有很多东西需要学习，比如明星怎样、什么时候、为什么放慢自旋速度。
+PanGu-Σ
+我们仍然有很多事情要了解，比如恒星如何、何时以及为何会减慢自转速率。
+Src
+连续熬夜看奥运赛事容易损伤心脏
+Ref
+Staying up late watching the Olympic Games will damage the heart easily
+CeMAT
+Staying up all night to watch the Olympics can hurt the heart
+PanGu-Σ
+it’s easy to damage your heart by staying up late to watch the Olympic Games
+21
+
+TECHNICAL REPORT - MARCH 21, 2023
+<comments>Write a python function to left rotate the string.\nassert
+left_rotate(\"python\",2) == \"thonpy\"   \nassert
+left_rotate(\"bigdata\",3 ) == \"databig\" \nassert
+left_rotate(\"hadoop\",1 ) == \"adooph\" <Python>\ndef left_rotate(s,d):\n
+   tmp = s[d : ] + s[0 : d]\n    return tmp <EOT>
+<comments>You get an array of numbers, return the sum of all of the
+positives ones.\nExample `[1,-4,7,12]` => `1 + 7 + 12 = 20`\nNote: if there
+is nothing to sum, the sum is default to `0`.\n<Python>\ndef
+positive_sum(arr):\n    return sum(x for x in arr if x > 0)\n<EOT>
+Figure 16: The traning sample format for ﬁne-tuning in MBPP task
+<comments>Write a function to search an element in the given array by using
+binary search.\nassert binary_search([1,2,3,5,8], 6) == False\nassert
+binary_search([7, 8, 9, 10, 13], 10) == True\nassert binary_search([11, 13,
+14, 19, 22, 36], 23) == False<Python>
+Figure 17: The formatted prompt for generating function code
+Table 18 shows the comparison of existing models, as well as PanGu-Σ on the MBPP dataset, along with model size
+and number of tokens trained by model. The PanGu-Σ outperforms the current state-of-the-art model PanGu-Coder by
+1.4 point on the pass@1 for MBPP tasks. The training data of PanGu-Σ is less than PanGu-coder, which contains only
+75B code data, while Python code data related to MBPP tasks is only 50B data. This suggests that PanGu-Σ makes
+more efﬁcient use of data.
+5.7
+English Natural Language Understanding
+In order to compare with other large language models on English tasks, we evaluate PanGu-Σ model on the SuperGLUE
+benchmark [70]. SuperGLUE consists of 8 natural language understanding tasks. We use accuracy as the performance
+metric except for MultiRC dataset where F1-score over the set of answer options is used (denoted by F1a). We cast
+each task to a multiple-choice classiﬁcation problem. The prediction is chosen based on the maximum log-likelihood
+score, log P(completion | context), of each available completion given the context. For some of the datasets, we
+normalize this score by the token length of the completion, but for COPA and RECORD non-normalized scores yield
+better results. We generally view binary classiﬁcation in such a way that the completion options are “Yes” and “No”,
+except for the COPA for which the model chooses between two appropriate sentence continuations. In the table 19,
+we report model’s performance on each of the SuperGLUE datasets along with the average score. We focus on the
+zero-shot setup and make a comparison with the GPT-3 model which has a similar evaluation setup.
+In the Table 19, evaluation results are presented. We see that, even with only 112B English tokens, the performance of
+PanGu-Σ English sub-model with 38B parameters roughly meets the performance of the GPT-3 13B model and gets a
+higher average score.
+Table 18: Pass@1 rates on the MBPP dataset, among various models
+Models
+Size
+(Billion)
+Train tokens
+(Billion)
+MBPP(%)
+PASS@1
+INCODER [68]
+6.7B
+216B (52B python code, 107B other code, other 57)
+19.4
+LaMDA [69]
+137B
+2877B
+14.8
+PanGu-Coder [33]
+2.6B
+387B (all is python code)
+25.4
+PanGu-Σ
+38B
+300B(50B python code, 25B other code, other 225B)
+26.8
+22
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 19: Zero-shot results of English downstream tasks
+Dataset
+Metric
+GPT3 13B
+PanGu-Σ
+BoolQ
+acc
+66.2
+65.54
+CB
+acc
+19.6
+55.36
+Copa
+acc
+84.0
+79.00
+RTE
+acc
+62.8
+59.21
+WiC
+acc
+0.0
+50.78
+WSC
+acc
+64.4
+63.46
+MultiRC
+F1a
+71.4
+59.31
+ReCoRD
+acc
+89.0
+84.37
+SuperGLUE
+average
+57.2
+64.62
+6
+Conclusion and Future Work
+In this work, we have present a trillion parameters language model architecture PanGu-Σ . With the Random Routed
+Experts (RRE) and Expert Computation Storage Separation (ECSS), PanGu-Σ achieves high system performance under
+the MindSpore framework using Ascend 910 AI accelerators. By extending and continually training from PanGu-α
+with 329B tokens, PanGu-Σ has successfully achieved state-of-the-art results in a bunch of downstream tasks such as
+few-shot NLU, open-domain dialogue, question answering, machine translation, and code generation. Despite these
+achievements, there remain some worthwhile problems to pursue in the future work.
+• Sparse models offer the beneﬁts of a larger model size at reduced computation cost. Despite the existing
+advancements, numerous algorithmic and system challenges persist within the sparse architecture. Addressing
+these challenges and creating a user-friendly, high-performing sparse architecture system continues to be an
+open problem.
+• Large language models are designed to be applied in real-world scenarios. Therefore, to enhance model
+evolution, the system should receive accurate feedback from the open environment. Although InstructGPT [71]
+and ChatGPT 10 provide promising approaches, they require a substantial amount of data labeling, which can
+be time-consuming and costly. Consequently, devising an efﬁcient method to generate valuable signals that
+can align with the real world is a crucial research topic worth exploring.
+• Large-scale language models provide intelligent foundations and various modalities alignment objectives for
+artiﬁcial intelligence systems. Therefore, utilizing language models as a foundation and incorporating multiple
+modalities for perception input in a multimodal model will be one of the most important topics, as already
+demonstrated by Flamingo [72] and GPT-4 [73] .
+• Large language models have great potential for real time applications, but their deployment cost remains a
+major hurdle to overcome. To make them more accessible for commercialization, researchers should focus
+on two directions: 1) to explore techniques to compress the large language model’s size while preserving its
+emergence abilities; 2) to optimize the system software and/or hardware to accelerate the model’s performance.
+Both of these directions are valuable for the deployment of large language models.
+• Online knowledge updates are also critical for optimal performance of the large language model system.
+However, effectively storing and updating knowledge online is a signiﬁcant challenge that requires advanced
+system infrastructure and algorithms. As large-scale language models continue to develop, the issue of online
+learning will undoubtedly become increasingly crucial and a key topic for the future research.
+7
+Acknowledgements
+We would like to thank Bin Zhou, Zhiwei Wang, Yasheng Wang, Liangyou Li, Bin He and Fanyi Du for their great
+support for this work; Chen Li, Yifan Yao, Kaisheng Wang, Zhenzhang Yang, Zhongzhe Hu, Zhepeng Sun, Zhijian
+Guo, Jun Wang, and Ziqiang Chen for their help to handle infrastructure issues.
+10https://openai.com/blog/chatgpt
+23
+
+TECHNICAL REPORT - MARCH 21, 2023
+References
+[1] Wei Zeng, Xiaozhe Ren, Teng Su, Hui Wang, Yi Liao, Zhiwei Wang, Xin Jiang, ZhenZhang Yang, Kaisheng Wang,
+Xiaoda Zhang, Chen Li, Ziyan Gong, Yifan Yao, Xinjing Huang, Jun Wang, Jia xin Yu, Qiwei Guo, Yue Yu, Yan
+Zhang, Jin Wang, Heng Tao, Dasen Yan, Zexuan Yi, Fang Peng, Fan Jiang, Han Zhang, Lingfeng Deng, Yehong
+Zhang, Zhengping Lin, Chao Zhang, Shaojie Zhang, Mingyue Guo, Shanzhi Gu, Gaojun Fan, Yaowei Wang,
+Xuefeng Jin, Qun Liu, and Yonghong Tian. Pangu-α: Large-scale autoregressive pretrained chinese language
+models with auto-parallel computation. ArXiv, abs/2104.12369, 2021.
+[2] Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared D Kaplan, Prafulla Dhariwal, Arvind
+Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal, Ariel Herbert-Voss, Gretchen
+Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel Ziegler, Jeffrey Wu, Clemens Winter, Chris Hesse,
+Mark Chen, Eric Sigler, Mateusz Litwin, Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam
+McCandlish, Alec Radford, Ilya Sutskever, and Dario Amodei. Language models are few-shot learners. In Proc.
+NeurIPS, pages 1877–1901, 2020.
+[3] Colin Raffel, Noam Shazeer, Adam Roberts, Katherine Lee, Sharan Narang, Michael Matena, Yanqi Zhou, Wei
+Li, and Peter J Liu. Exploring the limits of transfer learning with a uniﬁed text-to-text transformer. The Journal of
+Machine Learning Research, 21(1):5485–5551, 2020.
+[4] Aakanksha Chowdhery, Sharan Narang, Jacob Devlin, Maarten Bosma, Gaurav Mishra, Adam Roberts, Paul
+Barham, Hyung Won Chung, Charles Sutton, Sebastian Gehrmann, et al. Palm: Scaling language modeling with
+pathways. arXiv preprint arXiv:2204.02311, 2022.
+[5] Jack W Rae, Sebastian Borgeaud, Trevor Cai, Katie Millican, Jordan Hoffmann, Francis Song, John Aslanides,
+Sarah Henderson, Roman Ring, Susannah Young, et al. Scaling language models: Methods, analysis & insights
+from training gopher. arXiv preprint arXiv:2112.11446, 2021.
+[6] Susan Zhang, Stephen Roller, Naman Goyal, Mikel Artetxe, Moya Chen, Shuohui Chen, Christopher Dewan,
+Mona Diab, Xian Li, Xi Victoria Lin, Todor Mihaylov, Myle Ott, Sam Shleifer, Kurt Shuster, Daniel Simig,
+Punit Singh Koura, Anjali Sridhar, Tianlu Wang, and Luke Zettlemoyer. Opt: Open pre-trained transformer
+language models. ArXiv, abs/2205.01068, 2022.
+[7] Zhengyan Zhang, Xu Han, Hao Zhou, Pei Ke, Yuxian Gu, Deming Ye, Yujia Qin, Yusheng Su, Haozhe Ji, Jian
+Guan, Fanchao Qi, Xiaozhi Wang, Yanan Zheng, Guoyang Zeng, Huanqi Cao, Shengqi Chen, Daixuan Li, Zhenbo
+Sun, Zhiyuan Liu, Minlie Huang, Wentao Han, Jie Tang, Juanzi Li, Xiaoyan Zhu, and Maosong Sun. CPM: A
+large-scale generative Chinese pre-trained language model. arXiv preprint arXiv:2012.00413, 2020.
+[8] Shuohuan Wang, Yu Sun, Yang Xiang, Zhihua Wu, Siyu Ding, Weibao Gong, Shikun Feng, Junyuan Shang,
+Yanbin Zhao, Chao Pang, et al. Ernie 3.0 titan: Exploring larger-scale knowledge enhanced pre-training for
+language understanding and generation. arXiv preprint arXiv:2112.12731, 2021.
+[9] Aohan Zeng, Xiao Liu, Zhengxiao Du, Zihan Wang, Hanyu Lai, Ming Ding, Zhuoyi Yang, Yifan Xu, Wendi
+Zheng, Xiao Xia, et al. Glm-130b: An open bilingual pre-trained model. arXiv preprint arXiv:2210.02414, 2022.
+[10] Teven Le Scao, Angela Fan, Christopher Akiki, Ellie Pavlick, Suzana Ili´c, Daniel Hesslow, Roman Castagné,
+Alexandra Sasha Luccioni, François Yvon, Matthias Gallé, et al. Bloom: A 176b-parameter open-access
+multilingual language model. arXiv preprint arXiv:2211.05100, 2022.
+[11] Jason Wei, Yi Tay, Rishi Bommasani, Colin Raffel, Barret Zoph, Sebastian Borgeaud, Dani Yogatama, Maarten
+Bosma, Denny Zhou, Donald Metzler, et al. Emergent abilities of large language models. arXiv preprint
+arXiv:2206.07682, 2022.
+[12] Shaden Smith, Mostofa Patwary, Brandon Norick, Patrick LeGresley, Samyam Rajbhandari, Jared Casper, Zhun
+Liu, Shrimai Prabhumoye, George Zerveas, Vijay Korthikanti, et al. Using deepspeed and megatron to train
+megatron-turing nlg 530b, a large-scale generative language model. arXiv preprint arXiv:2201.11990, 2022.
+[13] Noam Shazeer, Azalia Mirhoseini, Krzysztof Maziarz, Andy Davis, Quoc Le, Geoffrey Hinton, and Jeff Dean.
+Outrageously large neural networks: The sparsely-gated mixture-of-experts layer, 2017.
+[14] William Fedus, Barret Zoph, and Noam Shazeer. Switch transformers: Scaling to trillion parameter models with
+simple and efﬁcient sparsity. J. Mach. Learn. Res, 23:1–40, 2021.
+[15] Nan Du, Yanping Huang, Andrew M Dai, Simon Tong, Dmitry Lepikhin, Yuanzhong Xu, Maxim Krikun, Yanqi
+Zhou, Adams Wei Yu, Orhan Firat, et al. Glam: Efﬁcient scaling of language models with mixture-of-experts. In
+International Conference on Machine Learning, pages 5547–5569. PMLR, 2022.
+[16] Mikel Artetxe, Shruti Bhosale, Naman Goyal, Todor Mihaylov, Myle Ott, Sam Shleifer, Xi Victoria Lin, Jingfei
+Du, Srinivasan Iyer, Ramakanth Pasunuru, et al. Efﬁcient large scale language modeling with mixtures of experts.
+arXiv preprint arXiv:2112.10684, 2021.
+24
+
+TECHNICAL REPORT - MARCH 21, 2023
+[17] Wu dao 2.0 super-scale intelligent model, 2021.
+[18] Junyang Lin, An Yang, Jinze Bai, Chang Zhou, Le Jiang, Xianyan Jia, Ang Wang, Jie Zhang, Yong Li, Wei Lin,
+et al. M6-10t: A sharing-delinking paradigm for efﬁcient multi-trillion parameter pretraining. arXiv preprint
+arXiv:2110.03888, 2021.
+[19] Jared Kaplan, Sam McCandlish, Tom Henighan, Tom B Brown, Benjamin Chess, Rewon Child, Scott Gray,
+Alec Radford, Jeffrey Wu, and Dario Amodei.
+Scaling laws for neural language models.
+arXiv preprint
+arXiv:2001.08361, 2020.
+[20] Jordan Hoffmann, Sebastian Borgeaud, Arthur Mensch, Elena Buchatskaya, Trevor Cai, Eliza Rutherford, Diego
+de Las Casas, Lisa Anne Hendricks, Johannes Welbl, Aidan Clark, et al. Training compute-optimal large language
+models. arXiv preprint arXiv:2203.15556, 2022.
+[21] Aidan Clark, Diego de Las Casas, Aurelia Guy, Arthur Mensch, Michela Paganini, Jordan Hoffmann, Bogdan
+Damoc, Blake Hechtman, Trevor Cai, Sebastian Borgeaud, et al. Uniﬁed scaling laws for routed language models.
+In International Conference on Machine Learning, pages 4057–4086. PMLR, 2022.
+[22] D. Lepikhin, H. J. Lee, Y. Xu, D. Chen, O. Firat, Y. Huang, M. Krikun, N. Shazeer, and Z. Chen. Gshard: Scaling
+giant models with conditional computation and automatic sharding. In International Conference on Learning
+Representations, 2021.
+[23] Mohammad Shoeybi, Mostofa Patwary, Raul Puri, Patrick LeGresley, Jared Casper, and Bryan Catanzaro.
+Megatron-LM: Training multi-billion parameter language models using model parallelism. arXiv preprint
+arXiv:1909.08053, 2019.
+[24] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Dehao Chen, Mia Chen, HyoukJoong Lee, Jiquan
+Ngiam, Quoc V. Le, Yonghui Wu, and zhifeng Chen. GPipe: Efﬁcient training of giant neural networks using
+pipeline parallelism. In Proc. NeurIPS, 2019.
+[25] Samyam Rajbhandari, Jeff Rasley, Olatunji Ruwase, and Yuxiong He. Zero: Memory optimizations toward
+training trillion parameter models. In Proc. SC, 2020.
+[26] Tianqi Chen, Bing Xu, Chiyuan Zhang, and Carlos Guestrin. Training deep nets with sublinear memory cost.
+arXiv preprint arXiv:1604.06174, 2016.
+[27] Jie Ren, Samyam Rajbhandari, Reza Yazdani Aminabadi, Olatunji Ruwase, Shuangyan Yang, Minjia Zhang, Dong
+Li, and Yuxiong He. Zero-ofﬂoad: Democratizing billion-scale model training. In USENIX Annual Technical
+Conference, pages 551–564, 2021.
+[28] H. Liao, J. Tu, J. Xia, H. Liu, and Y. Hu. Ascend: a scalable and uniﬁed architecture for ubiquitous deep
+neural network computing : Industry track paper. In 2021 IEEE International Symposium on High-Performance
+Computer Architecture (HPCA), 2021.
+[29] Stephen Roller, Sainbayar Sukhbaatar, Jason Weston, et al. Hash layers for large sparse models. Advances in
+Neural Information Processing Systems, 34:17555–17566, 2021.
+[30] Sha Yuan, Hanyu Zhao, Zhengxiao Du, Ming Ding, Xiao Liu, Yukuo Cen, Xu Zou, Zhilin Yang, and Jie Tang.
+Wudaocorpora: A super large-scale chinese corpora for pre-training language models. AI Open, 2:65–68, 2021.
+[31] Liang Xu, Xuanwei Zhang, and Qianqian Dong. Cluecorpus2020: A large-scale chinese corpus for pre-training
+language model. ArXiv, abs/2003.01355, 2020.
+[32] Leo Gao, Stella Rose Biderman, Sid Black, Laurence Golding, Travis Hoppe, Charles Foster, Jason Phang, Horace
+He, Anish Thite, Noa Nabeshima, Shawn Presser, and Connor Leahy. The pile: An 800gb dataset of diverse text
+for language modeling. ArXiv, abs/2101.00027, 2021.
+[33] Fenia Christopoulou, Gerasimos Lampouras, Milan Gritta, Guchun Zhang, Yinpeng Guo, Zhong-Yi Li, Qi Zhang,
+Meng Xiao, Bo Shen, Lin Li, Hao Yu, Li yu Yan, Pingyi Zhou, Xin Wang, Yu Ma, Ignacio Iacobacci, Yasheng
+Wang, Guangtai Liang, Jia Wei, Xin Jiang, Qianxiang Wang, and Qun Liu. Pangu-coder: Program synthesis with
+function-level language modeling. ArXiv, abs/2207.11280, 2022.
+[34] Georgios Gousios. The ghtorent dataset and tool suite. 2013 10th Working Conference on Mining Software
+Repositories (MSR), pages 233–236, 2013.
+[35] Ahmed El-Kishky, Vishrav Chaudhary, Francisco Guzmán, and Philipp Koehn. A massive collection of cross-
+lingual web-document pairs. In Conference on Empirical Methods in Natural Language Processing, 2019.
+[36] Holger Schwenk, Guillaume Wenzek, Sergey Edunov, Edouard Grave, and Armand Joulin. Ccmatrix: Mining
+billions of high-quality parallel sentences on the web. ArXiv, abs/1911.04944, 2019.
+25
+
+TECHNICAL REPORT - MARCH 21, 2023
+[37] Guangtao Zeng, Wenmian Yang, Zeqian Ju, Yue Yang, Sicheng Wang, Ruisi Zhang, Meng Zhou, Jiaqi Zeng,
+Xiangyu Dong, Ruoyu Zhang, Hongchao Fang, Penghui Zhu, Shu Chen, and Pengtao Xie. Meddialog: Large-scale
+medical dialogue datasets. In Conference on Empirical Methods in Natural Language Processing, 2020.
+[38] Chaojun Xiao, Haoxiang Zhong, Zhipeng Guo, Cunchao Tu, Zhiyuan Liu, Maosong Sun, Yansong Feng, Xianpei
+Han, Zhen Hu, Heng Wang, and Jianfeng Xu. Cail2018: A large-scale legal dataset for judgment prediction.
+ArXiv, abs/1807.02478, 2018.
+[39] Diederik P Kingma and Jimmy Ba. Adam: A method for stochastic optimization. arXiv preprint arXiv:1412.6980,
+2014.
+[40] Paulius Micikevicius, Sharan Narang, Jonah Alben, Gregory Diamos, Erich Elsen, David Garcia, Boris Ginsburg,
+Michael Houston, Oleksii Kuchaiev, Ganesh Venkatesh, et al. Mixed precision training. In Proc. ICLR, 2018.
+[41] C. Wang, K. Cho, and J. Gu. Neural machine translation with byte-level subwords. Proceedings of the AAAI
+Conference on Artiﬁcial Intelligence, 34(5):9154–9160, 2020.
+[42] Yiming Cui, Ting Liu, Wanxiang Che, Li Xiao, Zhipeng Chen, Wentao Ma, Shijin Wang, and Guoping Hu. A
+span-extraction dataset for Chinese machine reading comprehension. In Proceedings of the 2019 Conference
+on Empirical Methods in Natural Language Processing and the 9th International Joint Conference on Natural
+Language Processing (EMNLP-IJCNLP), pages 5886–5891, Hong Kong, China, November 2019. Association for
+Computational Linguistics.
+[43] Chih Chieh Shao, Trois Liu, Yuting Lai, Yiying Tseng, and Sam Tsai. Drcd: a chinese machine reading
+comprehension dataset, 2018.
+[44] Wei He, Kai Liu, Jing Liu, Yajuan Lyu, Shiqi Zhao, Xinyan Xiao, Yuan Liu, Yizhong Wang, Hua Wu, Qiaoqiao
+She, Xuan Liu, Tian Wu, and Haifeng Wang. DuReader: a Chinese machine reading comprehension dataset from
+real-world applications. In Proceedings of the Workshop on Machine Reading for Question Answering, pages
+37–46, Melbourne, Australia, July 2018. Association for Computational Linguistics.
+[45] Kai Sun, Dian Yu, Dong Yu, and Claire Cardie. Investigating prior knowledge for challenging chinese machine
+reading comprehension. Transactions of the Association for Computational Linguistics, 2020.
+[46] Hai Hu, Kyle Richardson, Liang Xu, Lu Li, Sandra Kuebler, and Larry Moss. Ocnli: Original chinese natural
+language inference. In Findings of EMNLP, 2020.
+[47] Liang Xu, Hai Hu, Xuanwei Zhang, Lu Li, Chenjie Cao, Yudong Li, Yechen Xu, Kai Sun, Dian Yu, Cong Yu, Yin
+Tian, Qianqian Dong, Weitang Liu, Bo Shi, Yiming Cui, Junyi Li, Jun Zeng, Rongzhao Wang, Weijian Xie, Yanting
+Li, Yina Patterson, Zuoyu Tian, Yiwen Zhang, He Zhou, Shaoweihua Liu, Zhe Zhao, Qipeng Zhao, Cong Yue,
+Xinrui Zhang, Zhengliang Yang, Kyle Richardson, and Zhenzhong Lan. CLUE: A Chinese language understanding
+evaluation benchmark. In Proceedings of the 28th International Conference on Computational Linguistics, pages
+4762–4772, Barcelona, Spain (Online), December 2020. International Committee on Computational Linguistics.
+[48] Chujie Zheng, Minlie Huang, and Aixin Sun. ChID: A large-scale Chinese IDiom dataset for cloze test. In
+Proceedings of the 57th Conference of the Association for Computational Linguistics, pages 778–787, Florence,
+Italy, July 2019. Association for Computational Linguistics.
+[49] Yiming Cui, Ting Liu, Ziqing Yang, Zhipeng Chen, Wentao Ma, Wanxiang Che, Shijin Wang, and Guoping Hu.
+A sentence cloze dataset for chinese machine reading comprehension. In Proceedings of the 28th International
+Conference on Computational Linguistics (COLING 2020), 2020.
+[50] Yiming Cui, Ting Liu, Zhipeng Chen, Shijin Wang, and Guoping Hu. Consensus attention-based neural networks
+for chinese reading comprehension. In Proceedings of COLING 2016, the 26th International Conference on
+Computational Linguistics: Technical Papers, pages 1777–1786, Osaka, Japan, 2016.
+[51] Yiming Cui, Ting Liu, Zhipeng Chen, Wentao Ma, Shijin Wang, and Guoping Hu. Dataset for the ﬁrst evaluation on
+chinese machine reading comprehension. In Nicoletta Calzolari (Conference chair), Khalid Choukri, Christopher
+Cieri, Thierry Declerck, Sara Goggi, Koiti Hasida, Hitoshi Isahara, Bente Maegaard, Joseph Mariani, Hélène
+Mazo, Asuncion Moreno, Jan Odijk, Stelios Piperidis, and Takenobu Tokunaga, editors, Proceedings of the
+Eleventh International Conference on Language Resources and Evaluation (LREC 2018), pages 2721–2725, Paris,
+France, may 2018. European Language Resources Association (ELRA).
+[52] Yida Wang, Pei Ke, Yinhe Zheng, Kaili Huang, Yong Jiang, Xiaoyan Zhu, and Minlie Huang. A large-scale
+chinese short-text conversation dataset. In Natural Language Processing and Chinese Computing - 9th CCF
+International Conference, NLPCC 2020, Zhengzhou, China, October 14-18, 2020, Proceedings, Part I, volume
+12430, pages 91–103. Springer, 2020.
+26
+
+TECHNICAL REPORT - MARCH 21, 2023
+[53] Hao Zhou, Pei Ke, Zheng Zhang, Yuxian Gu, Yinhe Zheng, Chujie Zheng, Yida Wang, Chen Henry Wu, Hao Sun,
+Xiaocong Yang, Bosi Wen, Xiaoyan Zhu, Minlie Huang, and Jie Tang. EVA: an open-domain chinese dialogue
+system with large-scale generative pre-training. CoRR, abs/2108.01547, 2021.
+[54] Yuxian Gu, Jiaxin Wen, Hao Sun, Yi Song, Pei Ke, Chujie Zheng, Zheng Zhang, Jianzhu Yao, Xiaoyan Zhu,
+Jie Tang, and Minlie Huang. EVA2.0: investigating open-domain chinese dialogue systems with large-scale
+pre-training. CoRR, abs/2203.09313, 2022.
+[55] Fei Mi, Yitong Li, Yulong Zeng, Jingyan Zhou, Yasheng Wang, Chuanfei Xu, Lifeng Shang, Xin Jiang, Shiqi
+Zhao, and Qun Liu. PANGUBOT: efﬁcient generative dialogue pre-training from pre-trained language model.
+CoRR, abs/2203.17090, 2022.
+[56] Angela Fan, Mike Lewis, and Yann N. Dauphin. Hierarchical neural story generation. In Iryna Gurevych and
+Yusuke Miyao, editors, Proceedings of the 56th Annual Meeting of the Association for Computational Linguistics,
+ACL 2018, Melbourne, Australia, July 15-20, 2018, Volume 1: Long Papers, pages 889–898. Association for
+Computational Linguistics, 2018.
+[57] Xiaoyang Wang, Chen Li, Jianqiao Zhao, and Dong Yu. Naturalconv: A chinese dialogue dataset towards
+multi-turn topic-driven conversation. In Thirty-Fifth AAAI Conference on Artiﬁcial Intelligence, AAAI 2021, pages
+14006–14014. AAAI Press, 2021.
+[58] Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. The curious case of neural text degeneration. In
+8th International Conference on Learning Representations, ICLR 2020, Addis Ababa, Ethiopia, April 26-30, 2020.
+OpenReview.net, 2020.
+[59] Jiwei Li, Michel Galley, Chris Brockett, Jianfeng Gao, and Bill Dolan. A diversity-promoting objective function
+for neural conversation models. In NAACL HLT 2016, The 2016 Conference of the North American Chapter of the
+Association for Computational Linguistics: Human Language Technologies, San Diego California, USA, June
+12-17, 2016, pages 110–119. The Association for Computational Linguistics, 2016.
+[60] M. Post. A call for clarity in reporting bleu scores, 2018.
+[61] L. Xue, N. Constant, A. Roberts, M. Kale, R. Al-Rfou, A. Siddhant, A. Barua, and C. Raffel. mt5: A massively
+multilingual pre-trained text-to-text transformer. 2020.
+[62] Z. Zhang, Y. Gu, X. Han, S. Chen, C. Xiao, Z. Sun, Y. Yao, F. Qi, J. Guan, and P. Ke. Cpm-2: Large-scale
+cost-effective pre-trained language models. 2021.
+[63] Y. Sun, S. Wang, S. Feng, S. Ding, and H. Wang. Ernie 3.0: Large-scale knowledge enhanced pre-training for
+language understanding and generation. 2021.
+[64] P. Li, L. Li, M. Zhang, M. Wu, and Q. Liu. Universal conditional masked language pre-training for neural machine
+translation. 2022.
+[65] Jacob Austin, Augustus Odena, Maxwell Nye, Maarten Bosma, Henryk Michalewski, David Dohan, Ellen Jiang,
+Carrie J. Cai, Michael Terry, Quoc V. Le, and Charles Sutton. Program synthesis with large language models.
+ArXiv, abs/2108.07732, 2021.
+[66] Dan Hendrycks, Steven Basart, Saurav Kadavath, Mantas Mazeika, Akul Arora, Ethan Guo, Collin Burns, Samir
+Puranik, Horace He, Dawn Xiaodong Song, and Jacob Steinhardt. Measuring coding challenge competence with
+apps. ArXiv, abs/2105.09938, 2021.
+[67] Yujia Li, David H. Choi, Junyoung Chung, Nate Kushman, Julian Schrittwieser, Rémi Leblond, Tom, Eccles,
+James Keeling, Felix Gimeno, Agustin Dal Lago, Thomas Hubert, Peter Choy, Cyprien de, Masson d’Autume,
+Igor Babuschkin, Xinyun Chen, Po-Sen Huang, Johannes Welbl, Sven Gowal, Alexey, Cherepanov, James Molloy,
+Daniel Jaymin Mankowitz, Esme Sutherland Robson, Pushmeet Kohli, Nando de, Freitas, Koray Kavukcuoglu,
+and Oriol Vinyals. Competition-level code generation with alphacode. ArXiv, abs/2203.07814, 2022.
+[68] Daniel Fried, Armen Aghajanyan, Jessy Lin, Sida I. Wang, Eric Wallace, Freda Shi, Ruiqi Zhong, Wen tau
+Yih, Luke Zettlemoyer, and Mike Lewis. Incoder: A generative model for code inﬁlling and synthesis. ArXiv,
+abs/2204.05999, 2022.
+[69] Romal Thoppilan, Daniel De Freitas, Jamie Hall, Noam M. Shazeer, Apoorv Kulshreshtha, Heng-Tze Cheng,
+Alicia Jin, Taylor Bos, Leslie Baker, Yu Du, Yaguang Li, Hongrae Lee, Huaixiu Zheng, Amin Ghafouri, Marcelo
+Menegali, Yanping Huang, Maxim Krikun, Dmitry Lepikhin, James Qin, Dehao Chen, Yuanzhong Xu, Zhifeng
+Chen, Adam Roberts, Maarten Bosma, Yanqi Zhou, Chung-Ching Chang, I. A. Krivokon, Willard James Rusch,
+Marc Pickett, Kathleen S. Meier-Hellstern, Meredith Ringel Morris, Tulsee Doshi, Renelito Delos Santos, Toju
+Duke, Johnny Hartz Søraker, Ben Zevenbergen, Vinodkumar Prabhakaran, Mark Díaz, Ben Hutchinson, Kristen
+Olson, Alejandra Molina, Erin Hoffman-John, Josh Lee, Lora Aroyo, Ravindran Rajakumar, Alena Butryna,
+27
+
+TECHNICAL REPORT - MARCH 21, 2023
+Matthew Lamm, V. O. Kuzmina, Joseph Fenton, Aaron Cohen, Rachel Bernstein, Ray Kurzweil, Blaise Aguera-
+Arcas, Claire Cui, Marian Croak, Ed Chi, and Quoc Le. Lamda: Language models for dialog applications. ArXiv,
+abs/2201.08239, 2022.
+[70] Alex Wang, Yada Pruksachatkun, Nikita Nangia, Amanpreet Singh, Julian Michael, Felix Hill, Omer Levy, and
+Samuel R. Bowman. SuperGLUE: A stickier benchmark for general-purpose language understanding systems.
+arXiv preprint 1905.00537, 2019.
+[71] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L. Wainwright, P. Mishkin, C. Zhang, S. Agarwal, K. Slama, and
+A. Ray. Training language models to follow instructions with human feedback. arXiv e-prints, 2022.
+[72] Jean-Baptiste Alayrac, Jeff Donahue, Pauline Luc, Antoine Miech, Iain Barr, Yana Hasson, Karel Lenc, Arthur
+Mensch, Katie Millican, Malcolm Reynolds, Roman Ring, Eliza Rutherford, Serkan Cabi, Tengda Han, Zhitao
+Gong, Sina Samangooei, Marianne Monteiro, Jacob Menick, Sebastian Borgeaud, Andy Brock, Aida Nematzadeh,
+Sahand Sharifzadeh, Mikolaj Binkowski, Ricardo Barreira, Oriol Vinyals, Andrew Zisserman, and Karen Si-
+monyan. Flamingo: a visual language model for few-shot learning. ArXiv, abs/2204.14198, 2022.
+[73] OpenAI. Gpt-4 technical report. 2023.
+28
+
+TECHNICAL REPORT - MARCH 21, 2023
+A
+Natural Language Generation Examples
+A.1
+Self-chat of dialog
+姚明是干什么的？
+姚明有多高？
+我也喜欢篮球，可是不知道怎么开始
+打篮球的，球迷很多
+Bot
+他有2.26米
+多多练习就好了
+Bot
+你平时打篮球吗？
+偶尔会打篮球，可以一起呀
+What does Yao Ming do?
+How tall is Yao Ming?
+I also like basketball, but I don't know how to start.
+He plays basketball and he has many fans.
+Bot
+He is 2.26 meters tall.
+Just practice more.
+Bot
+Do you usually play basketball?
+I play basketball occasionally. We can play basketball together.
+你什么时间有空？
+嗯嗯。谢谢！
+Yeah. Thank you!
+When are you free?
+你平时有什么爱好?
+嗯,我也挺喜欢的。
+当然没问题。你喜欢看什么书
+我喜欢看书,电影,音乐。
+Bot
+那我们一起去看书吧。
+我喜欢看《红楼梦》
+Bot
+我也看过,很喜欢里面的人物形象
+嗯嗯，特别喜欢林黛玉和贾宝玉
+what hobbies do you have?
+Well, I like them too.
+No problem. What books do you like?
+I like reading books, movies and music.
+Bot
+Let's go read together.
+I like reading the Red Mansion.
+Bot
+I've read it too. I like the characters in it very much.
+Yes, I especially like Lin Daiyu and Jia Baoyu.
+嘿嘿,握个爪~
+是啊，最喜欢他们两个人了
+Yeah, I like them both best.
+He-hey, let us shake hands.
+中国的首都是哪里? 
+我也想去北京,可惜没时间
+好啊,有机会一定要去
+中国的首都是北京。
+Bot
+下次来了带你去玩。
+嗯嗯。北京有很多好玩的地方
+Bot
+北京有什么景点？
+有长城、颐和园和故宫
+What is the capital of China?
+I also want to go to Beijing, but I don't have the time.
+Yes. I will go if I get a chance.
+The capital of China is Beijing.
+Bot
+Next time you come to Beijing, I will play with you.
+Yeah. There are many interesting places in Beijing.
+Bot
+What are the scenic spots in Beijing?
+The Great Wall, the Summer Palace and the Imperial
+Palace are located in Beijing.
+好的，早点睡吧，晚安
+谢谢。我去查查这些地方
+Thank you. I will check these places.
+OK. Have an early night. Good night.
+Figure 1: Cases of self-chat
+29
+
+TECHNICAL REPORT - MARCH 21, 2023
+A.2
+Topic-grounded dialog generation
+Table 1: Cases of topic-grounded dialog
+Dialog history
+你知道,今年的世预赛吗？马尔代夫那个
+(Do you know the World Cup Qualiﬁcation held in Maldives?)
+知道知道,没想到国足客场居然5-0大胜马尔代夫,难以置信。
+(Yes, it’s unbelievable that the China Men’s National Football Team beat Maldives 5-0 away.)
+对啊，打马尔代夫的池忠国都进化成坎特了!
+(Yeah, Chi Zhongguo evolved into Kant when playing with Maldives team.)
+有那么夸张吗？或者对手实在太菜了才赢的？
+(Isn’t it so dramatic? Or it is because the opponent is too weak?)
+对手确实有点菜，所以才能让里皮在人员和战术上有很多尝试。
+(The opponent is very weak exactly. Therefore, Lippi can make many attempts on personnel
+rotation and tactics.)
+EVA2.0
+所以我觉得应该让马塞洛打后卫。
+(That’s why I think Marcelo should play fullback.)
+PanGu-Bot 2.6B
+也是,毕竟国足教练也是很强
+(Yes, after all, the coach of the China Men’s National Football Team is also very strong.)
+PanGu-Σ
+对啊，银狐里皮的战术变化多端。
+(Yes, the tactics of "Silver Fox" Lippi are changeable.)
+Dialog history
+你也在看这篇报道啊?
+(Are you also reading this report?)
+嗯,刚刷到就点进来看看。
+(Yes, I click on the link after I saw the web page.)
+你喜欢拳王泰森嘛?
+(Do you like the boxing champion Tyson?)
+还好吧,觉得他还是挺厉害的,虽然我更喜欢拳王阿里。真男人,真心帅。
+(Not bad. I think he’s pretty good. I like boxing champion Ali more, a real man and handsome.)
+真的吗?我对这方面不太了解,你可以多跟我说说拳王阿里吗?
+(Really? I don’t know much about this. Can you tell me more about boxing champion Ali?)
+EVA2.0
+我也是看了泰森的报道才知道的。
+(I found out after reading Tyson’s story.)
+PanGu-Bot 2.6B
+好的,我会多和你说说的。
+(Okay, I’ll talk to you more.)
+PanGu-Σ
+阿里的影响力远远超出了体育的范畴。
+(Ali’s inﬂuence goes far beyond the scope of sporting competitions.)
+Dialog history
+今天天气不错是吧!
+(It’s a nice day today.)
+没错,非常适合出来散散心。
+(Yes, it is the time to go out for relaxation.)
+CBA的新赛季马上开始了,北控今天进行了誓师大会。
+(The new season of CBA will begin soon, and Beikong held the swearing ceremony today.)
+誓师大会会鼓舞队员的士气。
+(The swearing ceremony can inspire the morale of the team.)
+没错!新赛季状元秀王少杰也要跟随北控进入新赛季的比赛。
+(Yes, Wang Shaojie, the ﬁrst-pick of the draft in the new season, will also participate in
+competition as a member of Beikong.)
+EVA2.0
+确实是！
+(Indeed it is!)
+PanGu-Bot 2.6B
+这就是誓师大会的魅力所在。
+(This is the charm of the swearing ceremony.)
+PanGu-Σ
+王少杰的实力不容小视啊,他的投篮姿势很帅气。
+(Wang Shaojie’s strength cannot be undervalued, and his shooting form is very beautiful.)
+30
+
+TECHNICAL REPORT - MARCH 21, 2023
+A.3
+Open domain question-answering of dialog model
+Table 2: Cases of open domain question-answering
+Question:
+世界上的四大文明古国是哪四个？
+What are the four ancient civilizations in
+the world?
+EVA2.0:
+世界上的四大文明古国:世界上的四大
+文明古国
+The four ancient civilizations in the world:
+the four ancient civilizations in the world.
+PanGu-Bot 2.6B:
+古巴比伦、古印度、古埃及、古埃及
+Ancient Babylon, Ancient India, Ancient
+Egypt and Ancient Egypt
+PanGu-Σ:
+古印度、古埃及、古巴比伦、中国
+Ancient India, Ancient Egypt, Ancient
+Babylon and China
+Question:
+目前，中国的人口大约有多少亿？
+At present, how many billions of people are
+there in China?
+EVA2.0:
+我觉得应该是100亿左右
+I think it’s about 10 billion.
+PanGu-Bot 2.6B:
+960万,占全国总人口的百分之七十。
+9.6 million, 70 percent of China’s total pop-
+ulation.
+PanGu-Σ:
+中国有十四亿人口
+China has a population of 1.4 billion.
+Question:
+美术中的“三原色”指哪三种颜色
+What are the "three primary colors" in art?
+EVA2.0:
+三原色指的是三原色的颜色,指的是三
+原色的颜色。
+Yellow, red and green
+PanGu-Bot 2.6B:
+红、黄、蓝、绿、紫
+Red, yellow, blue, green, purple.
+PanGu-Σ:
+红、黄、蓝
+Red, yellow and blue.
+31
+
+TECHNICAL REPORT - MARCH 21, 2023
+A.4
+Character dialog generation
+Table 3: A case of character dialog. Source of the prompt about 姚明(Yaoming) is from https://baike.baidu.com.
+Prompt
+姚明,前中国职业篮球运动员,司职中锋,现任亚洲篮球联合会主席、中国篮球协会主
+席。在2002年NBA选秀中,他以状元秀身份被NBA的休斯敦火箭队选中,2003-09年连
+续6个赛季(生涯共8次)入选NBA全明星赛阵容。
+(Yao Ming, a former Chinese professional basketball player, working as a center, is currently
+president of the Asian Basketball Federation and president of the Chinese Basketball Associa-
+tion. In the 2002 NBA Draft, he was selected by the NBA’s Houston Rockets as the top draft,
+and was selected for the NBA All-Star Game for six consecutive seasons (eight career times)
+from 2003 to 2009.)
+姚明:你好,我是姚明,NBA球员,现在是中国篮协主席。
+(Yao Ming: Hello, I’m Yao Ming, NBA player, now the president of the Chinese Basketball
+Association.)
+记者:你好,非常高兴今天和你对话。你认为中国篮球应该如何改革?
+(Reporter: Hello, I’m very happy to talk to you today. How do you think Chinese basketball
+should be reformed?)
+PanGu-Σ
+姚明:首先,我觉得中国篮球的改革,首先要从体制上来改革,中国篮球在过去的几十
+年,特别是改革开放这几十年,取得了很大的成就,但在中国篮球的体制上,还是有很多
+的问题,所以中国篮球的改革,首先要从体制上来改革。
+(Yao Ming: First of all, I think the system of China’s basketball must ﬁrst be reformed. China’s
+basketball has made great achievements in the past decades, especially in the decades of
+reform and opening up. However, there are still many problems in the system of China’s
+basketball. Therefore, Chinese basketball must ﬁrst be reformed from the system.)
+记者:我想问一个问题,你在NBA的时候,你的队友都叫你“小巨人”,你觉得在中国的球
+迷当中,你的绰号是什么?
+(Reporter: I want to ask a question. When you were in the NBA, your teammates called you
+"Little Giant". What do you think is your nickname in the Chinese fans?)
+姚明:其实在中国,大家都叫我“小巨人”,我觉得这是对我的一种认可,我希望自己能够成
+为中国篮球的“小巨人”。
+(Yao Ming: In fact, in China, everyone calls me "little giant", and I think this is an approval
+for me. I hope that I can become the "little giant" of Chinese basketball.)
+记者:我知道你是中国篮球的标志性人物,你对中国篮球的未来有什么展望?
+(Reporter: I know you are the iconic ﬁgure of Chinese basketball. What are your prospects for
+the future of Chinese basketball?)
+姚明:我觉得中国篮球在未来的发展当中,应该更多的去重视青少年的培养,因为中国篮
+球的未来,还是要靠青少年来培养,只有青少年的发展了,中国篮球才会有更多的未来。
+(Yao Ming: I think in the future development of Chinese basketball, we should pay more
+attention to the training of young people. Because Chinese basketball will have more future
+with relying on the development of young people.)
+记者:你的球迷也都非常关心你的伤病,在伤病的恢复过程当中,你都做了哪些康复训
+练?
+(Reporter: Your fans are also very concerned about your injury. In the recovery process, what
+have you done on rehabilitation training?)
+姚明:其实在康复训练方面,我是比较注重的,因为我的伤病,也是比较多的。
+(Yao Ming: In fact, I paid more attention to the rehabilitation training, because I had a lot of
+injuries.)
+32
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 4: A case of character dialog. Source of the prompt about 马斯克(Musk) is from https://baike.baidu.com.
+Prompt
+埃隆·里夫·马斯克,1971年6月28日出生于南非的行政首都比勒陀利亚,企业家、工程
+师、慈善家、美国国家工程院院士。2021年3月2日,胡润研究院发布《2021胡润全球
+富豪榜》,马斯克以1.28万亿元人民币财富首次成为世界首富,他是特斯拉公司创始
+人。
+(Elon Reeve Musk was born on June 28, 1971 in Pretoria, the administrative capital of South
+Africa. He is an entrepreneur, engineer, philanthropist and member of the National Academy
+of Engineering. On March 2, 2021, Hurun Research Institute released the "2021 Hurun Global
+Rich List", and Musk became the world’s richest man for the ﬁrst time with a wealth of 1.28
+trillion yuan. In addition, he is the founder of Tesla.)
+马斯克:你好,我是马斯克,特斯拉公司创始人。
+(Musk: Hello, I’m Musk, founder of Tesla.)
+记者:你好,非常高兴今天和你对话。你怎么看待可持续能源的发展?
+(Reporter: Hello, it’s a pleasure to talk to you today. What do you think of the development of
+sustainable energy?)
+PanGu-Σ
+马斯克:可持续能源是一个非常重要的话题,我认为我们需要做的是通过技术的进步,来
+改变我们的能源结构。可持续能源的发展是一个非常重要的趋势,因为我们现在的能
+源结构是非常不合理的。我们需要找到一种方式,让能源的使用更加清洁,更加高效,并
+且更加环保。
+(Musk: Sustainable energy is a very important topic, and I think what we need to do is
+to change our energy mix through technological advances. The development of sustainable
+energy is a very important trend, because our current energy structure is very unreasonable. We
+need to ﬁnd a way to make the use of energy cleaner, more efﬁcient and more environmentally
+friendly.)
+记者:你觉得特斯拉的成功有哪些秘诀?
+(Reporter: What do you think is the secret to Tesla’s success?)
+马斯克:我觉得最重要的一点是,我们有一个非常好的团队。特斯拉的员工是世界上最
+聪明的一群人,他们为特斯拉的成功付出了很多努力。我认为,一个公司的成功取决于
+它的团队,而不是它的产品。
+(Musk: I think the most important thing is that we have a very good team. Tesla’s employees
+are some of the smartest people in the world, and they’ve worked so hard for Tesla’s success. I
+think the success of a company depends on its team, not on its products.)
+记者:你认为特斯拉的产品是如何影响世界的?
+(Reporter: How do you think Tesla’s products have impacted the world?)
+马斯克:特斯拉的产品正在改变世界,因为我们的产品可以让人们的生活变得更美好。
+我们的产品可以让人们的出行变得更便宜,让人们的生活变得更环保。
+(Musk: Tesla products are changing the world, because our products can make people’s
+lives better. Our products can make people travel cheaper and make people’s lives more
+environmentally friendly.)
+记者:你觉得特斯拉的成功对世界意味着什么?
+(Reporter: What do you think Tesla’s success means to the world?)
+马斯克:特斯拉的成功让很多人看到了新的希望,让很多人看到了未来的发展方向。我
+们的成功也让更多的人看到了创业的机会,让更多的人有机会去改变世界。
+(Musk: The success of Tesla let a lot of people see new hope, and let a lot of people see the
+future development direction. Our success has also allowed more people to see the opportunity
+to start a business and change the world.)
+33
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 5: A case of character dialog. Source of the prompt about 乔布斯(Jobs) is from https://baike.baidu.com.
+Prompt
+史蒂夫·乔布斯是一名美国发明家、企业家、营销家,苹果公司联合创始人之一,曾任董
+事长、首席执行官职位,NeXT创办人及首席执行官,也是皮克斯动画创办人并曾任首
+席执行官,2006年为华特迪士尼公司董事会成员。乔布斯在1970年代末个人电脑的热
+潮中创业,与苹果公司另一始创人斯蒂夫·沃兹尼亚克及首任投资者迈克·马库拉协同其
+他人设计、开发及销售AppleII系列。
+(Steve Jobs is an American inventor, entrepreneur, marketer, co-founder of Apple, former
+chairman and CEO, founder and CEO of NeXT, founder and former CEO of Pixar Animation,
+and was a member of the Walt Disney Company’s board of directors in 2006. Jobs started his
+business in the late 1970s during the personal computer boom, working with Apple’s other
+founder Steve Wozniak and ﬁrst investor Mike Makula to design, develop and sell the Apple
+II series.)
+乔布斯:你好,我是乔布斯,苹果公司联合创始人之一。
+(Jobs: Hello, I’m Jobs, co-founder of Apple.)
+记者:你好,非常高兴今天和你对话。你对未来手机行业的发展怎么看?
+(Reporter:Hello, it’s a pleasure to talk to you today. What do you think of the future develop-
+ment of the mobile phone industry?)
+PanGu-Σ
+乔布斯:手机行业未来肯定会有更多的创新,因为手机的功能越来越多,可以做的事情也
+越来越多。但是,我认为手机行业的创新会越来越集中在高端市场,比如,像苹果这样的
+公司,会推出一些高端的产品,而其他的手机厂商,可能会在中低端市场上进行创新。
+(Jobs: There will certainly be more innovation in the mobile phone industry in the future,
+because mobile phones have more and more functions and are capable to do more things.
+However, I think innovation in the mobile phone industry will become more and more
+concentrated in the high-end market. For example, companies like Apple will launch some
+high-end products, while other mobile phone manufacturers may innovate in the mid-range
+and low-end market.)
+记者:在智能手机领域,中国的发展速度是很快的,你觉得中国的手机行业会有哪些新的
+趋势?
+(Reporter: In the smartphone ﬁeld, China is developing rapidly. What new trends do you think
+will happen in China’s mobile phone industry?)
+乔布斯:我觉得中国的手机行业发展得非常好,中国的手机行业在未来的发展中,也会不
+断地创新,不断地推出新的产品。
+(Jobs: I think China’s mobile phone industry is developing very well. In the future, China’s
+mobile phone industry will continue to innovate and launch new products.)
+记者:在智能手机的市场上,苹果公司和三星公司一直都是竞争对手,你觉得在竞争激烈
+的市场上,三星公司和苹果公司谁会更胜一筹?
+(Reporter: Apple and Samsung have always been rivals in the smartphone market. For
+Samsung or Apple, who do you think is better in a competitive market?)
+乔布斯:我觉得在竞争激烈的市场上,竞争对手之间的竞争,主要是看谁能够推出更多的
+新产品,谁能够在产品的创新上更有优势。
+(Jobs: I think in a competitive market, the competition between competitors is mainly about
+who can launch more new products and who can have a better advantage in product innovation.)
+记者:苹果公司在中国的发展速度非常快,中国也成为了苹果公司最重要的市场之一,在
+你看来,苹果公司在中国市场上的发展,对全球的市场发展有什么影响?
+(Reporter:Apple’s development in China is very fast, and China has become one of Apple’s
+most important markets. In your opinion, what impact does Apple’s development in the
+Chinese market have on the development of the global market?)
+乔布斯:我觉得苹果公司在中国市场上的发展,对全球的市场发展,肯定会有非常大的影
+响。因为中国的市场非常大,中国的消费者也非常多。
+(Jobs: I think Apple’s development in the Chinese market will certainly have a great impact
+on the development of the global market. Because China’s market is very big, and China has a
+lot of consumers.)
+34
+
+TECHNICAL REPORT - MARCH 21, 2023
+A.5
+Open-ended text generation
+Table 6: Cases of reading comprehension. Source of the passages are from https://baike.baidu.com.
+Passage
+阅读文章:鲁迅,原名周樟寿,后改名周树人,浙江绍兴人。著名文学家、思想家、革命
+家、教育家、民主战士,新文化运动的重要参与者,中国现代文学的奠基人之一。早年
+与厉绥之和钱均夫同赴日本公费留学,于日本仙台医科专门学校肄业。鲁迅,1918年发
+表《狂人日记》时所用的笔名,也是最为广泛的笔名。鲁迅一生在文学创作、文学批
+评、思想研究、文学史研究、翻译、美术理论引进、基础科学介绍和古籍校勘与研
+究等多个领域具有重大贡献。他对于五四运动以后的中国社会思想文化发展具有重
+大影响,蜚声世界文坛,尤其在韩国、日本思想文化领域有极其重要的地位和影响,被
+誉为二十世纪东亚文化地图上占最大领土的作家”。请问:鲁迅于1918年发表过什么文
+章?回答:
+(Read the article: Lu Xun, formerly known as Zhou Zhangshou, later renamed Zhou Shuren,
+Zhejiang Shaoxing. He is a famous writer, thinker, revolutionist, educator, democracy ﬁghter,
+important participant of the New Culture Movement, one of the founders of Chinese modern
+literature. In his early years, Lu Xun, Li Suizhi and Qian Junfu went to Japan to study abroad
+at public expense and studied at Sendai Medical School in Japan. Lu Xun, the pen name
+used when he published Diary of Mad Men in 1918, is also the most widely used pen name.
+Lu Xun made great contributions in literary creation, literary criticism, ideological research,
+literary history research, translation, introduction of art theory, introduction of basic science
+and collation and research of ancient books. He had a great inﬂuence on the ideological and
+cultural development of Chinese society after the May 4th Movement, and was famous in the
+world literary circles, especially in the ideological and cultural ﬁelds of Korea and Japan. He
+was known as the writer who occupied the largest territory on the cultural map of East Asia in
+the 20th century. Question: What articles did Lu Xun publish in 1918? Answer:)
+PanGu-Σ
+鲁迅于1918年发表了《狂人日记》。《狂人日记》是中国现代文学史上最早的一部
+白话小说,也是中国现代小说的开山之作。
+(Lu Xun published the Madman’s Diary in 1918. Madman’s Diary is the earliest vernacular
+novel in the history of modern Chinese literature, and is also the beginning of modern Chinese
+novels.)
+Passage
+阅读文章:深圳,简称深,别称鹏城,广东省辖地级市,是广东省副省级市,国家计划单列
+市,超大城市,国务院批复确定的中国经济特区、全国性经济中心城市、国际化城市、
+科技创新中心、区域金融中心、商贸物流中心。全市下辖9个行政区和1个新区,总面
+积1997.47平方千米。截至2021年末,深圳市常住人口1768.16万人。1980年,成为中国
+设立的第一个经济特区,中国改革开放的窗口和新兴移民城市,创造了举世瞩目的深圳
+速度。请问:深圳的别称是什么?回答:
+(Read the article: Shenzhen, also known as Pengcheng, is a prefecture-level city under the
+jurisdiction of Guangdong Province. It is a sub-provincial city in Guangdong Province, a
+city separately listed on the national plan and a super-large city. China’s special economic
+zones, national economic centers, international cities, scientiﬁc and technological innovation
+centers, regional ﬁnancial centers and trade logistics centers approved by the State Council.
+The city has 9 administrative districts and 1 new district under its jurisdiction, with a total
+area of 1997.47 square kilometers. By the end of 2021, Shenzhen had a resident population of
+17.6816 million. In 1980, it became the ﬁrst special economic zone established by China, the
+window of China’s reform and opening up and the emerging immigrant city, creating a speed
+of Shenzhen that attracted worldwide attention. Question: What is the nickname of Shenzhen?
+Answer:)
+PanGu-Σ
+深圳别称鹏城
+(Shenzhen is also known as Pengcheng.)
+35
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 7: Cases of QA
+Query
+人工智能能干什么?
+(What can artiﬁcial intelligence do?)
+PanGu-Σ
+在当今这个时代,AI已经无处不在,从互联网到移动互联网,从电子商务到移动支付,从
+社交网络到O2O,AI的身影无处不在。而在医疗领域,AI也正逐渐渗透到医疗各个领
+域,并发挥着越来越重要的作用。在医院的各个科室,我们都能看到AI的身影。在手术
+室,医生可以通过AI来观察患者的生命体征,及时对患者进行手术;在门诊,医生可以通
+过AI来对患者的病情进行分析,为患者制定最合适的治疗方案;在病理实验室,医生可以
+通过AI来对患者的病理进行分析,及时为患者制定最合适的治疗方案。在未来,AI的应
+用将越来越多,而这些应用的背后,都离不开数据的支持。
+(In today’s era, AI is everywhere, from the Internet to mobile Internet, from e-commerce to
+mobile payment, from social networks to O2O. In the medical ﬁeld, AI is gradually inﬁltrating
+into the medical ﬁeld and playing an increasingly important role. In every department of the
+hospital, we can see AI. In the operating room, doctors can observe the patient’s vital signs
+through AI and operate on the patient in time. In the outpatient department, doctors can use
+AI to analyze the patient’s condition and develop the most appropriate treatment plan for the
+patient. In the pathology laboratory, doctors can use AI to analyze the patient’s pathology and
+develop the most appropriate treatment plan for the patient in time. In the future, more and
+more AI applications will be developed, and these applications must be supported by data.)
+Query
+请详细说明熬夜的坏处。
+Please elaborate on the disadvantages of staying up late.
+PanGu-Σ
+熬夜是现在很多人都有的一种习惯,因为工作的原因,很多人都会选择熬夜,那么,熬夜
+对身体有什么危害呢?
+1、导致皮肤受损。熬夜对皮肤的伤害是非常大的,经常熬夜会让皮肤的水分流失,皮肤
+的代谢能力也会下降,导致皮肤出现各种问题,比如长痘、黑眼圈、脸色暗沉等。
+2、导致免疫力下降。经常熬夜会导致人体的免疫力下降,从而导致各种疾病的发
+生,尤其是对于女性来说,经常熬夜会导致内分泌失调,从而导致月经不调等问题。
+3、导致精神萎靡。经常熬夜会让人精神萎靡,经常会感到疲劳,从而影响到工作和生
+活,所以经常熬夜的人往往会感到精神不佳,做事无精打采。
+4、导致肠胃不适。经常熬夜会导致人的肠胃功能紊乱,出现消化不良的问题,所以经常
+熬夜的人经常会出现腹胀、腹泻等肠胃不适的症状。
+5、导致失眠。经常熬夜会导致人的睡眠质量下降,经常熬夜的人往往会出现失眠的问
+题,而且失眠的时间会越来越长,严重的甚至会导致人出现神经衰弱的问题。
+6、导致记忆力下降。经常熬夜会导致人的记忆力下降,经常熬夜的人往往会出现记忆
+力减退的问题,而且会出现头晕、头痛等症状。
+(Staying up late is a habit that many people have now. Because of work, many people will
+choose to stay up late. So, what is the harm to the health of staying up late?
+1. Causes skin damage. Staying up late is very harmful to the skin. Often staying up late will
+cause the skin’s moisture loss, and the skin’s metabolic capacity will also decline, which will
+lead to various skin problems, such as acne, dark circles under the eyes, dullness, etc..
+2. Causes reduced immunity. Often staying up late can lead to the decline of human immunity,
+which can lead to various diseases. Especially for women, often staying up late can lead to
+endocrine disorders, which can lead to irregular menstruation and other problems.
+3. Causes mental malaise. Often staying up late can make people mentally depressed, feel
+tired, thus affecting work and life. Therefore, often staying up late will cause mental malaise,
+make people be listless.
+4. Causes gastrointestinal discomfort. Often staying up late can lead to gastrointestinal
+dysfunction and indigestion problems, so people who often stay up late often have abdominal
+distension, diarrhea and other gastrointestinal discomfort symptoms.
+5. Causes insomnia. Often staying up late will lead to the decline of sleep quality, and the
+time of insomnia will be longer and longer. What’s worse, it even can lead to the problem of
+neurasthenia.
+6. Causes memory loss. People who stay up late often will have memory loss problems, and
+cause symptoms such as dizziness and headache.)
+36
+
+TECHNICAL REPORT - MARCH 21, 2023
+Table 8: A case of text generation with few-shot prompt learning
+Prompt
+上联：马上催征催上马
+(The ﬁrst couplet: Expedite the expedition, and urge the horse immediately.)
+下联：春迎快乐快迎春
+(The second couplet: Welcome happiness in spring, and welcome spring immediately.)
+上联：浮生若梦凭心写
+(The ﬁrst couplet: Life is like a dream, which should be written with heart.)
+下联：此世如歌任意弹
+(The second couplet: Play freely the life which is like a song.)
+上联：苍官青士左右树
+(The ﬁrst couplet: Old ofﬁcials, young men, and trees on the left and right.)
+PanGu-Σ
+下联：海内名花满门香
+(The second couplet: The famous ﬂowers in the country are full of fragrance.)
+Table 9: A case of coreference resolution with few-shot prompt learning
+Prompt
+Q：苏小姐听了，心里直刺痛，回答孙太太同时安慰自己道：“那绝不可能！鲍小姐
+有未婚夫，她自己跟我讲过。她留学的钱还是她未婚夫出的。”
+“她”指代的内容是孙太太吗？
+(Q: When Miss Su heard this, her heart ached. She answered Mrs. Sun and comforted herself,
+"That’s impossible! Miss Bao has a ﬁance, and she told me about it herself. Her money for
+studying abroad is still from her ﬁance."
+Does "she" refer to Mrs. Sun?)
+A：不是，“她”指代的是鲍小姐
+(A:No, "she" refers to Miss Bao.)
+Q：这家人也有一个女孩子，年纪不大，远远地盯着我，害羞而好奇。我一对上她的
+目光，她就慌不迭扭头而去。
+上面这句话中的“她”指代的是什么？
+(Q: There was also a girl in this family. She was young and looked at me from a distance, shy
+and curious. As soon as I met her eyes, she turned away in a panic.
+What does "she" refer to in the above sentence?)
+A：“她”指代的是女孩子
+(A: "She" refers to a girl.)
+Q：张先生呵呵大笑，一面分付进来的女佣说：“快去跟太太小姐说，客人来了，请
+她们出来。”
+上面这句话中的“她们”指代的是什么？
+(Q: Mr.Zhang laughed and said to the maid, "Go and tell the ladies and girls that the guests are
+coming, and ask them out."
+What does "they" refer to in the above sentence?)
+PanGu-Σ
+A：“她们”指代的是太太小姐,因为太太小姐在屋子里
+(A: "They" refer to ladies and girls, because they are in the room.)
+37
+
