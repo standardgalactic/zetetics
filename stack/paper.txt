@@ -1,0 +1,1937 @@
+February 2023
+Grounded Decoding: Guiding Text Generation
+with Grounded Models for Robot Control
+Wenlong Huang1*, Fei Xia2, Dhruv Shah3, Danny Driess2, Andy Zeng2, Yao Lu2, Pete Florence2, Igor Mordatch4,
+Sergey Levine23, Karol Hausman2 and Brian Ichter2
+*Work done as an intern at Google, 1Stanford University, 2Robotics at Google, 3UC Berkeley, 4Google Research
+Recent progress in large language models (LLMs) has demonstrated the ability to learn and leverage
+Internet-scale knowledge through pre-training with autoregressive models. Unfortunately, applying such
+models to settings with embodied agents, such as robots, is challenging due to their lack of experience
+with the physical world, inability to parse non-language observations, and ignorance of rewards or safety
+constraints that robots may require. On the other hand, language-conditioned robotic policies that learn
+from interaction data can provide the necessary grounding that allows the agent to be correctly situated
+in the real world, but such policies are limited by the lack of high-level semantic understanding due to
+the limited breadth of the interaction data available for training them. Thus, if we want to make use of
+the semantic knowledge in a language model while still situating it in an embodied setting, we must con-
+struct an action sequence that is both likely according to the language model and also realizable according
+to grounded models of the environment. We frame this as a problem similar to probabilistic ﬁltering: de-
+code a sequence that both has high probability under the language model and high probability under a
+set of grounded model objectives. We demonstrate this guided decoding strategy is able to solve complex,
+long-horizon embodiment tasks in a robotic setting by leveraging the knowledge of both models. The
+project’s website can be found at grounded-decoding.github.io.
+1. Introduction
+Recent works have demonstrated robots that are
+increasingly proﬁcient at understanding and act-
+ing upon natural language, whether through plan-
+ning or conditioned policies. Complementing such
+progress, the ﬁeld of natural language processing
+has recently seen large language models (LLMs) be-
+come ubiquitously used as pre-trained or few-shot
+prompted models, due to their impressive few-shot
+performance and vast knowledge-base. These LLMs
+have eﬃciently learned from web-scale data through
+autoregressively modeling the probability distribu-
+tion over text tokens and thus generate text. How-
+ever, the nature of this process is such that applying
+such models to embodied settings remains a chal-
+lenge. They have not interacted with their environ-
+ment, lack observability of non-language observa-
+tion modalities (e.g., images), and may not know
+what is safe or possible for a particular embodiment.
+Determining how to execute long-horizon behav-
+iors based on high-level verbal commands is one
+particular area of robotics where the rich semantic
+knowledge in large language models can be espe-
+cially useful. This problem combines elements of
+Task Plan:
+1. Put the green block in the red bowl.
+2. Put the blue block in the
+Grounded
+Models
+Large
+Language
+Model
+red
+green
+blue
+yellow
+orange
+red
+green
+blue
+yellow
+orange
+"green"
+Grounded
+Decoding
+User
+Place the blocks in 
+mismatched color bowls.
+User
+I’d like a drink and a snack.
+I’ll bring a [pepsi] and an [apple].
+User
+Go to the green block.
+1. Go to the purple door and open it.
+Figure 1: Grounded Decoding solves robotic tasks by taking an instruction as input and selecting tokens that have
+high probability under a Large Language Model (LLM) and a set of Grounded Models (GM). Thus, it leverages the
+open-vocabulary and semantic knowledge of LLMs while being grounded in the environment and in the robot’s
+capabilities. Furthermore, the whole process does not require expensive ﬁne-tuning of the LLM.
+Correspondence to: Wenlong Huang (wenlongh@stanford.edu) and Brian Ichter (ichter@google.com).
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+semantic reasoning and planning: the robot must un-
+derstand the instruction, determine the steps needed
+to fulﬁll it, and also determine how to sequence those
+steps appropriately given its capabilities and the cur-
+rent state of the environment. However, this is not a
+problem that can be solved purely with semantics, as
+it requires suﬃcient grounding to understand how
+the task should be performed in context – for exam-
+ple, in the example in Figure 1, the language model
+alone has no way of knowing which block to pick
+up because this requires knowledge of which blocks
+are present, and also what manipulations the robot
+is capable of performing on them. Thus, although
+a language model can assign probabilities for how
+likely various steps are to correspond to the desired
+task semantically, the constraints of the planning
+problem must also enter into the process. These
+constraints could themselves be represented as prob-
+abilities that mirror the token probabilities generated
+by a language model, reﬂecting their applicability to
+the current environment rather than their semantic
+likelihood. We can frame this as a problem similar to
+probabilistic ﬁltering: decode a sequence (i.e., a task
+description) that both has a high probability under
+the language model and a high probability under a
+grounded model that predicts how applicable this
+sequence is to the current scene.
+Herein, we present Grounded Decoding (GD), a
+scalable, general approach to planning with LLMs
+embodied domains. Grounded Decoding jointly de-
+codes the token probability of an LLM and token
+probabilities from token-conditioned, robotic func-
+tions, such as aﬀordance functions capturing the
+abilities of a robot given its embodiment, safety func-
+tions, or more. By guiding the LLM directly at its
+output, Grounded Decoding enables a general and
+ﬂexible family of planning algorithms. We present
+empirical results on three robotic domains, demon-
+strating GD’s the necessity of grounding models and
+the ability of GD to perform long-horizon, complex
+tasks.
+2. Related Work
+Guided Decoding for Language Models. Decod-
+ing strategies for large language models is an active
+area of research within natural language process-
+ing [1, 2, 3, 4, 5]. A number of recent works have
+focused on developing decoding heuristics for natu-
+ral text generation [6, 7, 8, 9, 3, 10, 11, 12]. Another
+line of works use external classiﬁers for maximiz-
+ing certain language-space utilities when decoding
+language models [13, 14, 15, 16, 17, 18, 5, 19, 20, 21].
+Most closely related to our work are classiﬁer-guided
+decoding methods developed for oﬄine domains,
+such as image captioning [22, 23] and task-oriented
+dialog [24, 25]. However, extensions to embodied do-
+mains, which we investigate exclusively in this work,
+remain non-trivial because grounding in embodied
+domains is bounded by the abilities of the agent and
+by environment state transition as the agent actively
+interacts with the environment.
+Embodied and Multimodal Language Models.
+Training language models to understand embodi-
+ment is an active area of research. Training mul-
+timodal models can enable some degree of em-
+bodied reasoning, such as understanding images
+and videos [26, 27, 28, 29].
+Directly ﬁnetuning
+language models to output actions has also been
+investigated [30, 31, 32].
+Lastly, training down-
+stream models on language model embeddings
+shows promise [33, 34, 35, 36, 37, 38]. In this work,
+we investigate leveraging large frozen language mod-
+els for embodied applications [39, 40, 41, 42, 43, 44,
+45, 46, 47, 48, 49, 50], with grounded models to pro-
+vide domain-speciﬁc grounding during decoding pro-
+cess.
+Comparison to SayCan. The most closely related
+work to our work is SayCan [40]. SayCan uses a
+large language model and a value function to select
+robotic skills among a constrained set of primitives.
+This constrained set of primitives enables SayCan
+to use the so-called “scoring-mode” of the LLM to
+get the probability of a skill being useful to a high-
+level instruction. This requirement to consider only
+a ﬁxed and enumerated set of primitives limits the
+applicability of SayCan in scenarios with many possi-
+ble skills, such as open vocabulary or combinatorial
+tasks. Grounded Decoding on the other hand jointly
+decodes the LLM and the grounded model at the to-
+ken level, allowing for ﬂexible and expressive decod-
+ing of open vocabulary tasks. Furthermore, SayCan
+considers only grounding functions derived from
+RL-trained value functions for aﬀordance grounding
+functions, while Grounded Decoding explores many
+types of grounding functions to propose a broad
+family of algorithms.
+Task and Motion Planning. Task and motion plan-
+ning [51] seeks to solve high-level instructions via
+sequencing tasks in dynamically feasible manner. Re-
+search within this area generally focuses on symbolic
+2
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+2.     Put the cake
+Task Plan:
+1.
+Put the peach in the brown box.
+2.
+Put the
+User
+Please pack a picnic box for me.
+cake
+salad
+red
+···
+0.8
+0.1
+0.0
+0.0
+···
+Large
+Language
+Model
+cake
+salad
+fruit
+···
+0.2
+0.2
+0.2
+0.1
+···
+pepsi
+red
+cake
+A
+···
+0.3
+0.3
+0.2
+0.2
+···
+Aﬀordance
+···
+Preference
+···
+Safety
+Grounded
+Models
+peach 
+peach
+···
+···
+Figure 2: Overview of Grounded Decoding. Given a free-form language instruction, a language model and
+grounded models jointly decide the next candidate token to be decoded by combining their respective likelihood.
+Language model proposes likely tokens that produce goal-directed and coherent long-horizon behaviors, while
+grounded models connect them to the physical scene, through a ﬂexible composition of multiple objective functions,
+such as aﬀordance, preferences, and safety, that can be independently obtained.
+planning [52] or optimization-based [53] approaches.
+Machine learning has increasingly been used to ac-
+celerate planning and enable new domains [54, 55,
+56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67]. However,
+planning constraints are often explicitly speciﬁed for
+TAMP methods. In contrast, we specify constraints
+as (learned) probabilities, which are baked into the
+decoding process and provided by domain-speciﬁc
+grounded models.
+3. Grounded Decoding
+3.1. LLMs and Grounding Models
+Large Language Models.
+LLMs are trained to
+predict the probability 푝(푊) of a text sequence
+푊, represented as a sequence of tokens 푊
+=
+푤1∶푁= (푤1, … , 푤푁). The tokens are elements of
+a ﬁxed vocabulary .
+Typical neural architec-
+tures factorize the joint probability into 푝(푊) =
+∏푁
+푛=1 푝LLM(푤푛|푤1∶푛−1), where 푝LLM is predicted by
+a transformer network [68]. Given 푝LLM, gener-
+ating a text consisting of 푁-many tokens, the so-
+called decoding process, can be seen as the optimiza-
+tion problem arg max푤1∶푁∈∏푁
+푛=1 푝LLM(푤푛|푤1∶푛−1),
+which in practice is solved, e.g., using greedy search
+(푤푛= arg max푤∈푝LLM(푤|푤1∶푛−1)), beam search, or
+sampling strategies. To further ensure the LLM is
+solving a desired task, one typically starts with a
+given text, the so-called preﬁx or prompt, that de-
+scribes the task, and then the LLM completes this
+task in its decoding process.
+Grounding Functions.
+We use the concept
+of grounding functions, 푝G(푤1∶푛|푠), which seek to
+model a probability of tokens 푤1∶푛given state 푠∈.
+This state is intended to capture the embodiment
+of the robot and the environment, and may be for
+example an image, a proprioceptive robot state, or
+the environment state. Thus the grounding function
+models probabilities relevant to the robot embodi-
+ment and environment, such as whether the tokens
+are possible for the robot to execute given the state
+(aﬀordances), or other values like safety, cost, or user
+preferences.
+3.2. Problem formulation.
+Given an instruction in language 퓁, we can use an
+LLM to produce a language plan 푤1∶푁by ﬁnding the
+most likely decoding according to the LLM’s prob-
+ability distribution. 푝LLM(푤1∶푁|퓁), with 퓁being the
+preﬁx. However, based on the instruction 퓁as the
+preﬁx alone, the LLM can easily generate text that
+is not grounded in the physical state of the envi-
+ronment, rendering such plans useless in the real
+world. In order to ground the language model in an
+actual physical embodiment, we propose Grounded
+Decoding (GD): The main idea of GD is to guide the
+generation of token sequences with a grounding func-
+tion that is conditioned on the embodiment of the
+system.
+Formally, let 푠∈denote a representation of
+the state of the world (which could be given by an
+image). Then, GD
+푤∗
+1∶푁= arg
+max
+푤1∶푁,푤푛∈푝GD(푤1∶푁|푠, 퓁)
+(1)
+attempts to generate text that is consistent with both
+the instruction 퓁and the physical state 푠.
+To leverage the knowledge present in LLMs from
+internet-scale data, we factorize 푝GD(푤1∶푁|푠, 퓁) as
+3
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+follows
+푝GD(푤1∶푁|푠, 퓁) = 푝(푠, 퓁|푤1∶푁) 푝(푤1∶푁)
+푝(푠, 퓁)
+(2)
+= 푝(푠|푤1∶푁)푝(퓁|푤1∶푁)푝(푤1∶푁)
+푝(푠, 퓁)
+(3)
+= 푝(푤1∶푁|퓁)푝(퓁)푝(푤1∶푁|푠)푝(푠)푝(푤1∶푁)
+푝(푠, 퓁)푝(푤1∶푁)푝(푤1∶푁)
+(4)
+∝푝(푤1∶푁|퓁)
+푝(푤1∶푁) 푝(푤1∶푁|푠)
+(5)
+∝푝(푤1∶푁|퓁)푝(푤1∶푁|푠).
+(6)
+We make two assumptions for this derivation, that
+푠and 퓁are conditionally independent given 푤1∶푁
+(required for Line 5) and that 푝(푤1∶푁) is uniform over
+responses (required for Line 6). We then factorize
+into token decoding
+푝GD(푤1∶푁|푠, 퓁) ∝
+푁
+∏
+푛=1
+푝LLM(푤푛|푤1∶푛−1, 퓁) 푝G(푤1∶푛|푠).
+(7)
+The ﬁrst term, 푝LLM(푤푛|푤1∶푛−1, 퓁), can be modeled as
+the probability of the LLM predicting the token for
+the given instruction 퓁appended previously decoded
+tokens 푤1∶푛−1 without the state 푠as input. The sec-
+ond term, 푝G(푤1∶푛|푠), is the grounding function that
+is only conditioned on the state 푠and judges whether
+the generated text 푤1∶푛is consistent with the physi-
+cal state. The core idea behind this factorization is
+that LLMs exhibit long-term planning capabilities,
+while the grounding function guides the planning
+of the LLM to be possible in the concrete embodied
+physical world without needing to be informed or
+capable of reasoning over the long-horizon instruc-
+tion.
+3.3. Algorithm – Grounded Decoding.
+Algorithm 1 details the steps in GD and Figure 2
+visualizes a single step of the simplest greedy search
+form of GD. GD proceeds through a process similar
+to probabilistic ﬁltering by selecting tokens itera-
+tively that have high probability under the language
+model and the grounded model. After each token is
+selected, it is appended to the preﬁx. The process
+continues until a token in the terminal set term, is
+selected, at which point the command is returned
+and executed. Additionally, we note that GD, in its
+essence, provides a grounded scoring function; thus,
+it can be easily extended to any search methods such
+as beam search, top-k sampling, etc.
+Algorithm 1 GD w/ Greedy Search
+1: Given: state 푠, instruction 퓁, terminal set term
+2: Initialize: 푤= {}, 푛= 0
+3: while 푤푛∉term do
+4:
+푛= 푛+ 1
+5:
+푤푛= arg max푤푛∈푝LLM(푤푛|푤1∶푛−1, 퓁) 푝G(푤1∶푛|푠)
+6: Return: 푤
+Grounded Decoding for Robot Control. This
+work investigates grounded decoding in the con-
+text of robot control. For this setting, we assume to
+have access to a language conditioned policy 휋that
+predicts actions 푎= 휋(푠, 푤1∶푖) based on a language
+command 푤1∶푖and state 푠. We further assume access
+to a grounding function 푝G(푤1∶푛|푠) that model em-
+bodied probabilities, e.g., aﬀordances or safety of a
+the command given the state. Crucially, this ground-
+ing function must accept partial commands to enable
+grounding during decoding. As an example, an af-
+fordance ground function for a skill “pick up object”,
+should emit a high probability for “pick” and “pick
+up” if any object is able to be picked and collapse to
+only feasible objects only once the object token is
+decoded. Once a complete, executable skill is fully
+decoded it is executed in the environment and the
+decoding continues with the new state updated for
+the grounding function.
+4. Experiments
+Our experiments section demonstrates Grounded
+Decoding on three diﬀerent environments (Figure 3)
+and with a variety of grounding functions in order
+to demonstrate its generality and ﬂexibility. We
+show ﬁrst a tabletop manipulation environment
+with grounding functions for aﬀordances, safety,
+and preferences. Second, we show a 2D Maze envi-
+ronment built from Minigrid [69], with RL-trained
+value function-based grounding functions. Finally,
+we show a real robot in an oﬃce kitchen, inspired by
+[40], with a CLIP-based grounding function. We pro-
+vide high-level analysis of the results in this section
+and detailed analysis in Section 5.
+4.1. Long-Horizon Tabletop Manipulation
+Herein we experiment with a simulated tabletop ma-
+nipulation scene based on the RAVENS [70] environ-
+ment and a CLIPort [71] policy. We create a custom
+set of 20 tasks, all of which are speciﬁed via natu-
+ral language instructions and require the agent to
+4
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Language Model
+Grounded Models
+Combined Score
+Step 1: Go to the purple door and open it
+Step 2: Go to the green door and open it
+Step 3: Go to the purple door and open it
+Step 4: Go to the green door and open it
+Step 5: Go to the red door and open it
+Step 6: Go to the goal
+Step 1: Pick up Y and place it on left side
+Step 2: Pick up O and place it on right of Y
+Step 3: Done
+User
+Spell as much of 
+“you” as you can.
+Tabletop Rearrangement 
+(Sim)
+User
+Traverse the rooms 
+to get to the goal.
+MiniGrid 2D Maze
+(Sim)
+Thought: I will bring you the [pepsi] and 
+the [apple]
+Plan: Step 1: Find an apple
+Step 2: Pick up the apple
+Step 3: Bring it to you
+Step 4: Put it down
+…
+User
+Bring me a soda that is 
+not coke, and a fruit.
+Kitchen Mobile Robot
+(Real)
+Figure 3: Example rollouts and likelihood of representative tokens under Grounded Decoding objective in three
+distinct domains: simulated tabletop rearrangement (top), Minigrid 2D Maze (middle), and real-world kitchen mobile
+manipulation (bottom). Each domain uses diﬀerent prompts, grounded models, and low-level primitives. The GD
+formulation is shared across the domains, decoding a pre-trained langauge model with respect to domain-speciﬁc
+grounded models to decompose a open-ended instruction into actionable steps.
+perform long-horizon reasoning based on its obser-
+vation of the environment. The tasks are split into
+10 seen tasks and 10 unseen tasks, where seen tasks
+may be used for training (in the case of supervised
+baseline) or used as few-shot prompting. They are
+grouped by three categories:
+i. Letters (8 tasks): Rearranging alphabetical let-
+ters (e.g., “put the letters in alphabetical order from
+left to right”).
+ii. Blocks & Bowls (8 tasks): Rearranging or
+combining blocks and bowls (e.g., “put the blocks in
+the matching bowls”).
+iii. Box Packing (4 tasks): Sorting food items
+and utensils into boxes in accordance with safety
+constraints and user preferences (e.g., “Can you pack
+the picnic box for me?”).
+Given only high-level language instructions
+and top-down visual observation of the environ-
+ment, Grounded Decoding uses language models
+as planners to decompose the high-level instructions
+into a sequence of steps [39, 40]. After a complete
+step command is generated, we use a pre-trained
+multi-task language-conditioned CLIPort [71] as the
+primitive policy to execute the command. Note that
+because GD generated grounded free-form actions,
+it does not require each step to strictly map to a
+repertoire of skill as in [39, 40].
+While the GD formulation is amenable for any
+decoding method, we study two variants using beam
+search and greedy search. For baselines, we com-
+pare to "No Grounding" baseline that decodes only
+according to language model likelihood. Further-
+more, we compare to solitary method CLIPort [71]
+that directly take in the high-level language instruc-
+tions without a planner. We consider two variants of
+CLIPort: 1) "Short" that is trained with only single-
+step pick-and-place commands, and 2) "Long" that
+is trained on high-level instructions from the 10
+training tasks. For more details, please refer to Ap-
+pendix A.2.4.
+Owing
+to
+the
+elegance
+and
+extensibility
+of Grounded Decoding, we can seamlessly compose
+multiple grounding functions depending on the
+task at inference time.
+To compose grounding
+functions {푝1, 푝2, … , 푝푛}, the overall grounding
+score is calculated as 푝G = ∏푛
+푖=1 푝푖. Please refer to
+the Appendix A.1 for which grounding function are
+used for each task and Appendix A.2.4.
+Aﬀordance Grounding Function (AF). The af-
+fordance should be a function of the robot, the en-
+vironment, and the underlying policy in order to
+accurately determine what is possible in the scene.
+As part of its architecture, given a scene image 푠and
+partially-decoded open-ended language instruction
+5
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Step 1: Pick up the yellow block and place it on the purple block.
+Step 2: Pick up the red block and place it on the yellow block.
+User
+Stack all the blocks.
+Language Model
+Grounded Model (Aﬀordance)
+Combined Score
+Figure 4: Example decision-making with GD, where key decoded tokens are shown (yellow, purple, red, yellow). For
+each of the key token position, we show the top 10 candidates with their likelihoods under the language model,
+grounded model, and both. Combined scores are normalized to the maximum for visual clarity; others are normalized
+to the sum for showing their relative conﬁdence. While only greedy search is illustrated for simplicity, alternative
+search methods may achieve better results, as shown in Section 4.
+퓁the CLIPort primitive policy predicts unnormal-
+ized logits over the pixel space, which we use directly
+here as aﬀordances. This grounding is used for all
+tasks.
+Safety Grounding Function (S). World ground-
+ing for embodiment need not only be aﬀordances,
+it can also be crucial robotics functions like safety.
+While any safety function that can score a language
+instruction 퓁may be used, we implement a simple
+indicator to prevent the robot from interacting haz-
+ardous objects. This safety grounding function is
+used for 3 tasks in Box Packing task family.
+Preference Grounding Function (P). Robots
+operating alongside humans should also be aware
+of human preferences, which often diﬀer based on
+the speciﬁc user. We choose two random objects as
+the preferred objects to be used for the household
+object sorting tasks. Note that unlike safety func-
+tions, preferences often come in the form of “soft
+requirement”, and thus we implement them as a bias
+towards these objects of interest. More generic pref-
+erence functions may also be learned or statistically
+calculated based on history of user data. A prefer-
+ence grounding function is used for 2 tasks in Box
+Packing task family.
+Analysis. Results grouped by each task category
+are shown in Table 1. Please refer to the Appendix
+for detailed breakdown. Each method is evaluated
+on 20 episodes for each task within each task cat-
+egory. Supervised methods, such as CLIPort, are
+found to perform poorly on unseen tasks. Methods
+that leverage language model planner show better
+CLIPort
++LLM
++GD
+Short Long Ungrounded Greedy Beam
+Seen Tasks
+Letters
+7%
+40%
+20%
+43%
+57%
+Blocks & Bowls
+2%
+62%
+35%
+60%
+77%
+Box Packing*
+15%
+28%
+11%
+79 %
+78%
+Unseen Tasks
+Letters
+6%
+10%
+19%
+37%
+41%
+Blocks & Bowls
+6%
+10%
+28%
+44%
+50%
+Table 1: Average success rate for each tabletop task cat-
+egory. *Box Packing tasks are seen during training, but
+safety and preference requirements are only enforced
+during evaluation.
+generalization to unseen tasks but fall short due to
+lack of grounding.
+Grounded Decoding achieves
+the best results by enabling the LLM to plan actions
+using grounded information and is further improved
+with beam search.
+4.2. 2D Maze
+We further evaluate the long-horizon reasoning
+performance of Grounded Decoding for 2D maze-
+solving on Minigrid tasks [69]. The agent receives
+a top-down view of the environment along with a
+natural language instruction. The tasks are grouped
+in three categories:
+i. Easy: Simple tasks where the horizon is short
+(10-30 steps) and fully described by the textual in-
+struction, e.g. OpenDoors and PutNext.
+ii. Medium: Short and long-horizon tasks (up to
+6
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+80 steps) with step-by-step textual instructions, e.g.
+LockedRoom.
+iii. Hard: Complex, long-horizon instructions
+(over 100 steps) with ambiguous instructions that
+necessitate multi-step reasoning and eﬃcient explo-
+ration, e.g. MultiRoom and BlockedUnlock.
+Given such instructions and top-down observa-
+tions, Grounded Decoding uses an LLM as a planner
+to decompose the instructions into a sequence of
+steps. Following the recipe from Section 3.3, we
+combine this language model planning with an aﬀor-
+dance function grounded in the agent’s observations.
+To obtain this aﬀordance function, we use the value
+function from the goal-conditioned policy that is
+trained with PPO [72]. This policy performs short-
+horizon skills such as “Go to red key” or “Open the
+door” and are conditioned on CLIP embeddings of
+the skill and an image of the scene.
+Similar to the tabletop manipulation experi-
+ments, we compare the two variants of Grounded
+Decoding— with greedy and beam search — with
+the solitary policy [72], a hierarchical algorithm
+that uses the low-level skills and plans over it us-
+ing model-free RL, and a hierarchical algorithm that
+uses an ungrounded language model for planning
+for textual skills [39]. Each method is evaluated with
+100 randomly initialized environment layouts and
+object positions.
++Skills
++LLM
++GD
+PPO
+HRL
+Ungrounded Greedy Beam
+Easy
+28%
+68%
+96%
+100%
+100%
+Medium 13%
+48%
+87%
+93%
+97%
+Hard
+6%
+31%
+54%
+78%
+88%
+Table 2: 2D Maze success rates.
+Analysis. Table 2 reports the success rate. The
+“ﬂat” RL agent performs poorly in all but the sim-
+plest environments, owing to diﬃculties with un-
+derstanding the high-level instruction and reason-
+ing over long horizons (often over 100 steps). Plan-
+ning over low-level skills using hierarchical RL [73]
+improves this performance, since the high-level
+decision-making problem is greatly simpliﬁed. How-
+ever, the high-level RL agent still needs to reason
+over low-level (textual) skills by understanding their
+underlying capabilities and stitching them together.
+Using the planning capabilities of large language
+models to reason over textual skills signiﬁcantly
+boosts this performance [39], since the language
+model can inherit the strong reasoning capabilities
+from its training data. This tends to be insuﬃcient in
+challenging environments, however, since the num-
+ber of potentially viable skills may be very large and
+the LLM has no information about the robot’s ob-
+servations. GD can leverage the learned aﬀordance
+function (in this case, the goal-conditioned value
+function) to inform the language model’s plans, en-
+abling successful long-horizon reasoning. We fur-
+ther ﬁnd that beam search improves performance
+modestly, particularly in long-horizon tasks.
+4.3. Mobile Manipulation in a Kitchen
+Our last environment is a kitchen robot in the real
+world, and we follow the same implementations of
+the mobile manipulation platform and skills in Say-
+Can [40]. We perform instruction following tasks,
+as in [40]. An example task is “Bring an apple", for
+which the robot needs to plan and execute a sequence
+of “1. Find an apple, 2. Pick up the apple, 3. Bring
+it to you. 4. Put it down, 5. Done". We split the
+tasks into two categories. Unambiguous means the
+instruction explicitly contains the object of interest,
+and Ambiguous means the instruction does not con-
+tain the object name. For example, when human asks
+“bring me the fruit”, the robot needs to ﬁrst ﬁgure out
+what fruit is available. We assume when the robot
+starts, it is able to see all the necessary objects.
+Partial GD and Chain-of-thought We make a
+slight modiﬁcation of the SayCan [40] algorithm to
+enable grounded decoding. The language model in
+SayCan takes in a prompt and a human instruction,
+and then predicts next steps. When chain of thought
+prompting [74] is enabled, SayCan algorithm will
+ﬁrst decode a chain of thought in generative mode,
+then proceed with scoring mode to generate the plan.
+However, this open vocabulary generative process is
+not amenable to SayCan’s ﬁxed grammar, which can
+result in errors. We minimally augment the SayCan
+algorithm to prompt the language model to generate
+chain-of-thought that is visually grounded. We make
+sure that objects mentioned in chain of thought are in
+square bracket, which indicate to the language model
+that the object herein is “visually grounded”. During
+the chain-of-thought decoding, the left bracket will
+trigger grounded decoding and the right bracket will
+revert to ungrounded decoding. We take in current
+image as additional input, and use object detection
+score as grounding function [42]. This is illustrated
+7
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+in Fig. 5.
+GD (ours)
+SayCan
+Tasks
+Planning Execution Planning Execution
+Unambiguous
+85%
+57%
+85%
+57%
+Ambiguous
+58%
+44%
+33%
+25%
+Table 3: Kitchen task planning and execution success
+rates.
+Analysis. We found in Table 3 that we can recover
+the performance when the queries are explicit, and
+gain 25% in planning performance when the queries
+are ambiguous.
+Robot: I am a robot that can bring objects to you. 
+Human: I want a soda that is not coke, and a fruit.
+Robot thought: I will find the [pepsi] and the [apple]
+Robot plan: 1. Find an apple 
+2. Pick up the apple
+3. Bring it to you
+4. ... 
+grapefruit
+grapefruit Soda
+grapefruit soda
+lime soda
+sponge
+banana
+Ungrounded decoding
+Grounded decoding
+SayCan scoring mode
+1.Find an apple  
+2.Pick up the apple
+5.Find a pepsi
+6.Pick up the pepsi
+8.Put it down
+… 
+… 
+Figure 5: Grounded Decoding with open-vocabulary de-
+tection model in the loop resolves ambiguous queries.
+5. Analysis
+5.1. Comparison to SayCan
+In this section, we directly compare GD to Say-
+Can [40], which is related to our method in that both
+combine language model knowledge and grounded
+model knowledge (and discussed in more detail in
+Related Work Section 2). However, SayCan uses
+the language model to score all pre-speciﬁed op-
+tions, rendering it ineﬃcient at dealing with large or
+combinatorial action spaces. In contrast, GD compu-
+tation considers all possible language token in the
+autoregressive decoding process, which is indepen-
+dent of the size of the action space. Results shown in
+Table 4 demonstrate that GD is two orders of mag-
+nitude more eﬃcient on our tasks, with comparable
+performance. Furthermore, by decoding at the most
+basic functioning unit of language, GD’s formula-
+tion allows open-vocabulary grounding beyond just
+aﬀordances, e.g. safety, preferences, and multimodal
+embeddings such as CLIP.
+GD (Greedy)
+GD (Beam)
+SayCan
+Success Rate
+50%
+60%
+64%
+Token Count
+1x
+4.3x
+113.7x
+Table 4: By avoiding full enumeration of the skills, GD
+is much more eﬃcient than SayCan while staying perfor-
+mant.
+5.2. Breakdown of Failure Reasons
+Because all hierarchical approaches share an imper-
+fect low-level policy for step execution, the results
+reported in Table 1 are compounded with both plan-
+ning failures and low-level policy failure. In Figure 6,
+we provide failure breakdown analysis for Grounded
+Decoding and associated baselines. Note that the
+CLIPort baselines are solitary methods that do not
+use a planner, so the failures are solely composed
+of policy failures. As shown in Figure 6, while all
+planning-based methods use the same underlying
+low-level policy, Grounded Decoding signiﬁcantly
+reduces planning failure by being able to incorporate
+grounded scene information into the decoding pro-
+cess. Moreover, we observe that despite the shared
+aﬀordance function across beam and greedy search,
+the beam search variant performs stronger by be-
+ing aware of the full-length single-step instructions
+during decoding. A notable planning failure occurs
+when the planner produces a slightly incorrect plan
+(“orange block“ instead of “yellow block”), but as
+the grounding and the policy share limitations, the
+policy often still interacts with the correct object.
+5.3. Grounded Action Manifold
+A central goal of this work is to investigate the in-
+tegration of grounded information into language
+model decoding to output instructions actionable by
+a policy. To investigate this, we use a t-SNE [75] plot
+to illustrate the extent to which grounded models
+help narrow down the search space for language
+models. Speciﬁcally, we ﬁrst enumerate all mean-
+ingful instructions in the tabletop domain, such as
+"pick x and place it on y," which are represented as
+dots in the ﬁgure. We then compute the aﬀordance
+values with respect to four diﬀerent scenes, where
+each color represents one scene. Finally, we group
+the dots using t-SNE and BERT embeddings. The
+ﬁgure shows that grounded models can eﬀectively
+8
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+GD (Beam)
+GD (Greedy)
+No Grounding
+CLIPort (long)
+CLIPort (short)
+0%
+25%
+50%
+75%
+100%
+Policy Failure
+Planner Failure
+No Failure
+Figure 6: Failure breakdown analysis of various base-
+lines showing that while all planning-based methods use
+the same underlying low-level policy, GD signiﬁcantly
+reduces planning failure by incorporating grounded scene
+information into the decoding process. The beam search
+variant outperforms greedy search by being aware of the
+full instruction during decoding.
+identify achievable skills to produce an actionable
+manifold within the language space and that this
+grounding is required, as language alone does not
+perfectly group actionable skills. It is worth noting
+that while we provide manual enumeration of all
+possible skills for practical analysis, the language
+space is much larger, composed of roughly a 40,000
+token vocabulary at each step. This highlights the
+even more pronounced narrowing of the search in
+the language space.
+Figure 7: Visualization of actions colored by aﬀordance
+values in diﬀerent scenes. Every dot represents a possible
+action in the tabletop domain, where the majority of the
+actions are infeasible. We show how grounded models
+can identify the feasible actions for speciﬁc scenes. No-
+tably, these actions are not always clustered in language
+space, requiring the grounding function to determine
+what action to perform.
+6. Conclusions, Limitations, & Future
+We presented Grounded Decoding (GD), an approach
+for leveraging the knowledge and capabilities of
+large language models in embodied settings through
+grounding functions, which model the probabilities
+of tokens given an embodiment. GD resembles prob-
+abilistic ﬁltering, by decoding tokens that have high
+probabilities under the language model and under
+the grounding model. By guiding the LLM’s decod-
+ing directly at its output, GD is a general, ﬂexible,
+and expressive approach to embodied tasks. This
+is demonstrated on three embodied domains, show-
+ing GD is capable of solving complex, long-horizon
+tasks.
+Though quite general and ﬂexible, GD has a few
+limitations. First, though the formulation of ground-
+ing functions is general, the quality and availability
+of general grounding functions is still a bottleneck,
+particularly compared to the capabilities of LLMs.
+We hope that recent progress in large-scale robotics
+models (e.g. [76] and [77]) can remove this bottle-
+neck, and note that the ﬂexibility of GD allows such
+progress to be straightforwardly leveraged. Second,
+prompt engineering is often required to steer LLMs
+to the desired action space (e.g., likely action verbs,
+likely present objects). Finally, the joint decoding
+may be limiting compared to a single model capable
+of both grounding and language reasoning [29, 26].
+This work presented a family of algorithms for
+grounding LLMs in embodiment, for which there are
+many avenues for future work. The ﬂexibility of the
+approach enables many other grounding functions
+and ways to integrate grounding. Furthermore, the
+development and integration of a foundation model
+for grounding would improve performance signiﬁ-
+cantly. Finally, though GD’s probabilistic ﬁltering-
+based approach is quite general, fusing grounding
+information to the language model after each token
+decoding may be limiting and we plan to investigate
+how such grounding can be elegantly integrated dur-
+ing decoding.
+Acknowledgments
+The authors would like to acknowledge Pierre Ser-
+manet, Carolina Parada, Jie Tan, Yevgen Chebotar,
+Vincent Vanhoucke, and Dorsa Sadigh for their feed-
+back and contributions. This work is supported in
+part by OpenAI academic access program, granted
+to Wenlong Huang.
+References
+[1] I. Sutskever, O. Vinyals, and Q. V. Le, “Sequence
+to sequence learning with neural networks,”
+Advances in neural information processing sys-
+tems, vol. 27, 2014.
+9
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+[2] Y. Wu, M. Schuster, Z. Chen, Q. V. Le,
+M. Norouzi, W. Macherey, M. Krikun, Y. Cao,
+Q. Gao, K. Macherey, et al., “Google’s neural ma-
+chine translation system: Bridging the gap be-
+tween human and machine translation,” arXiv
+preprint arXiv:1609.08144, 2016.
+[3] A. Holtzman, J. Buys, L. Du, M. Forbes, and
+Y. Choi, “The curious case of neural text degen-
+eration,” arXiv preprint arXiv:1904.09751, 2019.
+[4] S. Welleck, I. Kulikov, J. Kim, R. Y. Pang, and
+K. Cho, “Consistency of a recurrent language
+model with respect to incomplete decoding,”
+arXiv preprint arXiv:2002.02492, 2020.
+[5] R. Leblond, J.-B. Alayrac, L. Sifre, M. Pislar,
+J.-B. Lespiau, I. Antonoglou, K. Simonyan,
+and O. Vinyals, “Machine translation de-
+coding beyond beam search,” arXiv preprint
+arXiv:2104.05336, 2021.
+[6] C. Meister, T. Vieira, and R. Cotterell, “If beam
+search is the answer, what was the question?,”
+arXiv preprint arXiv:2010.02650, 2020.
+[7] J. Kasai, K. Sakaguchi, R. L. Bras, D. Radev,
+Y. Choi, and N. A. Smith, “Beam decod-
+ing with controlled patience,” arXiv preprint
+arXiv:2204.05424, 2022.
+[8] C. Meister, T. Pimentel, G. Wiher, and R. Cot-
+terell, “Typical decoding for natural language
+generation,” arXiv preprint arXiv:2202.00666,
+2022.
+[9] A. Fan, M. Lewis, and Y. Dauphin, “Hierar-
+chical neural story generation,” arXiv preprint
+arXiv:1805.04833, 2018.
+[10] S. Basu, G. S. Ramachandran, N. S. Keskar, and
+L. R. Varshney, “Mirostat: A neural text decod-
+ing algorithm that directly controls perplexity,”
+arXiv preprint arXiv:2007.14966, 2020.
+[11] N. S. Keskar, B. McCann, L. R. Varshney,
+C. Xiong, and R. Socher, “Ctrl: A conditional
+transformer language model for controllable
+generation,” arXiv preprint arXiv:1909.05858,
+2019.
+[12] T. Scialom, P.-A. Dray, S. Lamprier, B. Pi-
+wowarski, and J. Staiano, “Discriminative ad-
+versarial search for abstractive summarization,”
+in International Conference on Machine Learn-
+ing, pp. 8555–8564, PMLR, 2020.
+[13] C. Snell, I. Kostrikov, Y. Su, M. Yang, and
+S. Levine, “Oﬄine rl for natural language gener-
+ation with implicit language q learning,” arXiv
+preprint arXiv:2206.11871, 2022.
+[14] K. Yang and D. Klein, “Fudge: Controlled text
+generation with future discriminators,” arXiv
+preprint arXiv:2104.05218, 2021.
+[15] A. Holtzman, J. Buys, M. Forbes, A. Bosse-
+lut, D. Golub, and Y. Choi, “Learning to write
+with cooperative discriminators,” arXiv preprint
+arXiv:1805.06087, 2018.
+[16] J. Li, W. Monroe, and D. Jurafsky, “Learning
+to decode for future success,” arXiv preprint
+arXiv:1701.06549, 2017.
+[17] B. Krause,
+A. D. Gotmare,
+B. McCann,
+N. S. Keskar, S. Joty, R. Socher, and N. F.
+Rajani,
+“Gedi:
+Generative discriminator
+guided sequence generation,” arXiv preprint
+arXiv:2009.06367, 2020.
+[18] M. Ghazvininejad, X. Shi, J. Priyadarshi, and
+K. Knight, “Hafez: an interactive poetry genera-
+tion system,” in Proceedings of ACL 2017, System
+Demonstrations, pp. 43–48, 2017.
+[19] A. Baheti, A. Ritter, J. Li, and B. Dolan, “Gen-
+erating more interesting responses in neural
+conversation models with distributional con-
+straints,” arXiv preprint arXiv:1809.01215, 2018.
+[20] S. Dathathri, A. Madotto, J. Lan, J. Hung,
+E. Frank, P. Molino, J. Yosinski, and R. Liu, “Plug
+and play language models: A simple approach
+to controlled text generation,” arXiv preprint
+arXiv:1912.02164, 2019.
+[21] T. Hartvigsen, S. Gabriel, H. Palangi, M. Sap,
+D. Ray, and E. Kamar, “Toxigen: A large-scale
+machine-generated dataset for adversarial and
+implicit hate speech detection,” arXiv preprint
+arXiv:2203.09509, 2022.
+[22] Y. Tewel, Y. Shalev, I. Schwartz, and L. Wolf,
+“Zero-shot
+image-to-text
+generation
+for
+visual-semantic arithmetic,” arXiv preprint
+arXiv:2111.14447, 2021.
+10
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+[23] Y. Su, T. Lan, Y. Liu, F. Liu, D. Yogatama,
+Y. Wang, L. Kong, and N. Collier, “Language
+models can see: plugging visual controls in text
+generation,” arXiv preprint arXiv:2205.02655,
+2022.
+[24] C. Snell, S. Yang, J. Fu, Y. Su, and S. Levine,
+“Context-aware language modeling for goal-
+oriented dialogue systems,” arXiv preprint
+arXiv:2204.10198, 2022.
+[25] S. Verma, J. Fu, M. Yang, and S. Levine, “Chai:
+A chatbot ai for task-oriented dialogue with
+oﬄine reinforcement learning,” arXiv preprint
+arXiv:2204.08426, 2022.
+[26] X. Chen, X. Wang, S. Changpinyo, A. Pier-
+giovanni, P. Padlewski, D. Salz, S. Goodman,
+A. Grycner, B. Mustafa, L. Beyer, et al., “Pali:
+A jointly-scaled multilingual language-image
+model,” arXiv preprint arXiv:2209.06794, 2022.
+[27] L. H. Li, M. Yatskar, D. Yin, C.-J. Hsieh, and
+K.-W. Chang, “Visualbert: A simple and perfor-
+mant baseline for vision and language,” arXiv
+preprint arXiv:1908.03557, 2019.
+[28] C. Sun, A. Myers, C. Vondrick, K. Murphy, and
+C. Schmid, “Videobert: A joint model for video
+and language representation learning,” in Pro-
+ceedings of the IEEE/CVF International Confer-
+ence on Computer Vision, 2019.
+[29] J.-B. Alayrac, J. Donahue, P. Luc, A. Miech,
+I. Barr, Y. Hasson, K. Lenc, A. Mensch, K. Mil-
+lican, M. Reynolds, et al., “Flamingo: a visual
+language model for few-shot learning,” arXiv
+preprint arXiv:2204.14198, 2022.
+[30] A. Suglia, Q. Gao, J. Thomason, G. That-
+tai, and G. Sukhatme, “Embodied bert: A
+transformer model for embodied, language-
+guided visual task completion,” arXiv preprint
+arXiv:2108.04927, 2021.
+[31] A. Pashevich, C. Schmid, and C. Sun, “Episodic
+transformer for vision-and-language naviga-
+tion,” in Proceedings of the IEEE/CVF Interna-
+tional Conference on Computer Vision, 2021.
+[32] P. Sharma, A. Torralba, and J. Andreas, “Skill
+induction and planning with latent language,”
+arXiv preprint arXiv:2110.01517, 2021.
+[33] C. Lynch and P. Sermanet, “Grounding lan-
+guage in play,” 2020.
+[34] S. Nair, E. Mitchell, K. Chen, B. Ichter,
+S. Savarese, and C. Finn, “Learning language-
+conditioned robot behavior from oﬄine data
+and crowd-sourced annotation,” in Conference
+on Robot Learning, pp. 1303–1315, PMLR, 2021.
+[35] F. Hill, S. Mokra, N. Wong, and T. Harley, “Hu-
+man instruction-following with deep reinforce-
+ment learning via transfer-learning from text,”
+arXiv preprint arXiv:2005.09382, 2020.
+[36] R. Zellers, X. Lu, J. Hessel, Y. Yu, J. S. Park,
+J. Cao, A. Farhadi, and Y. Choi, “Merlot: Mul-
+timodal neural script knowledge models,” Ad-
+vances in Neural Information Processing Systems,
+2021.
+[37] M. Reid, Y. Yamada, and S. S. Gu, “Can
+wikipedia help oﬄine reinforcement learning,”
+arXiv preprint arXiv:2201.12122, 2022.
+[38] S. Li, X. Puig, Y. Du, C. Wang, E. Akyurek,
+A. Torralba, J. Andreas, and I. Mordatch,
+“Pre-trained
+language
+models
+for
+inter-
+active
+decision-making,”
+arXiv
+preprint
+arXiv:2202.01771, 2022.
+[39] W. Huang, P. Abbeel, D. Pathak, and I. Mor-
+datch, “Language models as zero-shot planners:
+Extracting actionable knowledge for embodied
+agents,” in International Conference on Machine
+Learning, PMLR, 2022.
+[40] M. Ahn, A. Brohan, N. Brown, Y. Chebotar,
+O. Cortes, B. David, C. Finn, K. Gopalakrishnan,
+K. Hausman, A. Herzog, D. Ho, J. Hsu, J. Ibarz,
+B. Ichter, A. Irpan, E. Jang, R. J. Ruano, K. Jef-
+frey, S. Jesmonth, N. Joshi, R. Julian, D. Kalash-
+nikov, Y. Kuang, K.-H. Lee, S. Levine, Y. Lu,
+L. Luu, C. Parada, P. Pastor, J. Quiambao, K. Rao,
+J. Rettinghouse, D. Reyes, P. Sermanet, N. Siev-
+ers, C. Tan, A. Toshev, V. Vanhoucke, F. Xia,
+T. Xiao, P. Xu, S. Xu, and M. Yan, “Do as i can
+and not as i say: Grounding language in robotic
+aﬀordances,” in arXiv preprint arXiv:2204.01691,
+2022.
+[41] A. Zeng, A. Wong, S. Welker, K. Choromanski,
+F. Tombari, A. Purohit, M. Ryoo, V. Sindhwani,
+J. Lee, V. Vanhoucke, et al., “Socratic models:
+11
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Composing zero-shot multimodal reasoning
+with language,” arXiv preprint arXiv:2204.00598,
+2022.
+[42] B. Chen, F. Xia, B. Ichter, K. Rao, K. Gopalakr-
+ishnan, M. S. Ryoo, A. Stone, and D. Kappler,
+“Open-vocabulary queryable scene representa-
+tions for real world planning,” arXiv preprint
+arXiv:2209.09874, 2022.
+[43] D. Shah, B. Osinski, B. Ichter, and S. Levine,
+“Lm-nav: Robotic navigation with large pre-
+trained models of language, vision, and action,”
+arXiv preprint arXiv:2207.04429, 2022.
+[44] W. Huang, F. Xia, T. Xiao, H. Chan, J. Liang,
+P. Florence, A. Zeng, J. Tompson, I. Mor-
+datch, Y. Chebotar, P. Sermanet, N. Brown,
+T. Jackson, L. Luu, S. Levine, K. Hausman, and
+B. Ichter, “Inner monologue: Embodied reason-
+ing through planning with language models,”
+in arXiv preprint arXiv:2207.05608, 2022.
+[45] J. Liang, W. Huang, F. Xia, P. Xu, K. Hausman,
+B. Ichter, P. Florence, and A. Zeng, “Code as
+policies: Language model programs for em-
+bodied control,” arXiv preprint arXiv:2209.07753,
+2022.
+[46] I. Singh, V. Blukis, A. Mousavian, A. Goyal,
+D. Xu, J. Tremblay, D. Fox, J. Thomason, and
+A. Garg, “Progprompt: Generating situated
+robot task plans using large language models,”
+arXiv preprint arXiv:2209.11302, 2022.
+[47] O. Mees, J. Borja-Diaz, and W. Burgard,
+“Grounding language with visual aﬀordances
+over
+unstructured
+data,”
+arXiv
+preprint
+arXiv:2210.01911, 2022.
+[48] C. Huang, O. Mees, A. Zeng, and W. Burgard,
+“Visual language maps for robot navigation,”
+arXiv preprint arXiv:2210.05714, 2022.
+[49] S. S. Raman, V. Cohen, E. Rosen, I. Idrees,
+D. Paulius, and S. Tellex, “Planning with large
+language models via corrective re-prompting,”
+arXiv preprint arXiv:2211.09935, 2022.
+[50] C. H. Song, J. Wu, C. Washington, B. M. Sadler,
+W.-L. Chao, and Y. Su, “Llm-planner: Few-
+shot grounded planning for embodied agents
+with large language models,” arXiv preprint
+arXiv:2212.04088, 2022.
+[51] L. P. Kaelbling and T. Lozano-Pérez, “Hierarchi-
+cal planning in the now,” in Workshops at the
+Twenty-Fourth AAAI Conference on Artiﬁcial
+Intelligence, 2010.
+[52] R. E. Fikes and N. J. Nilsson, “Strips: A new
+approach to the application of theorem proving
+to problem solving,” Artiﬁcial intelligence, 1971.
+[53] M. Toussaint, “Logic-geometric programming:
+An optimization-based approach to combined
+task and motion planning,” in Twenty-Fourth
+International Joint Conference on Artiﬁcial In-
+telligence, 2015.
+[54] D. Xu, S. Nair, Y. Zhu, J. Gao, A. Garg, L. Fei-
+Fei, and S. Savarese, “Neural task program-
+ming: Learning to generalize across hierarchi-
+cal tasks,” in 2018 IEEE International Conference
+on Robotics and Automation (ICRA), 2018.
+[55] N. Savinov, A. Dosovitskiy, and V. Koltun,
+“Semi-parametric topological memory for navi-
+gation,” arXiv preprint arXiv:1803.00653, 2018.
+[56] T. Silver, R. Chitnis, N. Kumar, W. McClinton,
+T. Lozano-Perez, L. P. Kaelbling, and J. Tenen-
+baum, “Inventing relational state and action ab-
+stractions for eﬀective and eﬃcient bilevel plan-
+ning,” arXiv preprint arXiv:2203.09634, 2022.
+[57] C. R. Garrett, C. Paxton, T. Lozano-Pérez, L. P.
+Kaelbling, and D. Fox, “Online replanning in
+belief space for partially observable task and
+motion problems,” in 2020 IEEE International
+Conference on Robotics and Automation (ICRA),
+2020.
+[58] B. Eysenbach,
+R. R. Salakhutdinov,
+and
+S. Levine, “Search on the replay buﬀer: Bridg-
+ing planning and reinforcement learning,” Ad-
+vances in Neural Information Processing Systems,
+2019.
+[59] D.-A. Huang, S. Nair, D. Xu, Y. Zhu, A. Garg,
+L. Fei-Fei, S. Savarese, and J. C. Niebles, “Neural
+task graphs: Generalizing to unseen tasks from
+a single video demonstration,” in Proceedings
+of the IEEE/CVF Conference on Computer Vision
+and Pattern Recognition, 2019.
+[60] D. Xu, A. Mandlekar, R. Martín-Martín, Y. Zhu,
+S. Savarese, and L. Fei-Fei, “Deep aﬀordance
+foresight: Planning through what can be done
+12
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+in the future,” in 2021 IEEE International Con-
+ference on Robotics and Automation (ICRA),
+pp. 6206–6213, IEEE, 2021.
+[61] B. Ichter, P. Sermanet, and C. Lynch, “Broadly-
+exploring, local-policy trees for long-horizon
+task planning,” Conference on Robot Learning
+(CoRL), 2021.
+[62] C. Agia, T. Migimatsu, J. Wu, and J. Bohg,
+“Taps: Task-agnostic policy sequencing,” arXiv
+preprint arXiv:2210.12250, 2022.
+[63] D. Shah, P. Xu, Y. Lu, T. Xiao, A. Toshev,
+S. Levine, and B. Ichter, “Value function spaces:
+Skill-centric state abstractions for long-horizon
+reasoning,” ICLR, 2022.
+[64] A. V. Nair, V. Pong, M. Dalal, S. Bahl, S. Lin,
+and S. Levine, “Visual reinforcement learning
+with imagined goals,” in Advances in Neural
+Information Processing Systems, 2018.
+[65] B. Wu, S. Nair, L. Fei-Fei, and C. Finn, “Example-
+driven model-based reinforcement learning for
+solving long-horizon visuomotor tasks,” arXiv
+preprint arXiv:2109.10312, 2021.
+[66] F. Xia, C. Li, R. Martín-Martín, O. Litany, A. To-
+shev, and S. Savarese, “Relmogen: Integrating
+motion generation in reinforcement learning
+for mobile manipulation,” in 2021 IEEE Interna-
+tional Conference on Robotics and Automation
+(ICRA), 2021.
+[67] D. Driess, O. Oguz, J.-S. Ha, and M. Toussaint,
+“Deep visual heuristics: Learning feasibility of
+mixed-integer programs for manipulation plan-
+ning,” in 2020 IEEE International Conference on
+Robotics and Automation (ICRA), pp. 9563–9569,
+IEEE, 2020.
+[68] A. Vaswani, N. Shazeer, N. Parmar, J. Uszkoreit,
+L. Jones, A. N. Gomez, Ł. Kaiser, and I. Polo-
+sukhin, “Attention is all you need,” Advances in
+neural information processing systems, vol. 30,
+2017.
+[69] M. Chevalier-Boisvert, L. Willems, and S. Pal,
+“Minimalistic gridworld environment for gym-
+nasium,” 2018.
+[70] A. Zeng, P. Florence, J. Tompson, S. Welker,
+J. Chien, M. Attarian, T. Armstrong, I. Krasin,
+D. Duong, V. Sindhwani, and J. Lee, “Trans-
+porter networks: Rearranging the visual world
+for robotic manipulation,” Conference on Robot
+Learning (CoRL), 2020.
+[71] M. Shridhar, L. Manuelli, and D. Fox, “Cli-
+port: What and where pathways for robotic
+manipulation,” in Conference on Robot Learning,
+pp. 894–906, PMLR, 2022.
+[72] J. Schulman, F. Wolski, P. Dhariwal, A. Radford,
+and O. Klimov, “Proximal policy optimization
+algorithms,” arXiv preprint arXiv:1707.06347,
+2017.
+[73] A. G. Barto and S. Mahadevan, “Recent ad-
+vances in hierarchical reinforcement learn-
+ing,” Discrete Event Dynamic Systems, vol. 13,
+p. 41–77, jan 2003.
+[74] J. Wei, X. Wang, D. Schuurmans, M. Bosma,
+E. Chi, Q. Le, and D. Zhou, “Chain of thought
+prompting elicits reasoning in large language
+models,” arXiv preprint arXiv:2201.11903, 2022.
+[75] L. Van der Maaten and G. Hinton, “Visualizing
+data using t-sne.,” Journal of machine learning
+research, vol. 9, no. 11, 2008.
+[76] A. Brohan, N. Brown, J. Carbajal, Y. Chebotar,
+J. Dabis, C. Finn, K. Gopalakrishnan, K. Haus-
+man, A. Herzog, J. Hsu, et al., “Rt-1: Robotics
+transformer for real-world control at scale,”
+arXiv preprint arXiv:2212.06817, 2022.
+[77] S. Reed, K. Zolna, E. Parisotto, S. G. Col-
+menarejo,
+A.
+Novikov,
+G.
+Barth-Maron,
+M. Gimenez, Y. Sulsky, J. Kay, J. T. Springen-
+berg, et al., “A generalist agent,” arXiv preprint
+arXiv:2205.06175, 2022.
+[78] L. Ouyang, J. Wu, X. Jiang, D. Almeida, C. L.
+Wainwright, P. Mishkin, C. Zhang, S. Agarwal,
+K. Slama, A. Ray, et al., “Training language mod-
+els to follow instructions with human feedback,”
+arXiv preprint arXiv:2203.02155, 2022.
+[79] A. Chowdhery, S. Narang, J. Devlin, M. Bosma,
+G. Mishra, A. Roberts, P. Barham, H. W. Chung,
+C. Sutton, S. Gehrmann, et al., “Palm: Scal-
+ing language modeling with pathways,” arXiv
+preprint arXiv:2204.02311, 2022.
+13
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+[80] A. Radford, J. W. Kim, C. Hallacy, A. Ramesh,
+G. Goh, S. Agarwal, G. Sastry, A. Askell,
+P. Mishkin,
+J. Clark,
+G. Krueger,
+and
+I. Sutskever, “Learning transferable visual
+models from natural language supervision,” in
+Proceedings of the 38th International Conference
+on Machine Learning (M. Meila and T. Zhang,
+eds.), vol. 139 of Proceedings of Machine
+Learning Research, pp. 8748–8763, PMLR,
+18–24 Jul 2021.
+[81] E. Jang, A. Irpan, M. Khansari, D. Kappler,
+F. Ebert, C. Lynch, S. Levine, and C. Finn, “Bc-z:
+Zero-shot task generalization with robotic imi-
+tation learning,” in Conference on Robot Learn-
+ing, pp. 991–1002, PMLR, 2021.
+[82] M. Shridhar, L. Manuelli, and D. Fox, “Perceiver-
+actor: A multi-task transformer for robotic ma-
+nipulation,” in Proceedings of the 6th Conference
+on Robot Learning (CoRL), 2022.
+[83] M. Minderer, A. Gritsenko, A. Stone, M. Neu-
+mann, D. Weissenborn, A. Dosovitskiy, A. Ma-
+hendran, A. Arnab, M. Dehghani, Z. Shen,
+et al., “Simple open-vocabulary object detec-
+tion with vision transformers,” arXiv preprint
+arXiv:2205.06230, 2022.
+14
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+A. Appendix
+A.1. Grounded Decoding Implementation Details
+We study three diﬀerent implementations of Grounded Decoding for each of the experimental domains.
+While each instantiation applied Grounded Decoding to long-horizon planning and behavior synthesis,
+diﬀerent components including language models and grounded models are used in each domain, as seen in
+Table 5. Grounded models used in these domains include Aﬀordance Functions (AF), Safety Functions (S),
+Preference Functions (P), and Open-Vocabulary Object Detectors (D).
+Tabletop Rearrangement (Sim)
+MiniGrid 2D Maze (Sim)
+Kitchen Mobile Manipulation (Real)
+LLM
+InstructGPT [78]
+InstructGPT
+InstructGPT + PaLM[79]
+Primitives
+CLIPort [71]
+PPO [72]
+RT-1 [76]
+Grounded Models
+AF + S + P
+AF
+D
+Table 5: Comparison between diﬀerent versions of Grounded Decoding implemented in three diﬀerent environments.
+A.2. Implementation Details of Simulated Tabletop Rearrangement
+A.2.1. Tasks
+There are a total of 20 tasks (templates of language instructions), listed in Table 6, grouped into three task
+category: Letters, Blocks&Bowls, and Box Packing. Three categories share a total of 57 objects. For Letters
+category, the goals are to rearrange the alphabetical letter objects such that they satisfy certain orders
+speciﬁed by the language instructions. At the beginning of each episode, task-relevant objects and a set
+of 1 to 3 randomly-sampled distractor objects (except for the Letters category) are initialized at random
+positions on the tabletop with ﬁxed orientations. A minimum 15cm distance is enforced between any two
+objects to avoid collision and penetration at initialization. To allow for automatic evaluations, a binary
+reward function is deﬁned for each task using ground-truth state of the objects. Furthermore, we implement
+scripted policies for each task to collect demonstrations for training the CLIPort baseline. For certain tasks,
+we also randomize the attributes mentioned in the given instructions, which can be found below:
+• ⟨word⟩: hi, world, left, right, top, down, love, you
+• ⟨corner/side⟩: left side, top left corner, top side, top right corner, bottom right corner, bottom side,
+bottom left corner
+A.2.2. Low-level Primitives
+We use CLIPort [71] as the low-level primitive that can be invoked by the LLM planner, as it shows promising
+results of generalization across free-form language instructions. Additionally, since the policy predicts
+per-pixel aﬀordance, it can be repurposed to serve as grounded models for planning for long-horizon tasks,
+which we leverage in this work. The single primitive policy is trained on 50,000 pre-collected demonstrations,
+across 10 training tasks, where each demonstration contains 1) language instruction of the format “pick
+up [x] and place it on [y]”, 2) top-down RGB-D observation of the current scene, 3) expert pick location
+expressed as pixel coordinates, and 4) expert place location expressed as pixel coordinates. The expert
+actions are obtained by accessing ground-truth object pose in the simulator.
+A.2.3. Language Model
+We use InstructGPT [78] (text-davinci-002), accessed through OpenAI API.
+A.2.4. Grounding Functions
+Aﬀordance Grounding Function (AF). The aﬀordance should be a function of the robot, the environment,
+and the underlying policy in order to accurately determine what is possible in the scene. Given scene
+15
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+image 푠and partially-decoded open-ended language instruction 퓁, the primitive policy CLIPort predicts
+unnormalized logits over the pixel space 푠pick, 푠place ∈ℝ480×640, respectively for the pick location and
+the place location. Therefore, for any observation 푠and instruction 퓁, we calculate the aﬀordance as
+푝AF(푠, 퓁) = max(푥,푦)∈480×640 (푠pick(푥, 푦) + 푠place(푥, 푦)). The aﬀordance grounding function is used for all tasks.
+Safety Grounding Function (S). World grounding for embodiment may not only be aﬀordances, it can also
+be crucial robotics functions like safety. While any safety function that can score a language instruction 퓁may
+be used, we implement a simple indicator to prevent the robot from interacting with knives and red boxes,
+which we use as hazardous objects in this domain: 푝S(푠, 퓁) = 1
+푍(1−핀[red or knife in 퓁])+ 휖
+푍핀[red or knife in 퓁],
+where 푍is the normalizing term and 휖is a small value for ensuring the joint probability does not collapse
+to 0. Safety grounding function is used for 3 tasks in Box Packing task family.
+Preference Grounding Function (P). Robots operating alongside humans should also be aware of human
+preferences, which often diﬀer based on the speciﬁc user. We choose two random objects (표1, 표2) as the
+preferred objects to be used for the household object sorting tasks. Note that unlike safety functions,
+preferences often come in the form of “soft requirement”. Therefore, the preference grounding function is
+implemented as 푝P(푠, 퓁) = 푥
+푍핀[표1 or 표2 in 퓁] + 푦
+푍(1 −핀[표1 or 표2 in 퓁]), where we choose 푥= 0.5 and 푦= 0.1
+for our experiments. More generic preference functions may also be learned or statistically calculated based
+on history of user data. Preference grounding function is used for 2 tasks in Box Packing task family.
+A.2.5. CLIPort Baseline
+As CLIPort [71] already takes as input a natural language instruction and is capable of directly outputting
+robot actions, it bears the question whether we need a high-level planner for completing long-horizon
+tasks. To this end, we additionally train two variants of multi-task CLIPort policy on 10 of the total 20 tasks
+as baselines (see Table 6 for the train/test split). One variant, which we referred as “CLIPort (Short)”, is
+trained only on single-step pick-and-place instructions of the format “pick up [x] and place it on [y]” on
+the 10 training tasks. The decomposed pick-and-place instructions are obtained from scripted planners.
+At evaluation time, the policy is fed in only the high-level instructions without any planners. The other
+variant, which we referred as “CLIPort (Long)”, is trained on the high-level instructions from the 10 training
+tasks (without decomposition from scripted planners). Similarly, at evaluation time, it is fed in only the
+high-level instructions and evaluated on both seen and unseen instructions. Both variants are trained on
+50,000 demonstrations, similar to the Grounded Decoding primitive. The goal of these baselines is to evaluate
+whether solitary language-conditioned policies can perform well on long-horizon tasks and generalize to
+new task instructions. Note that the CLIPort baselines are diﬀerent from the primitive used in Grounded
+Decoding, although they share the same architecture.
+16
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+A.2.6. Full Experimental Results in Simulated Tabletop Domain
+Below we show the full list of tasks and the full experimental results in the simulated tabletop domain. Each
+entry is the average success rate across 20 rollouts. The tasks with blue-colored background are seen tasks
+and the tasks with orange-colored background are the unseen tasks. Seen tasks may be used for training for
+supervised baselines (CLIPort) or may be used in the prompt for methods using language model planner.
+Note that for the “Box Packing” task category, although all tasks were seen in training or the prompts, we
+enforce additional safety and preference constraints for evaluation only at test time.
+CLIPort
++LLM
++Grounded Decoding
+Tasks
+푝G
+Short Long Ungrounded Greedy
+Beam
+Letters
+Put the letters in alphabetical order from left to right
+AF
+5%
+20%
+10%
+20%
+40%
+Spell as much of word as you can
+AF
+10%
+60%
+30%
+60%
+65%
+Separate the vowels from the remaining letters to the bottom side
+AF
+5%
+40%
+20%
+50%
+65%
+Put the letters in reverse alphabetical order from left to right
+AF
+15%
+10%
+15%
+25%
+25%
+Correctly spell out a sport using the present letters
+AF
+10%
+10%
+5%
+30%
+30%
+Sort the geometrically symmetrical letters to the bottom side
+AF
+5%
+10%
+15%
+35%
+50%
+Separate the consonants from the remaining letters to the bottom side
+AF
+0%
+0%
+25%
+25%
+25%
+Sort the letters less than "D" according to ASCII to the bottom side
+AF
+0%
+20%
+35%
+70%
+75%
+Blocks & Bowls
+Stack all the blocks
+AF
+5%
+90%
+30%
+75%
+90%
+Put all the blocks on the corner/side
+AF
+0%
+65%
+50%
+45%
+70%
+Put all the blocks in the bowls with matching colors
+AF
+0%
+30%
+25%
+60%
+70%
+Put the blocks in the bowls with mismatched colors
+AF
+25%
+30%
+45%
+30%
+55%
+Put all the blocks in diﬀerent corners
+AF
+0%
+5%
+40%
+50%
+60%
+Stack only the blocks of cool colors
+AF
+5%
+5%
+20%
+70%
+70%
+Stack only the blocks of warm colors
+AF
+0%
+10%
+15%
+45%
+35%
+Sort the primary color blocks to the left side
+AF
+0%
+0%
+20%
+25%
+30%
+Box Packing
+Pack the objects into the brown box
+AF + S
+20%
+40%
+5%
+100%
+90%
+Pack the objects into the boxes
+AF + S
+10%
+20%
+5%
+75%
+70%
+I’d like some snacks on the right side
+AF + P
+15%
+20%
+15%
+40%
+55%
+Pack me a picnic box
+AF + S + P 15%
+30%
+20%
+100%
+95%
+Table 6: Full Experimental Results in Simulated Tabletop Rearrangement Tasks. The tasks with blue-colored back-
+ground are seen tasks and the tasks with orange-colored background are the unseen tasks. *Box Packing tasks are all
+seen during training, but safety and preference requirements are only enforced during evaluation.
+17
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+A.3. Implementation Details of MiniGrid 2D Maze
+A.3.1. Environment Setup
+We use the open-source gym-minigrid suite of environments to evaluate our method with one simple
+change — instead of the default observation space which is a 7 × 7 egocentric window, our agent has access
+to entire grid — that allows us to simplify the tasks by removing partial observability [63].
+A.3.2. Tasks
+The tasks are grouped in three categories (please see Table 7 for example instructions):
+1. Easy: Simple tasks where the horizon is short (10-30 steps) and fully described by the textual instruction,
+e.g. OpenDoors and PutNext. The short horizon makes them relatively easy for a wide range of
+HRL algorithms. The instructions for these tasks generally spell out each individual skill, making them
+particularly easy for high-level planners based on language modeling.
+2. Medium: Combination of short and long horizon tasks (up to 80 steps) with step-by-step textual
+instructions, e.g. LockedRoom. While being signiﬁcantly longer, these tasks also tend to have
+instructions that spell out the low-level tasks (see Table 7).
+3. Hard: Complex, long horizon instructions (over 100 steps) with short, ambiguous instructions that
+necessitate multi-step reasoning and eﬃcient exploration, e.g. MultiRoom and BlockedUnlock.
+In addition to being long-horizon, the instructions in this case tend to be ambiguous and under-speciﬁed,
+e.g. "traverse through the rooms to get to the goal", which does not provide enough context for any
+blind planning agent.
+Diﬃculty
+Task Name
+Example Instruction
+Easy
+OpenDoors
+open door blue, then open door red
+PutNext
+move the red ball next to the green box
+Medium
+LockedRoom
+get the red key from the purple room, open the red door and go to the goal
+Hard
+MultiRoom
+traverse the rooms to get to the goal
+BlockedUnlock
+pick up the blue box
+Table 7: Example Instructions in Minigrid
+A.3.3. Language Model
+We use InstructGPT [78] (text-davinci-002), accessed through OpenAI API. The prompts used can
+be found in Section A.5.
+We found the prompts to be generally suﬃcient for solving the “seen” tasks, as well as “unseen” tasks,
+i.e. tasks that do not have an example in the context. Empirically, we did not ﬁnd any improvements by
+including more then 3 example tasks in the prompt — we hypothesize that this is likely due to the shared
+low-level primitives across tasks. For all Minigrid experiments presented in this paper, we used the prompt
+shown in Section A.5.
+A.3.4. Low-level Primitives
+To train low-level primitives, we train an RL agent to solve a wide range of short-horizon subtasks (under
+10 steps) that are shared across the various Minigrid tasks — go to <obj>, pick up <obj>, drop
+<obj>, open <obj>. Rather than training individual skills for each of them [63], we train a single
+multi-task policy that is conditioned on the CLIP embeddings [80] of the task strings. This scheme allows
+some robustness to synonyms and ambiguous task speciﬁcations, and has been widely used in learning
+language-grounded policies [81, 82].
+18
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+We train these primitives using PPO [72], as recommended by the environment developers [69]. Each
+of these skills are trained with a sparse outcome reward (+1 if a trajectory is successful, 0 otherwise). In
+addition to these low-level skills, we perform a form of hindsight relabeling where “substrings“ of the task
+strings are masked to allow generalization to partial strings, e.g. “go to red” may be interpreted as “go to red
+key” or “go to red door”, and our masking strategy allows the multi-task policy to execute tasks speciﬁed by
+partially complete strings, if necessary.
+A.3.5. Grounded Aﬀordance Function
+We use the task string-conditioned value function estimates from our learned policy to obtain a visually
+grounded aﬀordance function.
+A.3.6. Additional Qualitative Results
+Step 1: go to the purple door and open it
+Step 2: go to the green door and open it
+Step 3: go to the purple door and open it
+Step 4: go to the green door and open it
+Step 5: go to the green door and open it
+Step 6: go to the goal
+User
+Traverse the 
+rooms to get 
+to the goal.
+Language Model
+Grounded Model (Aﬀordance)
+Combined Score
+Step 1: go to the purple door and open it
+Step 2: go to the green key
+Step 3: pick up the green key
+Step 4: go to the green door and open it
+Step 5: go to the goal
+Get the green 
+key from the 
+purple room, 
+unlock the 
+green door and 
+go to the goal.
+Step 1: go to the obstacle
+Step 2: pick up the obstacle
+Step 3: place the obstacle
+Step 4: go to the blue key
+Step 5: pick up the blue key
+Step 6: go to the blue door and open it
+Step 8: drop the blue key
+Step 9: go to the purple box
+Step 10: pick up the purple box
+Pick up the 
+purple box.
+User
+User
+Figure 8: Minigrid Domain
+19
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+A.4. Implementation Details of Real-World Mobile Manipulation
+A.4.1. Tasks
+Instruction
+put an energy bar and water bottle on the table
+bring me a lime soda and a bag of chips
+Can you throw away the apple and bring me a coke
+bring me a 7up can and a tea
+move an multigrain chips to the table and an apple to the far counter
+move the lime soda, the sponge, and the water bottle to the table
+bring me an apple, a coke, and water bottle
+Table 8: List of unambiguous SayCan instructions
+Instruction
+I want to wipe some spill.
+Bring me a fruit
+Bring me a snack
+Bring me a bag of chips
+Bring me a bag of snack
+Bring me a bag of chips and something to wipe a spill
+Bring me a bag of chips and something to drink
+Bring me a bag of chips and a soda
+Human: I want a soda that is not coke, and a fruit.
+I want a fruit and a soda
+Table 9: List of ambiguous SayCan instructions
+A.4.2. Language Model
+For planning, we use PaLM [79], a 540B parameter language model trained on a large datasets that include
+high-quality web documents, books, Wikipedia, conversations, and GitHub code. Before planning, we use
+InstructGPT [78] (text-davinci-002), accessed through OpenAI API. to generate the (grounded)
+chain of thought.
+We used square bracket to indicate grounded decoding, as illustrated in Fig. 5. The prompts are shown in
+Listing 3.
+A.4.3. Low-level Primitives
+We use a combination of learned and scripted control policies for navigation and manipulation, following
+the implementation described in SayCan [40] and RT-1 [76]. The manipulation policies for the picking
+action are learned using Behavior Cloning (BC) on 68000 demonstrations and 12000 autonomous successes
+that were collected over the course of 11 months using a ﬂeet of 10 robots. The demonstrations are collected
+by teleoperators using VR headset controllers to track the motion of their hand, which is then mapped onto
+the robot’s end-eﬀector pose. The navigation policies are scripted, based on a ground-truth map as well as a
+learned perception module for collision avoidance and planning. The placing actions follow pre-computed
+motions only when preceded by a navigation policy. The Value Functions used by SayCan for aﬀordance
+20
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+grounding are provided by the 푄-networks of trained RL agents; we follow the RL training setup described
+in [40].
+A.4.4. Open-Vocabulary Detector Grounding Function
+We use owl-vit [83] as our grounding model. It takes in an image and a natural language query, and returns
+a list of bounding boxes with scores. We take the maximum score a the grounding function.
+More examples of object detection as a grounding function can be found in Fig. 9.
+Human: I want a soda that is not coke, and a fruit.
+Robot thought: I will find the [pepsi] and the [apple]
+Human: Bring me a bag 
+of chips.
+Robot thought: I will 
+bring the [kettle 
+chips]
+Human: I want to wipe 
+some spill.
+Robot thought: I will 
+bring the [paper towel]
+Figure 9: Additional examples of using open-vocabulary object detection as a grounding function in Real-World
+Kitchen Mobile Manipulation Domain.
+21
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+A.5. Prompts
+Listing 1: Grounded Decoding Prompt in Simulated Tabletop Rearrangement Domain
+Task: Pack all letter objects on the brown box
+Step 1: pick up the e and place it on the brown box
+Step 2: pick up the g and place it on the brown box
+Step 3: done
+Task: Put the letters on the tables in alphabetical order
+Step 1: pick up the c and place it on the bottom left side
+Step 2: pick up the d and place it on the right of c
+Step 3: pick up the i and place it on the right of d
+Step 4: pick up the l and place it on the right of i
+Step 5: pick up the w and place it on the right of l
+Step 6: done
+Task: Spell as much of "blue" as you can
+Step 1: pick up the l and place it on the bottom left side
+Step 2: pick up the the u and place it on the right of l
+Step 3: pick up the the e and place it on the right of u
+Step 4: done
+Task: Separate the vowels from the remaining letters
+Step 1: pick up the i and place it on the bottom side
+Step 2: pick up the o and place it on the bottom side
+Step 3: done
+Task: Stack all the blocks
+Step 1: pick up the brown block and place it on the pink block
+Step 2: pick up the cyan block and place it on the brown block
+Step 3: pick up the orange block and place it on the cyan block
+Step 4: pick up the gray block and place it on the orange block
+Step 5: done
+Task: Put all the blocks on the bottom left corner
+Step 1: pick up the white block and place it on the bottom left corner
+Step 2: pick up the yellow block and place it on the bottom left corner
+Step 3: pick up the green block and place it on the bottom left corner
+Step 4: pick up the blue block and place it on the bottom left corner
+Step 5: pick up the purple block and place it on the bottom left corner
+Step 6: done
+Task: Put all the blocks in the bowls with matching colors
+Step 1: pick up the cyan block and place it on the cyan bowl
+Step 2: pick up the purple block and place it on the purple bowl
+Step 3: pick up the brown block and place it on the brown bowl
+Step 4: pick up the pink block and place it on the pink bowl
+Step 5: done
+Task: Pack the items into any box
+Step 1: pick up the donut stick and place it on the red box
+Step 2: pick up the pepsi and place it on the brown box
+Step 3: pick up the peach and place it on the brown box
+Step 4: pick up the strawberry and place it on the red box
+Step 5: done
+Task: Pack the items on the table into the brown box
+Step 1: pick up the knife and place it on the brown box
+Step 2: pick up the plum and place it on the brown box
+Step 3: pick up the pepsi and place it on the brown box
+Step 4: pick up the cupcake and place it on the brown box
+Step 5: done
+Task: Pack the items on the table into the brown box
+Step 1: pick up the i and place it on the brown box
+Step 2: pick up the green block and place it on the brown box
+Step 3: pick up the l and place it on the brown box
+Step 4: done
+Task: Can you put some snacks on the right side for me?
+Step 1: pick up the plum and place it on the right side
+22
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Step 2: done
+Task: Can you pack my picnic box for me?
+Step 1: pick up the orange and place it on the picnic box
+Step 2: pick up the diet pepsi and place it on the picnic box
+Step 3: pick up the knife and place it on the picnic box
+Step 4: done
+23
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Listing 2: Grounded Decoding Prompt in MiniGrid 2D Maze Domain
+You are a 2D maze-solving agent with access to a variety of low-level skills such as picking
+up or dropping objects, navigating to doors/keys/boxes, and opening/closing doors. Here
+are some example tasks:
+Task: get the green key from the purple room, unlock the green door and go to the goal
+Step 1: go to the purple door and open it
+Step 2: go to the green key
+Step 3: pick up the key
+Step 4: go to the green door and open it
+Step 5: go to the goal.
+Task: pick up the purple box
+Step 1: go to the green obstacle
+Step 2: pick up the obstacle
+Step 3: place the obstacle
+Step 4: go to the blue key
+Step 5: pick up the blue key
+Step 6: go to the blue door and open it
+Step 8: drop the blue key
+Step 7: go to the purple box
+Step 8: pick up the purple box.
+Task: traverse the rooms to get to the goal
+Step 1: go to the purple door and open it
+Step 2: go to the green door and open it
+Step 3: go to the purple door and open it
+Step 4: go to the green door and open it
+Step 5: go to the green door and open it
+Step 6: go to the goal.
+Now your turn.
+24
+
+Grounded Decoding: Guiding Text Generation with Grounded Models for Robot Control
+Listing 3: Grounded Decoding Prompt in Real-World Kitchen Mobile Manipulation Domain
+The following objects are in the scene: 7up, apple, banana, mango, tea, multigrain chips,
+kettle chips, jalapeno chips, rice chips, coke, grapefruit soda, pepsi, redbull, energy
+bar, lime soda, sponge, paper towel, and water bottle.
+The following locations are in the scene: close counter, far counter, table, trash, bowl.
+The robot will always put object name in brackets [].
+Robot: I am a robot that can bring objects to you.
+Human: I am hungry.
+Robot thought: I will find the [multigrain chips].
+Robot plan: 1. Find the multigrain chips
+2. Pick up the multigrain chips
+3. Bring it to you
+4. Put it down
+5. Done
+Robot: I am a robot that can bring objects to you.
+Human: Throw away the fruit.
+Robot thought: I will find the [mango] and move it to the trash.
+Robot plan: 1. Find the mango
+2. Pick up the mango
+3. Go to the trash
+4. Put it down
+5. Done
+Robot: I am a robot that can bring objects to you.
+Human: (inject instruction).
+Robot thought:
+25
+

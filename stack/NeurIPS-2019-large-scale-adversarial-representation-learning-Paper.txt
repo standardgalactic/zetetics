@@ -1,0 +1,883 @@
+Large Scale Adversarial Representation Learning
+Jeff Donahue
+DeepMind
+jeffdonahue@google.com
+Karen Simonyan
+DeepMind
+simonyan@google.com
+Abstract
+Adversarially trained generative models (GANs) have recently achieved compelling
+image synthesis results. But despite early successes in using GANs for unsuper-
+vised representation learning, they have since been superseded by approaches based
+on self-supervision. In this work we show that progress in image generation quality
+translates to substantially improved representation learning performance. Our ap-
+proach, BigBiGAN, builds upon the state-of-the-art BigGAN model, extending it to
+representation learning by adding an encoder and modifying the discriminator. We
+extensively evaluate the representation learning and generation capabilities of these
+BigBiGAN models, demonstrating that these generation-based models achieve the
+state of the art in unsupervised representation learning on ImageNet, as well as in
+unconditional image generation. Pretrained BigBiGAN models – including image
+generators and encoders – are available on TensorFlow Hub1.
+1
+Introduction
+In recent years we have seen rapid progress in generative models of visual data. While these models
+were previously conﬁned to domains with single or few modes, simple structure, and low resolution,
+with advances in both modeling and hardware they have since gained the ability to convincingly
+generate complex, multimodal, high resolution image distributions [1, 17, 18].
+Intuitively, the ability to generate data in a particular domain necessitates a high-level understanding
+of the semantics of said domain. This idea has long-standing appeal as raw data is both cheap –
+readily available in virtually inﬁnite supply from sources like the Internet – and rich, with images
+comprising far more information than the class labels that typical discriminative machine learning
+models are trained to predict from them. Yet, while the progress in generative models has been
+undeniable, nagging questions persist: what semantics have these models learned, and how can they
+be leveraged for representation learning?
+The dream of generation as a means of true understanding from raw data alone has hardly been realized.
+Instead, the most successful approaches for unsupervised learning leverage techniques adopted from
+the ﬁeld of supervised learning, a class of methods known as self-supervised learning [4, 35, 32, 9].
+These approaches typically involve changing or holding back certain aspects of the data in some way,
+and training a model to predict or generate aspects of the missing information. For example, [34, 35]
+proposed colorization as a means of unsupervised learning, where a model is given a subset of the
+color channels in an input image, and trained to predict the missing channels.
+Generative models as a means of unsupervised learning offer an appealing alternative to self-
+supervised tasks in that they are trained to model the full data distribution without requiring any
+modiﬁcation of the original data. One class of generative models that has been applied to rep-
+resentation learning is generative adversarial networks (GANs) [11]. The generator in the GAN
+1 Models available at https://tfhub.dev/s?publisher=deepmind&q=bigbigan, with a Colab
+notebook demo at https://colab.research.google.com/github/tensorflow/hub/blob/master/
+examples/colab/bigbigan_with_tf_hub.ipynb.
+33rd Conference on Neural Information Processing Systems (NeurIPS 2019), Vancouver, Canada.
+
+discriminator D
+x
+E
+ˆz
+encoder E
+z
+G
+ˆx
+generator G
+x
+ˆx
+ˆz
+z
+x ∼Px
+ˆx ∼G(z)
+data
+z ∼Pz
+ˆz ∼E(x)
+latents
+F
+H
+J
+scores
+sx
+sz
+sxz
+P
+loss
+ℓ
+Figure 1: The structure of the BigBiGAN framework. The joint discriminator D is used to compute
+the loss ℓ. Its inputs are data-latent pairs, either (x ∼Px, ˆz ∼E(x)), sampled from the data
+distribution Px and encoder E outputs, or (ˆx ∼G(z), z ∼Pz), sampled from the generator G outputs
+and the latent distribution Pz. The loss ℓincludes the unary data term sx and the unary latent term sz,
+as well as the joint term sxz which ties the data and latent distributions.
+framework is a feed-forward mapping from randomly sampled latent variables (also called “noise”)
+to generated data, with learning signal provided by a discriminator trained to distinguish between
+real and generated data samples, guiding the generator’s outputs to follow the data distribution.
+The adversarially learned inference (ALI) [8] or bidirectional GAN (BiGAN) [5] approaches were
+proposed as extensions to the GAN framework that augment the standard GAN with an encoder
+module mapping real data to latents, the inverse of the mapping learned by the generator.
+In the limit of an optimal discriminator, [5] showed that a deterministic BiGAN behaves like an
+autoencoder minimizing ℓ0 reconstruction costs; however, the shape of the reconstruction error
+surface is dictated by a parametric discriminator, as opposed to simple pixel-level measures like the
+ℓ2 error. Since the discriminator is usually a powerful neural network, the hope is that it will induce
+an error surface which emphasizes “semantic” errors in reconstructions, rather than low-level details.
+In [5] it was demonstrated that the encoder learned via the BiGAN or ALI framework is an effective
+means of visual representation learning on ImageNet for downstream tasks. However, it used a
+DCGAN [26] style generator, incapable of producing high-quality images on this dataset, so the
+semantics the encoder could model were in turn quite limited. In this work we revisit this approach
+using BigGAN [1] as the generator, a modern model that appears capable of capturing many of the
+modes and much of the structure present in ImageNet images. Our contributions are as follows:
+• We show that BigBiGAN (BiGAN with BigGAN generator) matches the state of the art in
+unsupervised representation learning on ImageNet.
+• We propose a more stable version of the joint discriminator for BigBiGAN.
+• We perform a thorough empirical analysis and ablation study of model design choices.
+• We show that the representation learning objective also improves unconditional image
+generation, and demonstrate state-of-the-art results in unconditional ImageNet generation.
+• We open source pretrained BigBiGAN models on TensorFlow Hub2.
+2
+BigBiGAN
+The BiGAN [5] or ALI [8] approaches were proposed as extensions of the GAN [11] framework
+which enable the learning of an encoder that can be employed as an inference model [8] or feature
+representation [5]. Given a distribution Px of data x (e.g., images), and a distribution Pz of latents z
+2See footnote 1.
+2
+
+(usually a simple continuous distribution like an isotropic Gaussian N(0, I)), the generator G models
+a conditional distribution P(x|z) of data x given latent inputs z sampled from the latent prior Pz,
+as in the standard GAN generator [11]. The encoder E models the inverse conditional distribution
+P(z|x), predicting latents z given data x sampled from the data distribution Px.
+Besides the addition of E, the other modiﬁcation to the GAN in the BiGAN framework is a joint
+discriminator D, which takes as input data-latent pairs (x, z) (rather than just data x as in a standard
+GAN), and learns to discriminate between pairs from the data distribution and encoder, versus
+the generator and latent distribution. Concretely, its inputs are pairs (x ∼Px, ˆz ∼E(x)) and
+(ˆx ∼G(z), z ∼Pz), and the goal of the G and E is to “fool” the discriminator by making the two
+joint distributions PxE and PGz from which these pairs are sampled indistinguishable. The adversarial
+minimax objective in [5, 8], analogous to that of the GAN framework [11], was deﬁned as follows:
+min
+GE max
+D
+
+Ex∼Px,z∼EΦ(x) [log(σ(D(x, z)))] + Ez∼Pz,x∼GΦ(z) [log(1 −σ(D(x, z)))]
+	
+Under this objective, [5, 8] showed that with an optimal D, G and E minimize the Jensen-Shannon
+divergence between the joint distributions PxE and PGz, and therefore at the global optimum, the
+two joint distributions PxE = PGz match, analogous to the results from standard GANs [11].
+Furthermore, [5] showed that in the case where E and G are deterministic functions (i.e., the learned
+conditional distributions PG(x|z) and PE(z|x) are Dirac δ functions), these two functions are inverses
+at the global optimum: e.g., ∀x∈supp(Px) x = G(E(x)), with the optimal joint discriminator effectively
+imposing ℓ0 reconstruction costs on x and z.
+While the crux of our approach, BigBiGAN, remains the same as that of BiGAN [5, 8], we have
+adopted the generator and discriminator architectures from the state-of-the-art BigGAN [1] generative
+image model. Beyond that, we have found that an improved discriminator structure leads to better
+representation learning results without compromising generation (Figure 1). Namely, in addition to
+the joint discriminator loss proposed in [5, 8] which ties the data and latent distributions together, we
+propose additional unary terms in the learning objective, which are functions only of either the data x
+or the latents z. Although [5, 8] prove that the original BiGAN objective already enforces that the
+learnt joint distributions match at the global optimum, implying that the marginal distributions of
+x and z match as well, these unary terms intuitively guide optimization in the “right direction” by
+explicitly enforcing this property. For example, in the context of image generation, the unary loss
+term on x matches the original GAN objective and provides a learning signal which steers only the
+generator to match the image distribution independently of its latent inputs. (In our evaluation we
+will demonstrate empirically that the addition of these terms results in both improved generation and
+representation learning.)
+Concretely, the discriminator loss LD and the encoder-generator loss LEG are deﬁned as follows,
+based on scalar discriminator “score” functions s∗and the corresponding per-sample losses ℓ∗:
+sx(x) = θ⊺
+xFΘ(x)
+sz(z) = θ⊺
+zHΘ(z)
+sxz(x, z) = θ⊺
+xzJΘ(FΘ(x), HΘ(z))
+ℓEG(x, z, y) = y (sx(x) + sz(z) + sxz(x, z))
+y ∈{−1, +1}
+LEG(Px, Pz) = Ex∼Px,ˆz∼EΦ(x) [ℓEG(x, ˆz, +1)] + Ez∼Pz,ˆx∼GΦ(z) [ℓEG(ˆx, z, −1)]
+ℓD(x, z, y) = h(ysx(x)) + h(ysz(z)) + h(ysxz(x, z))
+y ∈{−1, +1}
+LD(Px, Pz) = Ex∼Px,ˆz∼EΦ(x) [ℓD(x, ˆz, +1)] + Ez∼Pz,ˆx∼GΦ(z) [ℓD(ˆx, z, −1)]
+where h(t) = max(0, 1 −t) is a “hinge” used to regularize the discriminator [22, 30] 3, also used in
+BigGAN [1]. The discriminator D includes three submodules: F, H, and J. F takes only x as input
+and H takes only z, and learned projections of their outputs with parameters θx and θz respectively
+give the scalar unary scores sx and sz. In our experiments, the data x are images and latents z are
+unstructured ﬂat vectors; accordingly, F is a ConvNet and H is an MLP. The joint score sxz tying x
+and z is given by the remaining D submodule, J, a function of the outputs of F and H.
+3We also considered an alternative discriminator loss ℓ′
+D which invokes the “hinge” h just once on the
+sum of the three loss terms – ℓ′
+D(x, z, y) = h(y (sx(x) + sz(z) + sxz(x, z))) – but found that this performed
+signiﬁcantly worse than ℓD above which clamps each of the three loss terms separately.
+3
+
+The E and G parameters Φ are optimized to minimize the loss LEG, and the D parameters Θ are
+optimized to minimize loss LD. As usual, the expectations E are estimated by Monte Carlo samples
+taken over minibatches.
+Like in BiGAN [5] and ALI [8], the discriminator loss LD intuitively trains the discriminator to
+distinguish between the two joint data-latent distributions from the encoder and the generator, pushing
+it to predict positive values for encoder input pairs (x, E(x)) and negative values for generator
+input pairs (G(z), z). The generator and encoder loss LEG trains these two modules to fool the
+discriminator into incorrectly predicting the opposite, in effect pushing them to create matching joint
+data-latent distributions. (In the case of deterministic E and G, this requires the two modules to invert
+one another [5].)
+3
+Evaluation
+Most of our experiments follow the standard protocol used to evaluate unsupervised learning tech-
+niques, ﬁrst proposed in [34]. We train a BigBiGAN on unlabeled ImageNet, freeze its learned
+representation, and then train a linear classiﬁer on its outputs, fully supervised using all of the training
+set labels. We also measure image generation performance, reporting Inception Score [28] (IS) and
+Fréchet Inception Distance [15] (FID) as the standard metrics there.
+3.1
+Ablation
+We begin with an extensive ablation study in which we directly evaluate a number of modeling
+choices, with results presented in Table 1. Where possible we performed three runs of each variant
+with different seeds and report the mean and standard deviation for each metric.
+We start with a relatively fully-ﬂedged version of the model at 128 × 128 resolution (row Base), with
+the G architecture and the F component of D taken from the corresponding 128 × 128 architectures
+in BigGAN, including the skip connections and shared noise embedding proposed in [1]. z is 120
+dimensions, split into six groups of 20 dimensions fed into each of the six layers of G as in [1]. The
+remaining components of D – H and J – are 8-layer MLPs with ResNet-style skip connections
+(four residual blocks with two layers each) and size 2048 hidden layers. The E architecture is the
+ResNet-v2-50 ConvNet originally proposed for image classiﬁcation in [13], followed by a 4-layer
+MLP (size 4096) with skip connections (two residual blocks) after ResNet’s globally average pooled
+output. The unconditional BigGAN training setup corresponds to the “Single Label” setup proposed
+in [23], where a single “dummy” label is used for all images (theoretically equivalent to learning a
+bias in place of the class-conditional batch norm inputs). We then ablate several aspects of the model,
+with results detailed in the following paragraphs. Additional architectural and optimization details are
+provided in Appendix A (supplementary material). Full learning curves for many results are included
+in Appendix D (supplementary material).
+Latent distribution Pz and stochastic E.
+As in ALI [8], the encoder E of our Base model is non-
+deterministic, parametrizing a distribution N(µ, σ). µ and ˆσ are given by a linear layer at the output
+of the model, and the ﬁnal standard deviation σ is computed from ˆσ using a non-negative “softplus”
+non-linearity σ = log(1 + exp(ˆσ)) [7]. The ﬁnal z uses the reparametrized sampling from [19],
+with z = µ + ϵσ, where ϵ ∼N(0, I). Compared to a deterministic encoder (row Deterministic E)
+which predicts z directly without sampling (effectively modeling P(z|x) as a Dirac δ distribution),
+the non-deterministic Base model achieves signiﬁcantly better classiﬁcation performance (at no cost
+to generation). We also compared to using a uniform Pz = U(−1, 1) (row Uniform Pz) with E
+deterministically predicting z = tanh(ˆz) given a linear output ˆz, as done in BiGAN [5]. This also
+achieves worse classiﬁcation results than the non-deterministic Base model.
+Unary loss terms.
+We evaluate the effect of removing one or both unary terms of the loss function
+proposed in Section 2, sx and sz. Removing both unary terms (row No Unaries) corresponds to the
+original objective proposed in [5, 8]. It is clear that the x unary term has a large positive effect on
+generation performance, with the Base and x Unary Only rows having signiﬁcantly better IS and
+FID than the z Unary Only and No Unaries rows. This result makes intuitive sense as it matches
+the standard generator loss. It also marginally improves classiﬁcation performance. The z unary
+term makes a more marginal difference, likely due to the relative ease of modeling relatively simple
+4
+
+distributions like isotropic Gaussians, though also does result in slightly improved classiﬁcation and
+generation in terms of FID – especially without the x term (z Unary Only vs. No Unaries). On the
+other hand, IS is worse with the z term. This may be due to IS roughly measuring the generator’s
+coverage of the major modes of the distribution (the classes) rather than the distribution in its entirety,
+the latter of which may be better captured by FID and more likely to be promoted by a good encoder
+E. The requirement of invertibility in a (Big)BiGAN could be encouraging the generator to produce
+distinguishable outputs across the entire latent space, rather than “collapsing” large volumes of latent
+space to a single mode of the data distribution.
+G capacity.
+To address the question of the importance of the generator G in representation learning,
+we vary the capacity of G (with E and D ﬁxed) in the Small G rows. With a third of the capacity
+of the Base G model (Small G (32)), the overall model is quite unstable and achieves signiﬁcantly
+worse classiﬁcation results than the higher capacity base model4 With two-thirds capacity (Small G
+(64)), generation performance is substantially worse (matching the results in [1]) and classiﬁcation
+performance is modestly worse. These results conﬁrm that a powerful image generator is indeed
+important for learning good representations via the encoder. Assuming this relationship holds in
+the future, we expect that better generative models are likely to lead to further improvements in
+representation learning.
+Standard GAN.
+We also compare BigBiGAN’s image generation performance against a standard
+unconditional BigGAN with no encoder E and only the standard F ConvNet in the discriminator, with
+only the sx term in the loss (row No E (GAN)). While the standard GAN achieves a marginally better
+IS, the BigBiGAN FID is about the same, indicating that the addition of the BigBiGAN E and joint
+D does not compromise generation with the newly proposed unary loss terms described in Section 2.
+(In comparison, the versions of the model without unary loss term on x – rows z Unary Only and
+No Unaries – have substantially worse generation performance in terms of FID than the standard
+GAN.) We conjecture that the IS is worse for similar reasons that the sz unary loss term leads to
+worse IS. Next we will show that with an enhanced E taking higher input resolutions, generation with
+BigBiGAN in terms of FID is substantially improved over the standard GAN.
+High resolution E with varying resolution G.
+BiGAN [5] proposed an asymmetric setup in which
+E takes higher resolution images than G outputs and D takes as input, showing that an E taking
+128 × 128 inputs with a 64 × 64 G outperforms a 64 × 64 E for downstream tasks. We experiment
+with this setup in BigBiGAN, raising the E input resolution to 256 × 256 – matching the resolution
+used in typical supervised ImageNet classiﬁcation setups – and varying the G output and D input
+resolution in {64, 128, 256}. Our results in Table 1 (rows High Res E (256) and Low/High Res G (*))
+show that BigBiGAN achieves better representation learning results as the G resolution increases, up
+to the full E resolution of 256 × 256. However, because the overall model is much slower to train
+with G at 256 × 256 resolution, the remainder of our results use the 128 × 128 resolution for G.
+Interestingly, with the higher resolution E, generation improves signiﬁcantly (especially by FID),
+despite G operating at the same resolution (row High Res E (256) vs. Base). This is an encouraging
+result for the potential of BigBiGAN as a means of improving adversarial image synthesis itself,
+besides its use in representation learning and inference.
+E architecture.
+Keeping the E input resolution ﬁxed at 256, we experiment with varied and often
+larger E architectures, including several of the ResNet-50 variants explored in [20]. In particular,
+we expand the capacity of the hidden layers by a factor of 2 or 4, as well as swap the residual block
+structure to a reversible variant called RevNet [10] with the same number of layers and capacity as
+the corresponding ResNets. (We use the version of RevNet described in [20].) We ﬁnd that the base
+ResNet-50 model (row High Res E (256)) outperforms RevNet-50 (row RevNet), but as the network
+widths are expanded, we begin to see improvements from RevNet-50, with double-width RevNet
+outperforming a ResNet of the same capacity (rows RevNet ×2 and ResNet ×2). We see further gains
+with an even larger quadruple-width RevNet model (row RevNet ×4), which we use for our ﬁnal
+results in Section 3.2.
+4Though the generation performance by IS and FID in row Small G (32) is very poor at the point we measured
+– when its best validation classiﬁcation performance (43.59%) is achieved – this model was performing more
+reasonably for generation earlier in training, reaching IS 14.69 and FID 60.67.
+5
+
+Encoder (E)
+Gen. (G)
+Loss L∗
+Results
+A.
+D.
+C.
+R.
+Var.
+η
+C.
+R.
+sxz sx sz Pz
+IS (↑)
+FID (↓)
+Cls. (↑)
+Base
+S
+50
+1
+128
+✓
+1
+96
+128
+✓
+✓✓N
+22.66 ± 0.18
+31.19 ± 0.37
+48.10 ± 0.13
+Deterministic E
+S
+50
+1
+128
+(-)
+1
+96
+128
+✓
+✓✓N
+22.79 ± 0.27
+31.31 ± 0.30
+46.97 ± 0.35
+Uniform Pz
+S
+50
+1
+128
+(-)
+1
+96
+128
+✓
+✓✓(U) 22.83 ± 0.24
+31.52 ± 0.28
+45.11 ± 0.93
+x Unary Only
+S
+50
+1
+128
+✓
+1
+96
+128
+✓
+✓(-) N
+23.19 ± 0.28
+31.99 ± 0.30
+47.74 ± 0.20
+z Unary Only
+S
+50
+1
+128
+✓
+1
+96
+128
+✓(-) ✓N
+19.52 ± 0.39
+39.48 ± 1.00
+47.78 ± 0.28
+No Unaries (BiGAN)
+S
+50
+1
+128
+✓
+1
+96
+128
+✓(-) (-) N
+19.70 ± 0.30
+42.92 ± 0.92
+46.71 ± 0.88
+Small G (32)
+S
+50
+1
+128
+✓
+1
+(32) 128
+✓
+✓✓N
+3.28 ± 0.18 247.30 ± 10.31 43.59 ± 0.34
+Small G (64)
+S
+50
+1
+128
+✓
+1
+(64) 128
+✓
+✓✓N
+19.96 ± 0.15
+38.93 ± 0.39
+47.54 ± 0.33
+No E (GAN) *
+(-)
+96
+128
+(-) ✓(-) N
+23.56 ± 0.37
+30.91 ± 0.23
+-
+High Res E (256)
+S
+50
+1 (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.45 ± 0.14
+27.86 ± 0.13
+50.80 ± 0.30
+Low Res G (64)
+S
+50
+1 (256)
+✓
+1
+96
+(64)
+✓
+✓✓N
+19.40 ± 0.19
+15.82 ± 0.06
+47.51 ± 0.09
+High Res G (256)
+S
+50
+1 (256)
+✓
+1
+96 (256) ✓
+✓✓N
+24.70
+38.58
+51.49
+ResNet-101
+S
+(101) 1 (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.29
+28.01
+51.21
+ResNet ×2
+S
+50
+(2) (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.68
+27.81
+52.66
+RevNet
+(V)
+50
+1 (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.33 ± 0.09
+27.78 ± 0.06
+49.42 ± 0.18
+RevNet ×2
+(V)
+50
+(2) (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.21
+27.96
+54.40
+RevNet ×4
+(V)
+50
+(4) (256)
+✓
+1
+96
+128
+✓
+✓✓N
+23.23
+28.15
+57.15
+ResNet (↑E LR)
+S
+50
+1 (256)
+✓
+(10) 96
+128
+✓
+✓✓N
+23.27 ± 0.22
+28.51 ± 0.44
+53.70 ± 0.15
+RevNet ×4 (↑E LR) (V)
+50
+(4) (256)
+✓
+(10) 96
+128
+✓
+✓✓N
+23.08
+28.54
+60.15
+Table 1: Results for variants of BigBiGAN, given in Inception Score [28] (IS) and Fréchet Inception
+Distance [15] (FID) of the generated images, and ImageNet top-1 classiﬁcation accuracy percentage
+(Cls.) of a supervised logistic regression classiﬁer trained on the encoder features [34], computed
+on a split of 10K images randomly sampled from the training set, which we refer to as the “trainval”
+split. The Encoder (E) columns specify the E architecture (A.) as ResNet (S) or RevNet (V), the
+depth (D., e.g. 50 for ResNet-50), the channel width multiplier (C.), with 1 denoting the original
+widths from [13], the input image resolution (R.), whether the variance is predicted and a z vector
+is sampled from the resulting distribution (Var.), and the learning rate multiplier η relative to the G
+learning rate. The Generator (G) columns specify the BigGAN G channel multiplier (C.), with 96
+corresponding to the original width from [1], and output image resolution (R.). The Loss columns
+specify which terms of the BigBiGAN loss are present in the objective. The Pz column speciﬁes the
+input distribution as a standard normal N(0, 1) or continuous uniform U(−1, 1). Changes from the
+Base setup in each row are highlighted in blue. Results with margins of error (written as “µ ± σ”)
+are the means and standard deviations over three runs with different random seeds. (Experiments
+requiring more computation were run only once.) (* Result for vanilla GAN (No E (GAN)) selected
+with early stopping based on best FID; other results selected with early stopping based on validation
+classiﬁcation accuracy (Cls.).)
+Decoupled E/G optimization.
+As a ﬁnal improvement, we decoupled the E optimizer from that of
+G, and found that simply using a 10× higher learning rate for E dramatically accelerates training
+and improves ﬁnal representation learning results. For ResNet-50 this improves linear classiﬁer
+accuracy by nearly 3% (ResNet (↑E LR) vs. High Res E (256)). We also applied this to our largest E
+architecture, RevNet-50 ×4, and saw similar gains (RevNet ×4 (↑E LR) vs. RevNet ×4).
+3.2
+Comparison with prior methods
+Representation learning.
+We now take our best model by trainval classiﬁcation accuracy from the
+above ablations and present results on the ofﬁcial ImageNet validation set, comparing against the state
+of the art in recent unsupervised learning literature. For comparison, we also present classiﬁcation
+results for our best performing variant with the smaller ResNet-50-based E. These models correspond
+to the last two rows of Table 1, ResNet (↑E LR) and RevNet ×4 (↑E LR).
+Results are presented in Table 2. (For reference, the fully supervised accuracy of these architectures
+is given in Appendix A, Table 1 (supplementary material).) Compared with a number of modern self-
+supervised approaches [25, 3, 34, 32, 9, 14] and combinations thereof [4], our BigBiGAN approach
+based purely on generative models performs well for representation learning, state-of-the-art among
+recent unsupervised learning results, improving upon a recently published result from [20] of 55.4%
+to 60.8% top-1 accuracy using rotation prediction pre-training with the same representation learning
+6
+
+Method
+Architecture
+Feature
+Top-1
+Top-5
+BiGAN [5, 35]
+AlexNet
+Conv3
+31.0
+-
+SS-GAN [2]
+ResNet-19
+Block6
+38.3
+-
+Motion Segmentation (MS) [25, 4]
+ResNet-101
+AvePool
+27.6
+48.3
+Exemplar (Ex) [6, 4]
+ResNet-101
+AvePool
+31.5
+53.1
+Relative Position (RP) [3, 4]
+ResNet-101
+AvePool
+36.2
+59.2
+Colorization (Col) [34, 4]
+ResNet-101
+AvePool
+39.6
+62.5
+Combination of MS+Ex+RP+Col [4]
+ResNet-101
+AvePool
+-
+69.3
+CPC [32]
+ResNet-101
+AvePool
+48.7
+73.6
+Rotation [9, 20]
+RevNet-50 ×4
+AvePool
+55.4
+-
+Efﬁcient CPC [14]
+ResNet-170
+AvePool
+61.0
+83.0
+BigBiGAN (ours)
+ResNet-50
+AvePool
+55.4
+77.4
+ResNet-50
+BN+CReLU
+56.6
+78.6
+RevNet-50 ×4
+AvePool
+60.8
+81.4
+RevNet-50 ×4
+BN+CReLU
+61.3
+81.9
+Table 2: Comparison of BigBiGAN models on the ofﬁcial ImageNet validation set against recent
+competing approaches with a supervised logistic regression classiﬁer. BigBiGAN results are selected
+with early stopping based on highest accuracy on our trainval subset of 10K training set images.
+ResNet-50 results correspond to row ResNet (↑E LR) in Table 1, and RevNet-50 ×4 corresponds to
+RevNet ×4 (↑E LR).
+Method
+Steps
+IS (↑)
+FID vs. Train (↓)
+FID vs. Val. (↓)
+BigGAN + SL [23]
+500K
+20.4 (15.4 ± 7.57)
+-
+25.3 (71.7 ± 66.32)
+BigGAN + Clustering [23]
+500K
+22.7 (22.8 ± 0.42)
+-
+23.2 (22.7 ± 0.80)
+BigBiGAN + SL (ours)
+500K
+25.38 (25.33 ± 0.17)
+22.78 (22.63 ± 0.23)
+23.60 (23.56 ± 0.12)
+BigBiGAN High Res E + SL (ours)
+500K
+25.43 (25.45 ± 0.04)
+22.34 (22.36 ± 0.04)
+22.94 (23.00 ± 0.15)
+BigBiGAN High Res E + SL (ours)
+1M
+27.94 (27.80 ± 0.21)
+20.32 (20.27 ± 0.09)
+21.61 (21.62 ± 0.09)
+Table 3: Comparison of our BigBiGAN for unsupervised (unconditional) generation vs. previously
+reported results for unsupervised BigGAN from [23]. We specify the “pseudo-labeling” method as
+SL (Single Label) or Clustering. For comparison we train BigBiGAN for the same number of steps
+(500K) as the BigGAN-based approaches from [23], but also present results from additional training
+to 1M steps in the last row and observe further improvements. All results above include the median
+m as well as the mean µ and standard deviation σ across three runs, written as “m (µ ± σ)”. The
+BigBiGAN result is selected with early stopping based on best FID vs. Train.
+architecture5 and feature, labeled as AvePool in Table 2, and matches the results of the concurrent
+work in [14] based on contrastic predictive coding (CPC).
+We also experiment with learning linear classiﬁers on a different rendering of the AvePool feature,
+labeled BN+CReLU, which boosts our best results with RevNet ×4 to 61.3% top-1 accuracy. Given
+the global average pooling output a, we ﬁrst compute h = BatchNorm(a), and the ﬁnal feature
+is computed by concatenating [ReLU(h), ReLU(−h)], sometimes called a “CReLU” (concatened
+ReLU) non-linearity [29]. BatchNorm denotes parameter-free Batch Normalization [16], where the
+scale (γ) and offset (β) parameters are not learned, so training a linear classiﬁer on this feature does
+not involve any additional learning. The CReLU non-linearity retains all the information in its inputs
+and doubles the feature dimension, each of which likely contributes to the improved results.
+Finally, in Appendix C (supplementary material) we consider evaluating representations by zero-
+shot k nearest neighbors classiﬁcation, achieving 43.3% top-1 accuracy in this setting. Qualitative
+examples of nearest neighbors are presented in Appendix C, Figure 11 (supplementary material).
+Unsupervised image generation.
+In Table 3 we show results for unsupervised generation with
+BigBiGAN, comparing to the BigGAN-based [1] unsupervised generation results from [23]. Note
+5Our RevNet ×4 architecture matches the widest architectures used in [20], labeled as ×16 there.
+7
+
+Figure 2: Selected reconstructions from an unsupervised BigBiGAN model (Section 3.3). Top row
+images are real data x ∼Px; bottom row images are generated reconstructions of the above image x
+computed by G(E(x)). Unlike most explicit reconstruction costs (e.g., pixel-wise), the reconstruction
+cost implicitly minimized by a (Big)BiGAN [5, 8] tends to emphasize more semantic, high-level
+details. Additional reconstructions are presented in Appendix B (supplementary material).
+that these results differ from those in Table 1 due to the use of the data augmentation method of [23]6
+(rather than ResNet-style preprocessing used for all results in our Table 1 ablation study). The lighter
+augmentation from [23] results in better image generation performance under the IS and FID metrics.
+The improvements are likely due in part to the fact that this augmentation, on average, crops larger
+portions of the image, thus yielding generators that typically produce images encompassing most
+or all of a given object, which tends to result in more representative samples of any given class
+(giving better IS) and more closely matching the statistics of full center crops (as used in the real data
+statistics to compute FID). Besides this preprocessing difference, the approaches in Table 3 have the
+same conﬁgurations as used in the Base or High Res E (256) row of Table 1.
+These results show that BigBiGAN signiﬁcantly improves both IS and FID over the baseline uncondi-
+tional BigGAN generation results with the same (unsupervised) “labels” (a single ﬁxed label in the
+SL (Single Label) approach – row BigBiGAN + SL vs. BigGAN + SL). We see further improvements
+using a high resolution E (row BigBiGAN High Res E + SL), surpassing the previous unsupervised
+state of the art (row BigGAN + Clustering) under both IS and FID. (Note that the image generation
+results remain comparable: the generated image resolution is still 128 × 128 here, despite the higher
+resolution E input.) The alternative “pseudo-labeling” approach from [23], Clustering, which uses
+labels derived from unsupervised clustering, is complementary to BigBiGAN and combining both
+could yield further improvements. Finally, observing that results continue to improve signiﬁcantly
+with training beyond 500K steps, we also report results at 1M steps in the ﬁnal row of Table 3.
+3.3
+Reconstruction
+As shown in [5, 8], the (Big)BiGAN E and G can reconstruct data instances x by computing the
+encoder’s predicted latent representation E(x) and then passing this predicted latent back through the
+generator to obtain the reconstruction G(E(x)). We present BigBiGAN reconstructions in Figure 2.
+These reconstructions are far from pixel-perfect, likely due in part to the fact that no reconstruction
+cost is explicitly enforced by the objective – reconstructions are not even computed at training
+time. However, they may provide some intuition for what features the encoder E learns to model.
+For example, when the input image contains a dog, person, or a food item, the reconstruction is
+often a different instance of the same “category” with similar pose, position, and texture – for
+example, a similar species of dog facing the same direction. The extent to which these reconstructions
+tend to retain the high-level semantics of the inputs rather than the low-level details suggests that
+BigBiGAN training encourages the encoder to model the former more so than the latter. Additional
+reconstructions are presented in Appendix B (supplementary material).
+6See the “distorted” preprocessing method from the Compare GAN framework: https://github.com/
+google/compare_gan/blob/master/compare_gan/datasets.py.
+8
+
+4
+Related work
+A number of approaches to unsupervised representation learning from images based on self-
+supervision have proven very successful. Self-supervision generally involves learning from tasks
+designed to resemble supervised learning in some way, but in which the “labels” can be created
+automatically from the data itself with no manual effort. An early example is relative location
+prediction [3], where a model is trained on input pairs of image patches and predicts their relative
+locations. Contrastive predictive coding (CPC) [32, 14] is a recent related approach where, given
+an image patch, a model predicts which patches occur in other image locations. Other approaches
+include colorization [34, 35], motion segmentation [25], rotation prediction [9, 2], GAN-based dis-
+crimination [26, 2], and exemplar matching [6]. Rigorous empirical comparisons of many of these
+approaches have also been conducted [4, 20]. A key advantage offered by BigBiGAN and other
+approaches based on generative models, relative to most self-supervised approaches, is that their
+input may be the full-resolution image or other signal, with no cropping or modiﬁcation of the data
+needed (though such modiﬁcations may be beneﬁcial as data augmentation). This means the resulting
+representation can typically be applied directly to full data in the downstream task with no domain
+shift.
+A number of relevant autoencoder and GAN variants have also been proposed. Associative com-
+pression networks (ACNs) [12] learn to compress at the dataset level by conditioning data on other
+previously transmitted data which are similar in code space, resulting in models that can “daydream”
+semantically similar samples, similar to BigBiGAN reconstructions. VQ-VAEs [33] pair a discrete
+(vector quantized) encoder with an autoregressive decoder to produce faithful reconstructions with a
+high compression factor and demonstrate representation learning results in reinforcement learning
+settings. In the adversarial space, adversarial autoencoders [24] proposed an autoencoder-style
+encoder-decoder pair trained with pixel-level reconstruction cost, replacing the KL-divergence reg-
+ularization of the prior used in VAEs [19] with a discriminator. In another proposed VAE-GAN
+hybrid [21] the pixel-space reconstruction error used in most VAEs is replaced with feature space
+distance from an intermediate layer of a GAN discriminator. Other hybrid approaches like AGE [31]
+and α-GAN [27] add an encoder to stabilize GAN training. An interesting difference between many
+of these approaches and the BiGAN [8, 5] framework is that BiGAN does not train the encoder or
+generator with an explicit reconstruction cost. Though it can be shown that (Big)BiGAN implicitly
+minimizes a reconstruction cost, qualitative reconstruction results (Section 3.3) suggest that this
+reconstruction cost is of a different ﬂavor, emphasizing high-level semantics over pixel-level details.
+5
+Discussion
+We have shown that BigBiGAN, an unsupervised learning approach based purely on generative mod-
+els, achieves state-of-the-art results in image representation learning on ImageNet. Our ablation study
+lends further credence to the hope that powerful generative models can be beneﬁcial for representation
+learning, and in turn that learning an inference model can improve large-scale generative models.
+In the future we hope that representation learning can continue to beneﬁt from further advances in
+generative models and inference models alike, as well as scaling to larger image databases.
+Acknowledgments
+The authors would like to thank Aidan Clark, Olivier Hénaff, Aäron van den Oord, Sander Dieleman,
+and many other colleagues at DeepMind for useful discussions and feedback on this work.
+References
+[1] Andrew Brock, Jeff Donahue, and Karen Simonyan. Large scale GAN training for high ﬁdelity natural
+image synthesis. In ICLR, 2019.
+[2] Ting Chen, Xiaohua Zhai, Marvin Ritter, Mario Lucic, and Neil Houlsby. Self-supervised GANs via
+auxiliary rotation loss. In CVPR, 2019.
+[3] Carl Doersch, Abhinav Gupta, and Alexei A. Efros. Unsupervised visual representation learning by context
+prediction. In ICCV, 2015.
+[4] Carl Doersch and Andrew Zisserman. Multi-task self-supervised visual learning. In ICCV, 2017.
+9
+
+[5] Jeff Donahue, Philipp Krähenbühl, and Trevor Darrell. Adversarial feature learning. In ICLR, 2017.
+[6] Alexey Dosovitskiy, Philipp Fischer, Jost Tobias Springenberg, Martin Riedmiller, and Thomas Brox.
+Discriminative unsupervised feature learning with exemplar convolutional neural networks. In NeurIPS,
+2014.
+[7] Charles Dugas, Yoshua Bengio, François Belisle, Claude Nadeau, and Rene Garcia. Incorporating
+second-order functional knowledge for better option pricing. In NeurIPS, 2000.
+[8] Vincent Dumoulin, Ishmael Belghazi, Ben Poole, Olivier Mastropietro, Alex Lamb, Martin Arjovsky, and
+Aaron Courville. Adversarially learned inference. In ICLR, 2017.
+[9] Spyros Gidaris, Praveer Singh, and Nikos Komodakis. Unsupervised representation learning by predicting
+image rotations. In ICLR, 2018.
+[10] Aidan N. Gomez, Mengye Ren, Raquel Urtasun, and Roger B. Grosse. The reversible residual network:
+Backpropagation without storing activations. In NeurIPS, 2017.
+[11] Ian Goodfellow, Jean Pouget-Abadie, Mehdi Mirza, Bing Xu, David Warde-Farley, Sherjil Ozair, Aaron
+Courville, and Yoshua Bengio. Generative adversarial nets. In NeurIPS, 2014.
+[12] Alex Graves, Jacob Menick, and Aäron van den Oord.
+Associative compression networks.
+In
+arXiv:1804.02476, 2018.
+[13] Kaiming He, Xiangyu Zhang, Shaoqing Ren, and Jian Sun. Identity mappings in deep residual networks.
+In ECCV, 2016.
+[14] Olivier J. Hénaff, Ali Razavi, Carl Doersch, S. M. Ali Eslami, and Aäron van den Oord. Data-efﬁcient
+image recognition with contrastive predictive coding. In arXiv:1905.09272, 2019.
+[15] Martin Heusel, Hubert Ramsauer, Thomas Unterthiner, Bernhard Nessler, and Sepp Hochreiter. GANs
+trained by a two time-scale update rule converge to a local Nash equilibrium. In NeurIPS, 2017.
+[16] Sergey Ioffe and Christian Szegedy. Batch normalization: Accelerating deep network training by reducing
+internal covariate shift. In arXiv:1502.03167, 2015.
+[17] Tero Karras, Samuli Laine, and Timo Aila. A style-based generator architecture for generative adversarial
+networks. In CVPR, 2019.
+[18] Diederik P. Kingma and Prafulla Dhariwal. Glow: Generative ﬂow with invertible 1x1 convolutions. In
+arXiv:1807.03039, 2018.
+[19] Diederik P. Kingma and Max Welling. Auto-encoding variational Bayes. In arXiv:1312.6114, 2013.
+[20] Alexander Kolesnikov, Xiaohua Zhai, and Lucas Beyer. Revisiting self-supervised visual representation
+learning. In arXiv:1901.09005, 2019.
+[21] Anders Boesen Lindbo Larsen, Søren Kaae Sønderby, Hugo Larochelle, and Ole Winther. Autoencoding
+beyond pixels using a learned similarity metric. In ICML, 2016.
+[22] Jae Hyun Lim and Jong Chul Ye. Geometric GAN. In arXiv:1705.02894, 2017.
+[23] Mario Lucic, Michael Tschannen, Marvin Ritter, Xiaohua Zhai, Olivier Bachem, and Sylvain Gelly.
+High-ﬁdelity image generation with fewer labels. In ICML, 2019.
+[24] Alireza Makhzani, Jonathon Shlens, Navdeep Jaitly, Ian Goodfellow, and Brendan Frey. Adversarial
+autoencoders. In ICLR, 2016.
+[25] Deepak Pathak, Ross Girshick, Piotr Dollár, Trevor Darrell, and Bharath Hariharan. Learning features by
+watching objects move. In CVPR, 2017.
+[26] Alec Radford, Luke Metz, and Soumith Chintala.
+Unsupervised representation learning with deep
+convolutional generative adversarial networks. In ICLR, 2016.
+[27] Mihaela Rosca, Balaji Lakshminarayanan, David Warde-Farley, and Shakir Mohamed. Variational ap-
+proaches for auto-encoding generative adversarial networks. In arXiv:1706.04987, 2017.
+[28] Tim Salimans, Ian Goodfellow, Wojciech Zaremba, Vicki Cheung, Alec Radford, and Xi Chen. Improved
+techniques for training GANs. In arXiv:1606.03498, 2016.
+10
+
+[29] Wenling Shang, Kihyuk Sohn, Diogo Almeida, and Honglak Lee. Understanding and improving convolu-
+tional neural networks via concatenated rectiﬁed linear units. In ICML, 2016.
+[30] Dustin Tran, Rajesh Ranganath, and David M. Blei. Hierarchical implicit models and likelihood-free
+variational inference. In NeurIPS, 2017.
+[31] Dmitry Ulyanov, Andrea Vedaldi, and Victor Lempitsky. It takes (only) two: Adversarial generator-encoder
+networks. In arXiv:1704.02304, 2017.
+[32] Aäron van den Oord, Yazhe Li, and Oriol Vinyals. Representation learning with contrastive predictive
+coding. In arXiv:1807.03748, 2018.
+[33] Aäron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu. Neural discrete representation learning. In
+arXiv:1711.00937, 2017.
+[34] Richard Zhang, Phillip Isola, and Alexei A. Efros. Colorful image colorization. In ECCV, 2016.
+[35] Richard Zhang, Phillip Isola, and Alexei A. Efros. Split-brain autoencoders: Unsupervised learning by
+cross-channel prediction. In CVPR, 2016.
+11
+
