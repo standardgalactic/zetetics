@@ -1,0 +1,1161 @@
+Soft Policy Optimization:
+Online Off-Policy RL for Sequence Models
+Taco Cohen * 1 David W. Zhang * 1 Kunhao Zheng 1 Yunhao Tang 1 Remi Munos 1 Gabriel Synnaeve 1
+Abstract
+RL-based post-training of language models is al-
+most exclusively done using on-policy methods
+such as PPO. These methods cannot learn from
+arbitrary sequences such as those produced ear-
+lier in training, in earlier runs, by human experts
+or other policies, or by decoding and exploration
+methods. This results in severe sample ineffi-
+ciency and exploration difficulties, as well as a
+potential loss of diversity in the policy responses.
+Moreover, asynchronous PPO implementations
+require frequent and costly model transfers, and
+typically use value models which require a large
+amount of memory. In this paper we introduce
+Soft Policy Optimization (SPO), a simple, scal-
+able and principled Soft RL method for sequence
+model policies that can learn from arbitrary on-
+line and offline trajectories and does not require
+a separate value model. In experiments on code
+contests, we shows that SPO outperforms PPO on
+pass@10, is significantly faster and more memory
+efficient, is able to benefit from off-policy data,
+enjoys improved stability, and learns more diverse
+(i.e. soft) policies.
+1. Introduction
+One of the key traits that distinguishes humans from other
+animals is our capacity for social learning and open-ended
+cultural evolution. Through the invention of writing and
+the internet, AI is now able to leverage the product of our
+cultural evolution by pretraining, yielding near human-level
+understanding of many subjects. Yet, the reinforcement
+learning stage, which holds the unique potential to surpass
+human-level performance, still requires repeating the ex-
+ploration process with each new training run – much like a
+species whose members are unable to learn from the discov-
+eries and mistakes of others.
+*Equal contribution
+1Meta Platforms, Inc..
+Correspon-
+dence to: Taco Cohen <tscohen@meta.com>, David W. Zhang
+<dwz@meta.com>.
+Copyright 2025 by the author(s).
+Indeed, although online on-policy RL methods such as PPO
+consistently outperform pure offline methods like DPO, they
+must re-discover good behaviour in each training run (Xu
+et al.; Rafailov et al., 2023; Schulman et al., 2017b). For
+hard prompts (e.g. a coding challenge), it can easily take
+thousands of rollouts to find a correct response (Wu et al.,
+2024; Brown et al., 2024). The resulting trajectory is then
+used to do a small clipped gradient update (lest the policy
+collapse), after which it is discarded. In order to get un-
+biased gradients and guarantee convergence, the rollouts
+must be performed using standard sampling because alter-
+native decoding or exploration methods result in off-policy
+trajectories. Clearly, then, it would be highly desirable to
+have RL methods that can learn from arbitrary previous
+experiences, as it would allow us to leverage exploration
+methods during training, and re-use hard-to-discover solu-
+tions from previous training runs. In this way, AI models
+become participants in the knowledge evolution process.
+In this paper we introduce Soft Policy Optimization (SPO),
+a principled and effective asynchronous online off-policy
+soft RL method. SPO leverages both online and offline data,
+and excels at learning policies with high entropy and high
+return. A key idea behind our method is what we call the
+Cumulative Q-Parameterization, which parameterizes the
+token-level soft action-value function in terms of policy and
+reference model log-probabilities.
+This unification of policy and value function saves a signifi-
+cant amount of memory. More importantly, we prove that a
+cumulatively parameterized Q-function satisfies both soft
+Bellman-consistency and path-consistency (Nachum et al.,
+2017) by construction, except at tokens where a reward is
+observed (in our case, only the last one). Hence, neither
+Q-learning nor path-consistency losses are needed for non-
+terminal tokens. We therefore explore a family of simple
+off-policy losses that we derive from first principles and
+which can be thought of equivalently as terminal Q-value
+regression or full-sequence path-consistency learning.
+We further prove that if either the policy or the value func-
+tion is optimal, then so is the other one. This allows us to
+flexibly combine policy-based and value-based losses (on
+both online and offline trajectories), with the understanding
+that all of them share the same optimum.
+1
+arXiv:2503.05453v1  [cs.LG]  7 Mar 2025
+
+Soft Policy Optimization
+We implement both PPO and a number of SPO variants
+in an asynchronous distributed RL framework (Gehring
+et al., 2024; Noukhovitch et al., 2024) and evaluate their
+performance on the CodeContests and TACO competitive
+programming benchmarks (Li et al., 2022; 2023). Our ex-
+periments demonstrate that SPO consistently outperforms
+PPO in terms of pass@10 scores, indicating that SPO learns
+more diverse policies in accordance with the soft RL theory
+on which our method is based. We also demonstrate that
+SPO can effectively leverage offline data in practice to speed
+up learning and yield improved results.
+Furthermore, we perform a number of ablations to study the
+effect of different SPO loss variants. To demonstrate the
+utility of combining different loss functions, we show that
+results can be improved by regressing the Q-values towards
+Monte-Carlo targets for a subset of tokens obtained via
+Pivotal Token Search (Abdin et al., 2024). Finally, because
+off-policy learning does not require frequent model transfer
+between compute nodes, we observe speedups of about 85%
+compared to PPO.
+2. Theoretical Results
+2.1. Setup & Basic Results
+We consider a simple setup, where the policy π(a|x) sees
+a prompt x (e.g. a programming problem), responds with
+a sequence of tokens (actions) a = a1, . . . , aT , and then
+receives a deterministic reward r(x, a) ∈{0, −1}, e.g.
+based on whether a solution passes all tests (r = 0) or
+not (r = −1). There is no observation beyond the prompt,
+no intermediate reward, no environment stochasticity, and
+no discounting. The ideas and methods in this paper can
+be generalized, but this setup simplifies the exposition and
+matches our current experimental setup.
+Following much recent work (Jaques et al., 2016; Ziegler
+et al., 2019; Rafailov et al., 2023), we consider the KL-
+regularized reward maximization problem (“Soft RL”),
+L(π) = Eπ[r] −β KL[π, π0],
+(1)
+where π0 is a reference policy, typically an instruction-tuned
+LLM that is also used to initialize π. It is well known that
+the optimum of L is given by
+π∗(a | x) = exp(r(x, a)/β) π0(a | x)/Z.
+(2)
+This can be shown by maximizing L(π) subject to a normal-
+ization constraint, or by recognizing L(π) as a variational
+bound on KL[π, π∗] (explained shortly).
+When β is small, the reward factor exp(r/β) will be close
+to 0 for failure (r = −1) and equal 1 for success (r = 0),
+thus acting as a (soft) constraint. Moreover, the target π∗
+will be approximately proportional to π0 on the set of suc-
+cessful a, thus (theoretically) preserving the full diversity of
+correct responses in π0 instead of hard-maxing the reward,
+which should benefit exploration. Clearly, learning all good
+responses to a query is a harder problem than learning only
+one good response, but should lead to a deeper understand-
+ing of the domain and a reduction in reliance on spurious
+correlations and memorization. Soft RL, which learns a
+high-entropy policy, is also more aligned with generative
+modelling objectives than classical hard RL that converges
+to a deterministic policy.
+Indeed, we can interpret π∗as a success-conditioned poste-
+rior (Levine, 2018). In this interpretation we view π0(a|x)
+as a prior over actions, and define the likelihood of an auxil-
+iary binary variable p(o = 1|x, a) = exp(r(x, a)/β) (well
+defined for r ≤0). We can think of o = 1 as “success” or
+“optimality”. By Bayes rule, the posterior is proportional to
+likelihood times prior, so p(a|x, o = 1) = π∗(a|x).
+The normalizing constant Z = Eπ0[exp(r/β)] can be ex-
+pressed in log-space as β log Z = Sβ
+π0[r] using the general-
+ized softmax operator:
+Sβ
+π0(a|x)[r] = β log
+X
+a
+π0(a|x) exp(r(x, a)/β)
+(3)
+Taking limits, we see that Sβ
+π[r] interpolates between the
+classical value function V π = Eπ[r] = S∞
+π [r] and the
+optimal value function V ∗= maxa[r] = S0
+π[r]. Hence, we
+can think of Sβ
+π0[r] as a generalized “soft” value function:
+V = Sβ
+π0(a|x)[r] = β log Z = β log p(o = 1|x).
+By expanding β KL[π, π∗] and rearanging terms, we find
+L(π) = V π −β KL[π, π0] = V −β KL[π, π∗],
+(4)
+This remarkable equation, which we have not found in the
+Soft RL literature, can be understood as the fundamental
+equation of variational inference expressed in RL notation.
+Because V is the (soft) value of π0, it is a constant with
+respect to optimization, so that maximizing L(π) is equiva-
+lent to minimizing KL[π, π∗], making it evident that π∗is
+indeed the optimum of L(π) as claimed before.
+2.2. Token-level Policy & Value Functions
+Since we wish to train a sequence model, we consider the
+token-level policy and value functions. Given a partial re-
+sponse a≤t = a1, . . . , at, we define the soft Q-value:
+Qt = Sβ
+π0(a>t|a≤t,x)[r] = β log p(o = 1|a≤t, x).
+Note that Q0 = V. Furthermore, we define the advantage
+At = Qt −Qt−1
+(5)
+The advantage of at can be interpreted as the change in
+log-likelihood of o = 1 (when following π0) that results
+from appending at to the sequence a<t.
+2
+
+Soft Policy Optimization
+By applying the sum and product rules of probability to
+Eq. 2, we find that the token-level optimal policy can be
+expressed as:
+π∗(at|a<t, x) = exp(At/β) π0(at|a<t, x)
+(6)
+Thus, the posterior π∗is an easily computable function of
+the Q or A-value of the prior π0.
+2.3. Path- & Bellman Consistency
+Taking logarithms of Eq. 6 we find that
+At = β log π∗(at|a<t, x) −β log π0(at|a<t, x)
+(7)
+Thus At tells us how much more likely at is under π∗
+compared to π0, and (by Eq. 5), how much more likely
+o = 1 is after adding at to the sequence a<t.
+Using the definition At = Qt −Qt−1 we find that for any
+interval t = t1, . . . , tk:
+tk
+X
+t=t1
+At = Qtk −Qt1−1,
+(8)
+That is, analogous to the fundamental theorem of calculus,
+integrating (summing) the change (in log-prob) at each time
+step yields the total change (see also Jenner et al. (2022)).
+This kind of equation, which relates the value function Q
+and the difference of policy log-probs A, has been called
+path consistency (Nachum et al., 2017).
+Consider now Eq. 8 for the whole sequence (i.e. t1 =
+1, tk = T). Rearanging terms and using QT = r we obtain
+a forward and backward expression for Qt:
+Qt = Q0 +
+t
+X
+t′=1
+At′ = r −
+T
+X
+t′=t
+At′
+(9)
+The forward equations says that the sequence of Qt values
+can be obtained by a cumulative sum of the advantages.
+By definition of At (eq. 5) we have Qt+1 = Qt + At+1.
+Using this fact one can show that Q satisfies the following
+Bellman-like consistency equation:
+Sβ
+π0[Qt+1] = Sβ
+π0[At+1] + Qt = Qt
+(10)
+where the subscript π0 refers to the next-token distribution
+π0(at+1|a≤t, x). Like the Bellman equations in classical
+(hard) RL, this equation relates the values at the next time
+step (weighted by π0) to the value at the current time step.
+(note that there is no instantaneous reward because we only
+consider terminal rewards in our setup). Since Sβ interpo-
+lates between E and max, the soft Bellman equation gener-
+alizes both the Bellman evaluation and optimality equations.
+Path-consistency is a property that holds for every trajec-
+tory or contiguous sub-trajectory, regardless of how it was
+produced. It relates the Q values and policy log-probs, eval-
+uated at specific token values at. By contrast, Bellman
+consistency relates the Qt-value of a≤t to the Qt+1 value
+for all possible next tokens at+1, using a policy (in our case
+π0) to weigh the different possibilities.
+2.4. The Cumulative Q-Parameterization
+So far, we have discussed relations between the log-probs
+and value functions associated with the optimal and refer-
+ence policy. Now, let us consider an arbitrary sequence
+policy πθ(a | x) = Q
+t πθ(at | a<t, x) parameterized by θ.
+Based on the expression of At as a difference of policy
+log-probs (Eq. 7), we propose to estimate the advantage as
+Aθ
+t ≡β (log πθ(at | a<t, x) −log π0(at | a<t, x)) . (11)
+Notice that when initializing πθ ←π0, the advantage esti-
+mates start off at 0. Now, based on the expression of At as a
+difference of Q-values (Eq. 5), and using the result of Eq. 9,
+we define the cumulative Q-parameterization as:
+Qθ
+t ≡bQ0 +
+t
+X
+t′=1
+Aθ
+t′ = Qθ
+t−1 + Aθ
+t ,
+(12)
+That is, we compute all Qθ
+t as a cumulative sum of log-prob
+differences (advantages), plus an initial value estimate. The
+initial value of the prompt Vθ = Qθ
+0 = bQ0 is estimated
+once before training using Monte-Carlo sampling from π0
+(see Sec. 3.1.3). One could also estimate Q0 online using a
+running average or using πθ (e.g. as a log-prob or difference
+at the last prompt token or summed over the prompt), but
+learning accurate generalizing value functions is hard.
+As argued by Tang et al. (2023), parameterizing the value
+Qθ
+t in terms of previous value plus advantage is statistically
+advantageous, since Qt−1 can share statistical power from
+all visits to a<t whereas Aθ
+t only needs to learn whether at
+was a relative improvement (thus sidestepping the hard task
+of estimating the magnitude of Qt).
+Theorem 2.1. Qθ = Q iff πθ = π∗and bQ0 = Q0.
+Proof. The cumulative Q-parameterization defines an invert-
+ible map from bQ0 and policy log-probabilities to Qθ
+t -values,
+so either one determines the other. Moreover, by Eq. 7 and
+Eq. 9, the true / optimal value Q and π∗are related by the
+same mapping. Hence, if Qθ = Q then the policy is optimal
+(and trivially bQ0 = Q0), and vice versa.
+It follows from Theorem 2.1 that we can freely combine
+policy-based and value-based RL methods for improving
+πθ and Qθ, as they will converge on the same optimal θ∗.
+A natural idea would be to use temporal difference (TD)
+or path-consistency (PC) losses. However, the following
+3
+
+Soft Policy Optimization
+theorems show that Bellman consistency and path consis-
+tency are already satisfied by construction, making a loss
+unnecessary.
+Theorem 2.2. For any θ and any sequence of tokens
+a1, . . . , aT , the cumulative Q-function Qθ
+t satisfies Bellman
+consistency for all 0 ≤t ≤T. That is,
+Qθ
+t = Sβ
+π0(at+1|a≤t,x)[Qθ
+t+1]
+Proof. By definition, we have Qθ
+t+1 = Qθ
+t + Aθ
+t+1. Fur-
+thermore, as with the expectation and max operators, we
+can take out additive constants from the softmax, so
+Sβ
+π0[Qθ
+t + Aθ
+t+1] = Sβ
+π0[Aθ
+t+1] + Qθ
+t
+It remains to show that Sβ
+π0[Aθ
+t+1] = 0:
+Sβ
+π0[Aθ
+t+1] = β log
+X
+at+1
+π0(at+1|a≤t)πθ(at+1|a≤t)
+π0(at+1|a≤t)
+= β log
+X
+at+1
+πθ(at+1|a≤t) = 0.
+(we left out conditioning on the prompt x for brevity)
+Note that the theorem only speaks about internal consis-
+tency between the Q-values produced by the model. At
+time t = T we obtain an external reward and since there
+is no guarantee that Qθ
+T = Qt = r we will in general
+get an error at that time. However, the intermediate TD
+errors Qθ
+t −Sβ
+π0[Qθ
+t+1] are always 0. So although standard
+Q-learning and even methods such as Q-Transformer (Cheb-
+otar et al., 2023) that are used with transformers need to
+learn Bellman-consistency even for intermediate steps, our
+Q-parameterization is internally consistent by construction.
+We have a similar result for path consistency:
+Theorem 2.3. For any θ and any sequence of tokens
+a1, . . . , aT , the cumulative Q-function Qθ
+t satisfies path
+consistency on any interval t1, . . . , tk with t1 ≤tk ≤T.
+That is,
+tk
+X
+t=t1
+Aθ
+t = Qθ
+tk −Qθ
+t1−1,
+Proof. Substitute the definition of Qθ
+t (Eq. 12) and cancel
+shared terms bQθ
+0 +Pt1−1
+t′=1 Aθ
+t′, leaving only Ptk
+t=t1 Aθ
+t .
+In path consistency learning (Nachum et al., 2017), one
+learns a separate policy and value function, and attempts to
+enforce path consistency on random intervals by learning.
+When using the cumulative Q-parameterization, there is no
+point to this because path consistency is guaranteed.
+Theorem 2.4. If Qθ
+T = QT for all a, then Qθ = Q.
+Proof. By induction, assume Qθ
+t+1 = Qt+1 for all at+1.
+Then by Theorem 2.2,
+Qθ
+t = Sβ
+π0[Qθ
+t+1] = Sβ
+π0[Qt+1] = Qt.
+Hence Qθ = Q.
+Together with Theorem 2.1, this demonstrates that if we can
+learn the terminal Qθ
+T for all sequences, we have learned
+the true value function and optimal policy.
+3. Soft Policy Optimization
+SPO is a hybrid online off-policy method, which means we
+can learn from on-policy trajectories as well arbitrary offline
+data. A key feature of SPO is the use of the cumulative Q-
+Parameterization (Sec. 2.4), which means we compute Qθ
+t
+as the value of the prompt bQ0 (estimated by sampling from
+π0 before trainig) plus the cumulative sum of log-prob dif-
+ferences Aθ
+t = β(πθ(at|a<t, x)−log π0(at|a>t, x)). Thus,
+quite intuitively, when the policy log prob for at exceeds
+the reference model log prob (i.e. it is considered a good
+action by πθ), we have a positive advantage for at and an
+increase in value Qθ
+t .
+3.1. Learning Objectives
+The results of the previous section show that a cumulative
+Q function (Eq. 11 and Eq. 12) is always self-consistent
+in both the Bellman- and path-consistency sense. What
+remains to be learned is consistency with observed rewards.
+The terminal QT is equal to the terminal reward r(x, a).
+Hence, we wish to make Qθ
+T satisfy (for all x, a):
+Qθ
+T ≡bQ0 +
+T
+X
+t=1
+Aθ
+t ≈r,
+(13)
+where Qθ
+T is defined by the cumulative Q-parameterization,
+meaning bQ0 is a Monte-Carlo estimate of the soft value
+of the prompt x (computed prior to training), and Aθ
+t =
+β(log πθ −log π0)t (Eq. 11).
+By rearranging terms, we can derive from Eq. 13 various
+equations, each of which can be turned into an off-policy
+learning objective by choosing a loss function. Below we
+first discuss the choice of loss function (Sec. 3.1.1), and
+then consider the various off-policy learning objectives
+(Sec. 3.1.2). Finally, we also discuss the use of Monte-
+Carlo regression targets (Sec. 3.1.3) and policy gradients
+(Sec. 3.1.4). Here we will simply present all options; in
+Sec. 5 we will systematically compare them.
+3.1.1. LOSS FUNCTIONS
+Below we discuss different regression problems, each of
+which is defined by a prediction ˆy that we want to bring
+4
+
+Soft Policy Optimization
+close to a target y (for instance, regressing Qθ
+T towards r).
+To measure the discrepancy, we can employ a squared loss
+L(ˆy, y) = (ˆy −y)2. Where ˆy and y are log-probabilities,
+we can also use a binary cross-entropy loss: L(ˆy, y) =
+−xˆy −(1 −x) log(1 −exp(ˆy)), with targets x = exp y.
+Clipping: In some cases, the prediction ˆy (and target y) may
+be larger than 0 even though a log-probability can never be.
+This results in infinities in the cross-entropy, so we use clip-
+ping on both y and ˆy. We clip the prediction ˆy close to
+zero, and propagate gradient straight-through, ignoring clip-
+ping on the backward pass. We further modify the positive
+term of the cross-entropy from −xˆy to x relu(−ˆy) so as to
+remove any incentive to increase ˆy above 0.
+Warping: For any injective (difference-preserving) map σ,
+σ(u) = σ(v) ⇒u = v. Hence, for any equation implied
+by Eq. 13, we can apply σ to both sides and aim to make
+the resulting equation hold. In our experiments, we consider
+specifically the case where σ is the sigmoid function.
+3.1.2. OFF-POLICY OBJECTIVES
+Terminal Q-Regression: Most obviously, we can regress
+Qθ
+T towards the observed reward using some loss function
+L(Qθ
+T , r). In Q-learning and other TD-methods, one typ-
+ically regresses the Q-function towards TD targets using
+a squared loss. Since Qt has an interpretation as a log-
+probability Qt = log p(o = 1 | a≤t, x), we can also use a
+binary cross-entropy loss. Since Qθ
+t may exceed 0, we use
+clipping as described in the previous section.
+Non-Terminal Q-Regression: Rearranging terms in Eq. 13,
+we can also attempt to make Qθ
+t = bQ0 + Pt
+t′=1 Aθ
+t ≈
+r −PT
+t′=t+1 Aθ
+t′ hold. That is, we regress Qθ
+t towards
+targets Rt defined as Rt = detach(r −PT
+t′=t+1 Aθ
+t′). We
+refer to this as reverse-Q targets because Rt is just a time-
+reversed estimate of Qt. Intuitively, the target for Qθ
+t is the
+reward, adjusted for the quality (advantage) of later actions.
+If we obtained a low reward but this can be explained by
+later actions, perhaps Qθ
+t should still take a relatively high
+value.
+When using squared loss L = PT
+t=1(Qθ
+t −Rt)2, the error
+at each term is equal to the terminal one: Qθ
+t −Rt = Qθ
+T −r.
+However, because we detach the gradients of the targets Rt,
+the gradients for the t-th term only flow into Qθ
+t, leading
+to larger gradients for earlier terms. Moreover, when using
+cross-entropy loss, the error itself is different for each term
+because the target Rt and predictor Qt enter into the cross-
+entropy formula in exponentiated and non-exponentiated
+form, respectively.
+Advantage Regression: Finally, we can subtract bQ0 from
+Eq. 13 to obtain PT
+t=1 Aθ
+t = r −bQ0. Again the error is
+equivalent to terminal Q-regression, and in this case the
+gradients are also equivalent. Hence, we only consider
+advantage regression in combination with sigmoid-warping
+and a binary cross-entropy loss.
+3.1.3. MONTE-CARLO TARGETS
+As mentioned, we use Monte-Carlo sampling to estimate
+bQ0. Additionally, we experiment with directly regressing
+Qθ
+t towards a Monte-Carlo estimate of Qt. Recall that
+Qt = Sβ
+π0[r] = β log Eπ0[exp (r/β)], i.e. it is the loga-
+rithm of the expectation of the exponentiated reward. Ap-
+proximating the expectation using samples from π0 leads
+to a consistent but biased estimation of Qt, due to the loga-
+rithm. However, when using the cross-entropy loss, we get
+an unbiased estimate of the loss as long as the exponentiated
+value targets are unbiased, which they are.
+In order to estimate bQ0, we take 800 samples from π0 for
+each prompt, before training. Since we assume our reward
+to be binary with r ∈{0, −1}, we can estimate the success
+probability bS0 ≈p(r = 0|x) and compute exp (Q0/β) =
+Eπ0[exp(r/β)] ≈bS0 exp(0/β) + (1 −bS0) exp(−1/β).
+In order to test the utility of regressing Qθ
+t directly towards
+Monte-Carlo estimates, we annotate some of our offline
+data (described in Sec. 5) with estimates of the success
+probability St (from which a Qt-estimate can be derived as
+above). Since samples are taken from the reference model,
+early tokens in successful but improbable trajectories may
+produce failed rollouts with overwhelming probability, thus
+providing little learning signal. Hence, we wish to focus
+the computational effort on “interesting” tokens, where the
+success probability changes significantly.
+For this purpose, we use Pivotal Token Search as described
+in Abdin et al. (2024). This algorithm searches for pivotal
+tokens (where the success probability changes significantly)
+by recursively bisecting the trajectory, performing K roll-
+outs to estimate St at the bisection point, and recursing if the
+endpoints of the current interval have sufficiently different
+St. In this way, a number of pivotal tokens are produced,
+and more importantly for our purposes, a sparse set of St-
+estimates that can be used as targets for Qθ
+t .
+3.1.4. PROXIMAL POLICY OPTIMIZATION
+Our primary baseline is PPO (Schulman et al., 2017b), im-
+plemented following the approach in (Gehring et al., 2024).
+PPO uses GAE (Schulman et al., 2016) to estimate the ad-
+vantage based on a learned value model, and uses a clipped
+loss function to avoid excessive gradient updates.
+Importance Weighting: Because we use asynchronous
+RL (Sec. 3.2) with worker nodes performing rollouts and
+trainer nodes operating simultaneously, rollouts may be
+generated using a slightly out of date policy parameter
+θold, making them somewhat off-policy. For limited de-
+5
+
+Soft Policy Optimization
+grees of staleness, a simple importance weighting correc-
+tion suffices to make the gradients unbaised without in-
+troducing too much variance. This is done by evaluating
+the policy probabilities πθold on the workers, and sending
+them to the trainers, which compute an importance weight
+wi = πθ(at|a<t, x)/πθold(at|a<t, x) and multiplies the loss
+by this weight.
+3.2. Asynchronous On- & Off-policy RL Framework
+We perform asynchronous RL training in a distributed
+system consisting of trainer and worker nodes (each con-
+taining 8 H100 GPUs), similar to Gehring et al. (2024);
+Noukhovitch et al. (2024).
+The workers continuously perform rollouts using a batched
+and throughput-optimized inference implementation and
+parallelized sandboxed code execution for reward evaluation.
+The resulting trajectories (token sequences and rewards) are
+sent to the trainers.
+The trainers collect a batch of trajectories (from workers and
+optionally from offline sources), and do a training update us-
+ing one of the available loss functions. In general this will re-
+quire a forward pass on the latest policy and reference model,
+as well as the value model for PPO, followed by a backward
+pass on the latest policy and value model (if applicable).
+After a certain number of steps (model update interval), we
+send new model weights from the trainers to the workers, in
+order to enable approximately on-policy rollouts. Compared
+to a synchrounous approach – where the same nodes alter-
+nate between collecting rollouts and doing training updates
+– the asynchronous approach yields much higher throughput
+and continuously high GPU utilization.
+The workers are configurable so that they can do on-policy
+rollouts (temperature 1, using the latest policy), or use al-
+ternative decoding methods such as temperature and top-p
+sampling using the latest or reference policy. Likewise, the
+trainers can be configured to use a mix of offline trajec-
+tories loaded from disk and online data produced by the
+workers. Trainers can also be configured to use different
+loss functions (optionally depending on the source of data)
+including the ones discussed in Sec. 3.1. When using on-
+policy losses, we set a low value for model update interval,
+and although there is no strict guarantee that training trajec-
+tories are strictly on-policy, we have found that low values
+such as 1 – 4 lead to stable training.
+4. Related Work
+Our work is based on the Soft RL framework, also known as
+RL-as-inference, maximum-entropy RL and KL-divergence
+control (Todorov, 2008; Ziebart et al., 2008; Kappen et al.,
+2009; Schulman et al., 2017a; Levine, 2018; L´azaro-Gredilla
+et al., 2024). It is the basis of several popular methods, such
+as Soft Q-Learning and Soft Actor-Critic (Haarnoja et al.,
+2018; 2017). Most recent works on RL for LLMs, including
+RLHF (Ziegler et al., 2019; Ouyang et al., 2022), use the
+KL-regularized reward maximization soft RL objective.
+The off-policy objectives we use can be understood either as
+Q-regression towards (future-corrected) empirical targets,
+or as path-consistency losses applied to the entire trajectory
+(since they relate the values bQ0 and QT = r at the begin-
+ning and end of the trajectory to the policy log-probs along
+the trajectory). There is however a fundamental difference
+to path-consistency learning as explored by Nachum et al.
+(2017), because in their case the policy and value function
+are learned separately, and path-consistency must be en-
+forced by a loss on every sub-trajectory t1, . . . , tk. In our
+case, path-consistency is satisfied on all sub-trajectories,
+and learning only happens on the entire trajectory (with the
+terminal QT -value replaced by the observed reward r).
+Similarly, although we learn a soft Q function, SPO is dif-
+ferent from Soft Q-Learning (Haarnoja et al., 2017), be-
+cause we do not use Bellman backups (since according to
+Theorem 2.2, all TD errors are zero). Other works have ex-
+plored Q-Learning with transformers (Chebotar et al., 2023),
+but again these methods need to learn internal Bellman-
+consistency whereas for SPO it is guaranteed.
+Expressions involving a sum of log-probability differences
+log πθ −log π0 have appeared in a number of recent
+works, most notably DPO (Rafailov et al., 2023) and DRO
+(Richemond et al., 2024). However these methods differ in
+that DPO is a preference-optimization method (requiring
+preference pairs rather than rewards for training), and DRO
+is a purely offline training method. Such sums have also
+been used in concurrent work to parameterize “process re-
+ward models” (a new name for advantage (Schulman et al.,
+2016)), which can be used to speed up learning in policy
+gradient methods (Yuan et al., 2024; Cui et al.). However,
+these works use the resulting PRM only to accelerate learn-
+ing with policy gradients, rather than using it directly as
+a policy and value function as we do. Indeed, the authors
+found that their PRMs perform poorly as policies, which
+is likely due to the fact that they omitted the critical bQ0
+estimate, and use a different loss function.
+Other recent works have noted that removing the value
+model from PPO can have benefits, both for reasons of
+memory and bias, in the context of LLM training. Group
+Relative Policy Optimization (Shao et al., 2024) samples
+multiple independent trajectories and computes an advan-
+tage for each, which is then used in the clipped PPO loss as a
+replacement for the GAE estimate. Similarly, VinePPO uses
+Monte-Carlo rollouts for advantage estimation at each rea-
+soning step in a rollout (Kazemnejad et al., 2024). Although
+these works share the benefit of not requiring a separate
+value model, neither can leverage off-policy data.
+6
+
+Soft Policy Optimization
+5. Experiments & Results
+Our experiments are centered around two main questions:
+first, is incorporating previous experiences during the train-
+ing of SPO possible and beneficial, and secondly, can SPO
+learn a better and more diverse policy compared to PPO?
+For the first point, it is important that SPO can not only train
+stably on arbitrary offline data, but actually benefits from
+adding more offline data from diverse sources.
+Experiment setting: We run all our experiments on the
+challenging CodeContests benchmark introduced by Li et al.
+(2022). In this task the LLM is presented with a code con-
+test problem description, followed by a description of the
+input and outputs, and some example input and outputs. The
+LLM needs to generate a Python solution that solves the
+coding challenge correctly within the given memory and
+time constraints. A solution is deemed correct if it produces
+the correct output for all the test inputs, including inputs that
+are not shown in the prompt. We evaluate the models based
+on the average over the evaluation sets in CodeContests,
+and in TACO (Li et al., 2023). In our experience adding
+the TACO tests has proven to be a more reliable way of
+tracking progress. We deduplicate the CodeContests train-
+ing data against the TACO test data. We evaluate the models
+with the pass@10 score, which measures whether out of
+10 solutions, at least one solution passes all the tests. This
+metric favors models with diverse outputs compared to the
+more commonly seen pass@1. To compute the pass@10 we
+sample 20 responses with a temperature of 0.4 and top-p of
+0.95, and use the estimator from (Li et al., 2022).
+We initialize all policies using Llama-3.1-8B-Instruct
+(Llama Team, AI Meta, 2024). The model is then trained for
+100,000 steps with a batch size of 128. We use 64 GPUs to
+update the policy and 32-64 GPUs to generate new samples.
+We use the AdamW optimizer with a warm-up period of
+200 steps, followed by a constant learning rate of 6 × 10−8.
+We test two settings for SPO that differ only in their train-
+ing data: pure online vs a combination of online and of-
+fline data in equal proportions.
+Both SPO runs use a
+β = 1/ log(100000) ≈1/11.5, and use the Q-regression
+with cross-entropy loss. For each training problem we es-
+timate Q0 with Monte Carlo simulation by sampling 800
+completions and evaluating their correctness. In order to
+demonstrate SPO’s ability to handle diverse data sources, we
+gather offline data from the reference model (sampled from
+π0 with random temperature and top-p 0.95), from an online
+SPO run and PPO run, samples generated by Llama-70B
+with a chain-of-though (CoT) prompt, and human solutions
+from the CodeContests dataset. We remove duplicates from
+the offline dataset and filter for correct solutions. The on-
+line samples for SPO are generated from its current policy
+with a random temperature sampled from U(0.1, 0.8) and a
+top-p value of 0.95. This steers the training process towards
+0
+20k
+40k
+60k
+80k
+100k
+steps
+10
+11
+12
+13
+pass@10
+SPO half-online
+SPO online
+PPO
+Figure 1. Code generation performance measured in pass@10 vs
+training step. SPO trained on mixed online and offline data outper-
+forms both the pure online SPO and PPO.
+sequences for which the model assigns higher probability.
+Our primary baseline is a well-tuned PPO implementation
+with a KL-regularized reward using the same β as SPO.
+PPO is the most commonly used policy gradient method
+and it has also found popular application in training LLMs
+(Ouyang et al., 2022; Gehring et al., 2024). It can train on
+slightly off-policy trajectories by applying importance sam-
+pling, but generally benefits from on-policy samples using
+the latest model. Hence we update the behavior policy after
+each batch of samples. This requires the trainer nodes to
+frequently send model updates to the worker nodes, which
+incurs a heavy slowdown in overall training speed (even
+though the transfer is done asynchronously). In contrast,
+in preliminary experiments with SPO we observed no sig-
+nificant benefits from on-policy samples or frequent model
+updates. Hence, we decrease the update frequency of the
+behavior policy to every 10 batches of samples. This has a
+significant effect on the training time, resulting in an 85%
+speedup in terms of wall clock time.
+Results: In Figure 1, the results show that the pass@10
+performance of SPO steadily improves over training, while
+it declines somewhat for PPO. Additionally, we observe
+that the half-online SPO run, which incorporates offline
+data, not only remains stable but also shows better results.
+Importantly, both PPO and SPO-online require the same
+number of GPUs for training and collecting rollouts. In
+contrast, SPO half-online trains on 50% offline samples,
+effectively reducing the sampling cost by half.
+On pass@1, PPO performs better, yielding 8.4 vs 6.3 for
+SPO half-online and 6.0 for online SPO.
+PPO discussion: Our PPO baseline matches the pass@1
+performance reported in (Gehring et al., 2024) for the single-
+turn setup, but its improvement in pass@1 performance co-
+occurs with a modest decline in the pass@10 performance.
+7
+
+Soft Policy Optimization
+0
+10k
+20k
+30k
+40k
+50k
+60k
+steps
+12
+13
+pass@10
+Squared Loss
+Cross Entropy
+Advantage Regression
+(a)
+0
+10k
+20k
+30k
+40k
+50k
+60k
+steps
+11
+12
+13
+pass@10
+Squared Loss
+Cross Entropy
+Non-Terminal
+Terminal
+(b)
+0
+5k
+10k
+15k
+20k
+25k
+30k
+35k
+40k
+steps
+12
+13
+pass@10
+MCQ
+Rollouts
+SPO
+(c)
+Figure 2. Ablation of different SPO settings and extensions: (a) Terminal Q-regression with different losses. (b) Terminal vs. non-terminal
+Q-regression with reverse-Q targets, combined with either squared or cross-entropy loss. (c) Non-terminal Q-regression with Monte Carlo
+Q-estimations at pivotal tokens, ablated against terminal Q-regression on the rollouts gathered during the pivotal token search.
+This happens because the PPO policy quickly learns to sam-
+ple a single solution per problem, so the original difference
+between pass@1 and pass@10 performance diminishes over
+the duration of training. In contrast, SPO improves both
+while preserving the difference.
+5.1. Ablations and Extensions
+In our previous experiment we focused on a specific imple-
+mentation of SPO: terminal Q-regression with cross-entropy
+loss. This allowed us to assess the practical feasibility of
+SPO by examining its training dynamics over long training
+runs. In this section we will ablate these choices in shorter
+training runs and explore additional directions to improve
+the performance of SPO. We consider terminal Q-regression
+with cross-entropy loss as the primary baseline, which we
+refer to simply as SPO. Unless otherwise specified, the ab-
+lation runs use the half-online setting.
+Loss function: We begin by investigating the impact of
+different loss functions on performance. We compare termi-
+nal Q-regression with squared loss and cross-entropy loss,
+and advantage regression with sigmoid warping and cross-
+entropy loss. The results in Figure 2(a) show that the choice
+of loss function significantly affects the speed of improve-
+ment, with the squared loss outperforming the other two.
+Interestingly, our findings differ from those of Yuan et al.
+(2024), who reported policy performance degradation when
+using a similar cross-entropy loss. This discrepancy can be
+attributed to the difference in target labels: their model was
+trained on response-level correctness labels, whereas our
+advantage regression loss correctly captures the mathemati-
+cal relationship between the policy and the value function,
+leading to improved policy performance.
+Terminal vs. Non-Terminal: Next, we investigate whether
+a non-terminal loss using reverse-Q targets can enhance the
+performance. We conduct experiments with non-terminal
+Q-regression using both squared loss and cross-entropy loss.
+The results in Figure 2(b) indicate that combining the non-
+terminal targets with cross-entropy loss significantly de-
+grades the performance, while for the squared loss we ob-
+serve no substantial effect.
+Monte Carlo Targets: Finally, we examine the effective-
+ness of using Monte Carlo estimation for non-terminal Qt
+in place of reverse-Q targets. We specifically target time
+steps t that show the greatest increase in successive Qt val-
+ues, identified through a Pivotal Token Search on multiple
+correct samples from our offline dataset (Sec. 3.1.3). This
+process produces 50,000 trajectories, annotated with the
+success probability estimated via 10 rollouts at each token
+visited by PTS. We replace half of the offline data with
+these samples, resulting in a data distribution of 50% online,
+25% standard offline, and 25% samples with Monte Carlo
+targets. We also introduce a baseline that replaces half of
+the offline data with rollouts obtained during the pivotal
+token search. This baseline checks whether integrating the
+additional information from rollouts with the terminal loss
+is sufficient, or if condensing these rollouts into Qt targets
+for non-terminal targets is essential. The results in Fig-
+ure 2(c) show that the non-terminal Q-regression towards
+Monte Carlo targets significantly improves the performance.
+This happens despite only adding 50,000 trajectories, which
+corresponds to less than 1,600 steps per epoch. In contrast,
+applying the terminal loss solely on the rollouts performs
+the same as the baseline.
+6. Discussion
+The goal of Soft RL is to learn a policy that not only knows
+a good response to every query, but ideally knows all good
+responses to every query. Although any KL-regularized
+reward maximization method shares this objective in theory,
+in practice policy gradient methods fail to preserve diversity
+in the policy. They rapidly learn to increase the probability
+of responses that already have a reasonably high probability
+under the reference policy. As a result they achieve good
+pass@1 performance early on, but it becomes increasingly
+8
+
+Soft Policy Optimization
+hard to discover good responses that were not known al-
+ready. By contrast, even pure online SPO is able to steadily
+improve on both pass@1 and pass@10, with the gap remain-
+ing consistent or growing. This effect is further enhanced
+by the inclusion of offline data containing solutions with
+relatively low probability under the reference model.
+The cumulative Q parameterization provides a unified policy
+and value function that are guaranteed to be consistent. This
+feature of our method enables many interesting possibilities
+for combined policy and value-based learning. For instance,
+although still limited in scale, our experiments with Monte-
+Carlo Qt estimates show that combining terminal Q loss
+with MC targets results in faster learning and improved final
+performance. Other options, such as combining SPO with a
+policy gradient loss, remain to be explored as well.
+One limitation of our current implementation is that we do
+not update the reference model. Doing so would require on-
+line estimation of Q0, but is likely to improve both pass@1
+and pass@10 performance (preliminary experiments using
+fixed bQ0 support this notion).
+In our experiments we have demonstrated the benefit of
+including offline data, but the full extent of the benefit of
+our approach will become evident only when we contin-
+uously grow the offline dataset as we run more and more
+experiments and ablations. Although such a cumulative
+procedure becomes hard to reproduce, it drastically reduces
+the inference cost of RL training runs by amortizing it.
+7. Conclusion
+In this paper we have presented Soft Policy Optimiza-
+tion, a hybrid online off-policy RL method for language
+model improvement. SPO is based on the cumulative Q-
+parameterization, which has a number of appealing theoret-
+ical properties first revealed in this work. Our large-scale
+experiments on code contests demonstrate that SPO is able
+to leverage diverse and highly off-policy data, and unlike
+PPO is able to preserve diversity in the policy throughout
+training, resulting in improved pass@10 scores. Moreover,
+SPO is significantly more scalable and faster to train, due
+to a reduced need for model transfers, significantly reduced
+memory consumption, and reduced need for inference com-
+pute due to the use of offline data. Although here we have
+experimented with a fixed set of offline data, the benefits
+of offline data are poised to grow as we accumulate diverse
+solutions to hard problems across the many training runs
+that are required for frontier model development.
+References
+Abdin, M., Aneja, J., Behl, H., Bubeck, S., Eldan, R., Gu-
+nasekar, S., Harrison, M., Hewett, R. J., Javaheripi, M.,
+Kauffmann, P., Lee, J. R., Lee, Y. T., Li, Y., Liu, W.,
+Mendes, C. C. T., Nguyen, A., Price, E., de Rosa, G.,
+Saarikivi, O., Salim, A., Shah, S., Wang, X., Ward, R.,
+Wu, Y., Yu, D., Zhang, C., and Zhang, Y. Phi-4 Techni-
+cal Report. 2024. URL http://arxiv.org/abs/
+2412.08905.
+Brown, B., Juravsky, J., Ehrlich, R., Clark, R., Le, Q. V., R´e,
+C., and Mirhoseini, A. Large language monkeys: Scaling
+inference compute with repeated sampling. 2024. URL
+http://arxiv.org/abs/2407.21787.
+Chebotar, Y., Vuong, Q., Irpan, A., Hausman, K., Xia,
+F., Lu, Y., Kumar, A., Yu, T., Herzog, A., Pertsch,
+K., Gopalakrishnan, K., Ibarz, J., Nachum, O., Son-
+takke, S., Salazar, G., Tran, H., Peralta, J., Tan, C.,
+Manjunath, D., Singht, J., Zitkovich, B., Jackson, T.,
+Rao, K., Finn, C., and Levine, S.
+Q-transformer:
+Scalable offline reinforcement learning via autoregres-
+sive Q-functions.
+CoRL, 229:3909–3928, September
+2023. URL https://proceedings.mlr.press/
+v229/chebotar23a/chebotar23a.pdf.
+Cui, G., Yuan, L., Wang, Z., Wang, H., Li, W., He, B.,
+Fan, Y., Yu, T., Xu, Q., Chen, W., Yuan, J., Chen, H.,
+Zhang, K., Lv, X., Wang, S., Yao, Y., Han, X., Peng,
+H., Cheng, Y., Liu, Z., Sun, M., Zhou, B., and Ding, N.
+Process Reinforcement through IMplicit rEwards. URL
+http://arxiv.org/abs/2502.01456.
+Gehring, J., Zheng, K., Copet, J., Mella, V., Cohen, T., and
+Synnaeve, G. Rlef: Grounding code llms in execution
+feedback with reinforcement learning. arXiv preprint
+arXiv:2410.02089, 2024.
+Haarnoja, T., Tang, H., Abbeel, P., and Levine, S. Reinforce-
+ment learning with deep energy-based policies. 2017.
+URL http://arxiv.org/abs/1702.08165.
+Haarnoja, T., Zhou, A., Abbeel, P., and Levine, S. Soft
+actor-critic: Off-policy maximum entropy deep reinforce-
+ment learning with a stochastic actor. arXiv [cs.LG], Jan-
+uary 2018. URL http://arxiv.org/abs/1801.
+01290.
+Jaques, N., Gu, S., Bahdanau, D., Hern´andez-Lobato, J. M.,
+Turner, R. E., and Eck, D.
+Sequence tutor: Conser-
+vative fine-tuning of sequence generation models with
+KL-control. 2016. URL http://arxiv.org/abs/
+1611.02796.
+Jenner, E., van Hoof, H., and Gleave, A. Calculus on MDPs:
+Potential Shaping as a Gradient. 2022. URL http:
+//arxiv.org/abs/2208.09570.
+Kappen, B., Gomez, V., and Opper, M.
+Optimal con-
+trol as a graphical model inference problem.
+2009.
+9
+
+Soft Policy Optimization
+URL
+https://cdn.aaai.org/ojs/13573/
+13573-40-17091-1-2-20201228.pdf.
+Kazemnejad, A., Aghajohari, M., Portelance, E., Sordoni,
+A., Reddy, S., Courville, A., and Roux, N. L. VinePPO:
+Unlocking RL potential for LLM reasoning through re-
+fined credit assignment. 2024. URL http://arxiv.
+org/abs/2410.01679.
+Levine, S. Reinforcement learning and control as proba-
+bilistic inference: Tutorial and review. arXiv [cs.LG],
+May 2018. URL http://arxiv.org/abs/1805.
+00909.
+Li, R., Fu, J., Zhang, B.-W., Huang, T., Sun, Z., Lyu, C., Liu,
+G., Jin, Z., and Li, G. Taco: Topics in algorithmic code
+generation dataset. arXiv preprint arXiv:2312.14852,
+2023.
+Li, Y., Choi, D., Chung, J., Kushman, N., Schrittwieser, J.,
+Leblond, R., Eccles, T., Keeling, J., Gimeno, F., Dal Lago,
+A., et al. Competition-level code generation with alpha-
+code. Science, 378(6624):1092–1097, 2022.
+Llama Team, AI Meta. The llama 3 herd of models, 2024.
+URL https://arxiv.org/abs/2407.21783.
+L´azaro-Gredilla, M., Ku, L. Y., Murphy, K. P., and George,
+D. What type of inference is planning?
+2024. URL
+http://arxiv.org/abs/2406.17863.
+Nachum, O., Norouzi, M., Xu, K., and Schuurmans, D.
+Bridging the gap between value and policy based re-
+inforcement learning.
+February 2017.
+URL http:
+//arxiv.org/abs/1702.08892.
+Noukhovitch, M., Huang, S., Xhonneux, S., Hosseini, A.,
+Agarwal, R., and Courville, A. Asynchronous RLHF:
+Faster and more efficient off-policy RL for language mod-
+els. 2024. URL http://arxiv.org/abs/2410.
+18252.
+Ouyang, L., Wu, J., Jiang, X., Almeida, D., Wainwright,
+C. L., Mishkin, P., Zhang, C., Agarwal, S., Slama,
+K., Ray, A., Schulman, J., Hilton, J., Kelton, F.,
+Miller, L. E., Simens, M., Askell, A., Welinder, P.,
+Christiano, P., Leike, J., and Lowe, R. J.
+Training
+language models to follow instructions with human
+feedback.
+abs/2203.02155:27730–27744,
+2022.
+URL
+https://cdn.openai.com/papers/
+Training_language_models_to_follow_
+instructions_with_human_feedback.pdf.
+Rafailov, R., Sharma, A., Mitchell, E., Ermon, S., Manning,
+C. D., and Finn, C. Direct preference optimization: Your
+language model is secretly a reward model. arXiv [cs.LG],
+May 2023. URL http://arxiv.org/abs/2305.
+18290.
+Richemond, P. H., Tang, Y., Guo, D., Calandriello, D.,
+Azar, M. G., Rafailov, R., Pires, B. A., Tarassov, E.,
+Spangher, L., Ellsworth, W., Severyn, A., Mallinson, J.,
+Shani, L., Shamir, G., Joshi, R., Liu, T., Munos, R.,
+and Piot, B.
+Offline regularised reinforcement learn-
+ing for large language models alignment. 2024. URL
+http://arxiv.org/abs/2405.19107.
+Schulman, J., Moritz, P., Levine, S., Jordan, M., and Abbeel,
+P. High-Dimensional Continuous Control Using Gen-
+eralized Advantage Estimation. pp. 1–9, 2016. URL
+http://arxiv.org/abs/1506.02438v1.
+Schulman, J., Chen, X., and Abbeel, P. Equivalence be-
+tween policy gradients and soft Q-learning. arXiv [cs.LG],
+April 2017a. URL http://arxiv.org/abs/1704.
+06440.
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A.,
+and Klimov, O.
+Proximal Policy Optimization Algo-
+rithms.
+2017b.
+URL http://arxiv.org/abs/
+1707.06347.
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Zhang, M.,
+Li, Y. K., Wu, Y., and Guo, D. DeepSeekMath: Push-
+ing the Limits of Mathematical Reasoning in Open Lan-
+guage Models. 2024. URL http://arxiv.org/
+abs/2402.03300.
+Tang, Y., Munos, R., Rowland, M., and Valko, M.
+VA-learning as a more efficient alternative to Q-
+learning.
+2023.
+URL http://arxiv.org/abs/
+2305.18161.
+Todorov, E.
+General duality between optimal con-
+trol and estimation.
+9:4286–4292, 2008.
+URL
+https://homes.cs.washington.edu/
+˜todorov/papers/TodorovCDC08.pdf.
+Wu, Y., Sun, Z., Li, S., Welleck, S., and Yang, Y. Infer-
+ence scaling laws: An empirical analysis of compute-
+optimal inference for problem-solving with language
+models. 2024. URL https://arxiv.org/abs/
+2408.00724.
+Xu, S., Fu, W., Gao, J., Ye, W., Liu, W., Mei, Z., Wang,
+G., Yu, C., and Wu, Y. Is DPO superior to PPO for
+LLM alignment? A comprehensive study. URL http:
+//arxiv.org/abs/2404.10719.
+Yuan, L., Li, W., Chen, H., Cui, G., Ding, N., Zhang, K.,
+Zhou, B., Liu, Z., and Peng, H. Free process rewards
+without process labels. 2024. URL http://arxiv.
+org/abs/2412.01981.
+Ziebart, B. D., Maas, A. L., Bagnell, J. A., Dey, A. K.,
+et al. Maximum entropy inverse reinforcement learning.
+8:1433–1438, 2008.
+10
+
+Soft Policy Optimization
+Ziegler, D. M., Stiennon, N., Wu, J., Brown, T. B., Radford,
+A., Amodei, D., Christiano, P., and Irving, G. Fine-tuning
+language models from human preferences. 2019. URL
+http://arxiv.org/abs/1909.08593.
+11
+
