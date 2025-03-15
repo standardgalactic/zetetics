@@ -38,6 +38,11 @@ process_files() {
         [[ -f "$file" ]] || continue
         local filename="$(basename "$file")"
 
+        if [[ "$filename" == "detailed_summary.txt" ]]; then
+            log "Skipping detailed_summary.txt"
+            continue
+        fi
+
         # Skip overview and processed files
         [[ "$filename" == "overview.txt" ]] && { log "Skipping $filename"; continue; }
         grep -Fxq "$filename" "$PROCESSED_FILES" && { log "Already processed: $filename"; continue; }
